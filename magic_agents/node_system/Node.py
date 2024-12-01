@@ -1,6 +1,7 @@
 import abc
 import functools
-from typing import Callable
+import inspect
+import time
 from magic_agents.models.model_agent_run_log import ModelAgentRunLog
 
 
@@ -11,7 +12,7 @@ class Node(abc.ABC):
                  **kwargs):
         self.cost = cost
         self.parents = {}
-        self.debug = debug
+        self.debug = debug\
 
     def prep(self, content):
         return {
@@ -45,11 +46,23 @@ class Node(abc.ABC):
         return self.debug
 
     @staticmethod
-    def magic_telemetry(func: Callable):
+    def magic_telemetry(func):
+        if not inspect.isasyncgenfunction(func):
+            raise TypeError(f"Function {func.__qualname__} is not an async generator. "
+                            f"magic_telemetry can only be applied to async generator functions.")
+
         @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            print('Executing', func.__qualname__.split('.')[0])
-            response = func(*args, **kwargs)
-            return response
+        async def wrapper(*args, **kwargs):
+            debug = args[0].get_debug() if args and hasattr(args[0], "get_debug") else False
+
+            start_time = time.monotonic()
+            if debug:
+                print(f"Executing {func.__qualname__.split('.')[0]}...")
+            async for i in func(*args, **kwargs):
+                yield i
+            end_time = time.monotonic()
+            execution_time = end_time - start_time
+            if debug:
+                print(f"{func.__qualname__.split('.')[0]} execution time: {execution_time:.4f} seconds")
 
         return wrapper
