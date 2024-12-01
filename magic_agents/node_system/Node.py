@@ -12,7 +12,7 @@ class Node(abc.ABC):
                  **kwargs):
         self.cost = cost
         self.parents = {}
-        self.debug = debug\
+        self.debug = debug
 
     def prep(self, content):
         return {
@@ -23,7 +23,7 @@ class Node(abc.ABC):
         # Define a mapping of possible node types to their keys
         node_types = [
             "NodeText", "NodeUserInput", "NodeParser",
-            "NodeChat", "NodeLLM", "NodeFetch"
+            "NodeChat", "NodeLLM", "NodeFetch", "NodeClientLLM"
         ]
 
         for node_type in node_types:
@@ -47,8 +47,9 @@ class Node(abc.ABC):
 
     @staticmethod
     def magic_telemetry(func):
+        qualname = func.__qualname__.split('.')[0]
         if not inspect.isasyncgenfunction(func):
-            raise TypeError(f"Function {func.__qualname__} is not an async generator. "
+            raise TypeError(f"Function {qualname} is not an async generator. "
                             f"magic_telemetry can only be applied to async generator functions.")
 
         @functools.wraps(func)
@@ -57,12 +58,12 @@ class Node(abc.ABC):
 
             start_time = time.monotonic()
             if debug:
-                print(f"Executing {func.__qualname__.split('.')[0]}...")
+                print(f"Executing {qualname}...")
             async for i in func(*args, **kwargs):
                 yield i
             end_time = time.monotonic()
             execution_time = end_time - start_time
             if debug:
-                print(f"{func.__qualname__.split('.')[0]} execution time: {execution_time:.4f} seconds")
+                print(f"{qualname} execution time: {execution_time:.4f} seconds")
 
         return wrapper
