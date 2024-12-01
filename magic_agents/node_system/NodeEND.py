@@ -8,4 +8,7 @@ class NodeEND(Node):
         super().__init__(**kwargs)
 
     async def __call__(self, chat_log):
-        yield ChatCompletionModel(id='', model='', choices=[ChoiceModel()])
+        yield {
+            'type': 'content',
+            'content': ChatCompletionModel(id='', model='', choices=[ChoiceModel()])
+        }

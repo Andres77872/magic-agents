@@ -36,5 +36,11 @@ class NodeLLM(Node):
         else:
             async for i in self.client.llm.async_stream_generate(chat):
                 self.generated += i.choices[0].delta.content
-                yield i
-        super().prep(self.generated)
+                yield {
+                    'type': 'content',
+                    'content': i
+                }
+        yield {
+            'type': 'end',
+            'content': super().prep(self.generated)
+        }

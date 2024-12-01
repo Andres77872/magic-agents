@@ -9,4 +9,7 @@ class NodeParser(Node):
 
     async def __call__(self, chat_log) -> dict:
         output = template_parse(template=self._text, params=self.parents)
-        return super().prep(output)
+        yield {
+            'type': 'end',
+            'content': super().prep(output)
+        }

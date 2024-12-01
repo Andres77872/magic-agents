@@ -47,4 +47,7 @@ class NodeFetch(Node):
         with ThreadPoolExecutor() as executor:
             res = executor.submit(sync_make_request, self.url, data, self.headers).result()
 
-        return super().prep(res)
+        yield {
+            'type': 'end',
+            'content': super().prep(res)
+        }

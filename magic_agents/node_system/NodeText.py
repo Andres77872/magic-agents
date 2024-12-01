@@ -7,4 +7,7 @@ class NodeText(Node):
         self._text = text
 
     async def __call__(self, chat_log) -> dict:
-        return super().prep(self._text)
+        yield {
+            'type': 'end',
+            'content': super().prep(self._text)
+        }

@@ -38,7 +38,7 @@ class NodeChat(Node):
             c += '\n' + k['content']
             self.chat.add_user_message(c)
             print('CHAT_EVAL_TEST MESSAGE CONTEXT : ', self.chat)
-
-        return super().prep({
-            'chat': self.chat
-        })
+        yield {
+            'type': 'end',
+            'content': super().prep(self.chat)
+        }
