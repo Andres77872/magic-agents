@@ -16,16 +16,21 @@ from magic_agents.node_system.NodeParser import NodeParser
 from magic_agents.util.const import HANDLE_VOID
 
 
-async def execute_graph(graph: dict, load_chat: Callable):
+async def execute_graph(graph: dict,
+                        load_chat: Callable,
+                        id_chat: int | str = None,
+                        id_thread: int | str = None,
+                        id_user: int | str = None):
     # Prepare nodes and edges
     nodes = {}
     edges = graph["edges"]
 
     # Initialize the logs for execution tracking
     chat_completion_log = {
-        'id_chat': 'chat_id',
+        'id_chat': id_chat,
+        'id_thread': id_thread,
+        'id_user': id_user,
         'id_app': 'magic-research',
-        'chat_system': '',
         'execution': [],
         'execution_time': 0,
     }
@@ -96,6 +101,9 @@ async def execute_graph(graph: dict, load_chat: Callable):
 async def run_agent(message: str,
                     agt: dict,
                     load_chat: Callable,
+                    id_chat: int | str = None,
+                    id_thread: int | str = None,
+                    id_user: int | str = None,
                     extras: str = None):
     if extras:
         agt.update({
@@ -125,6 +133,10 @@ async def run_agent(message: str,
                 "target": void_id
             })
 
-    r = execute_graph(agt, load_chat)
+    r = execute_graph(graph=agt,
+                      id_chat=id_chat,
+                      id_thread=id_thread,
+                      id_user=id_user,
+                      load_chat=load_chat)
     async for i in r:
         yield i
