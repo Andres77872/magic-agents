@@ -10,6 +10,7 @@ from magic_agents.node_system import (NodeChat,
                                       NodeUserInput,
                                       NodeFetch,
                                       NodeClientLLM,
+                                      NodeSendMessage,
                                       )
 from magic_agents.node_system.NodeParser import NodeParser
 from magic_agents.util.const import HANDLE_VOID
@@ -52,6 +53,8 @@ async def execute_graph(graph: dict, load_chat: Callable):
             return NodeFetch(debug=debug, **data)
         elif nodo_tipo == 'client':
             return NodeClientLLM(debug=debug, **data)
+        elif nodo_tipo == 'send_message':
+            return NodeSendMessage(debug=debug, **data)
         elif nodo_tipo == 'void':  # 'Void' node does nothing
             return lambda _: None
         else:

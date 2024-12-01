@@ -7,6 +7,7 @@ from magic_agents.node_system.NodeText import NodeText
 from magic_agents.node_system.NodeUserInput import NodeUserInput
 from magic_agents.node_system.NodeFetch import NodeFetch
 from magic_agents.node_system.NodeClientLLM import NodeClientLLM
+from magic_agents.node_system.NodeSendMessage import NodeSendMessage
 
 
 def find_starting_nodes(edges):

@@ -1,41 +1,25 @@
-import time
 import json
+
+from magic_llm.model.ModelChatStream import ChatCompletionModel, ChoiceModel
 
 from magic_agents.node_system.Node import Node
 
 
 class NodeSendMessage(Node):
     def __init__(self,
-                 text: str = '',
-                 extras: dict = None
+                 message: str = '',
+                 json_extras: bool = False,
+                 **kwargs
                  ) -> None:
-        super().__init__()
-        self._text = text
-        self._extras = extras
+        super().__init__(**kwargs)
+        self.message = message
+        self.json_extras = json_extras
 
     async def __call__(self, chat_log) -> dict:
-        print('Node text')
-        lt = {
-            'id': -1,
-            'id_chat': chat_log.id_chat,
-            'choices':
-                [{
-                    'delta':
-                        {
-                            'content': self._text,
-                            'role': None
-                        },
-                    'finish_reason': None,
-                    'index': 0
-                }],
-            'created': int(time.time()),
-            'model': '',
-            'usage': {
-                'prompt_tokens': 0,
-                'completion_tokens': 0
-            },
-            'object': 'chat.completion.chunk',
-            'extras': self._extras
+        output = self.parents['handle_send_extra']
+        if self.json_extras:
+            output = json.loads(output)
+        yield {
+            'type': 'content',
+            'content': ChatCompletionModel(id='', model='', choices=[ChoiceModel()], extras=output)
         }
-
-        yield 'data: ' + json.dumps(lt, separators=(',', ':')) + '\n\n'
