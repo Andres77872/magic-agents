@@ -1,18 +1,10 @@
-import functools
 from collections import defaultdict
-from typing import Callable
 
-# from magic_agents.node_system.NodeBrowsing import NodeBrowsing
 from magic_agents.node_system.NodeChat import NodeChat
 from magic_agents.node_system.NodeEND import NodeEND
-# from magic_agents.node_system.NodeFindit import NodeFindit
-# from magic_agents.node_system.NodeGenerator import NodeGenerator
 from magic_agents.node_system.NodeLLM import NodeLLM
-# from magic_agents.node_system.NodeMerger import NodeMerger
 from magic_agents.node_system.NodeText import NodeText
 from magic_agents.node_system.NodeUserInput import NodeUserInput
-# from magic_agents.node_system.NodeArxiv import NodeArxiv
-# from magic_agents.node_system.NodeParser import NodeParser
 from magic_agents.node_system.NodeFetch import NodeFetch
 
 

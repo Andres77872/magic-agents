@@ -33,7 +33,6 @@ async def execute_graph(graph: dict, load_chat: Callable, get_client: Callable):
     def create_node(node_data):
         """Create a node instance based on its type."""
         nodo_tipo = node_data['type']
-        debug = node_data.get('debug', False)
         data = node_data.get('data', {})
 
         if nodo_tipo == 'chat':
@@ -56,6 +55,7 @@ async def execute_graph(graph: dict, load_chat: Callable, get_client: Callable):
             raise ValueError(f"Unsupported node type: {nodo_tipo}")
 
     # Initialize all nodes based on the graph
+    debug = graph.get('debug', False)
     for nd in graph['nodes']:
         try:
             nodes[nd['id']] = create_node(nd)
@@ -69,20 +69,15 @@ async def execute_graph(graph: dict, load_chat: Callable, get_client: Callable):
         source_node = nodes[source_id]
         target_node = nodes[target_id]
 
-        # If the source node is an async generator
-        if isinstance(source_node, NodeLLM):
-            async for item in source_node(chat_log):
-                yield item
-            output = {'NodeLLM': source_node.generated}
-        elif isinstance(source_node, NodeEND):
-            async for item in source_node(chat_log):
-                yield item
-            return
-        else:  # For sync or other nodes
-            output = await source_node(chat_log)
+        output = None
+        async for item in source_node(chat_log):
+            if item['type'] == 'end':
+                output = item['content']
+            elif item['type'] == 'content':
+                yield item['content']
 
         # Send the output of the source node to the target node
-        if target_handle:
+        if target_handle and output:
             target_node.add_parent(output, target_handle)
 
     # Iterate through edges and connect source to targets
