@@ -17,7 +17,6 @@ class NodeLLM(Node):
         self.stream = stream
         self.generated = ''
 
-    @Node.magic_telemetry
     async def __call__(self, chat_log):
         params = self.parents
         if c := params.get(HANDLE_CHAT):

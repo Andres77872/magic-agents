@@ -7,5 +7,4 @@ class NodeUserInput(Node):
         self._text = text
 
     async def __call__(self, chat_log) -> dict:
-        print('Node user input')
         return super().prep(self._text)

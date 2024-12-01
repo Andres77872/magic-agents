@@ -9,4 +9,3 @@ class NodeEND(Node):
 
     async def __call__(self, chat_log):
         yield ChatCompletionModel(id='', model='', choices=[ChoiceModel()])
-        # pass

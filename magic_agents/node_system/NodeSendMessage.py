@@ -31,8 +31,8 @@ class NodeSendMessage(Node):
             'created': int(time.time()),
             'model': '',
             'usage': {
-                'prompt_tokens': thread_log.thread_content_token_context,
-                'completion_tokens': thread_log.thread_content_token_generated
+                'prompt_tokens': 0,
+                'completion_tokens': 0
             },
             'object': 'chat.completion.chunk',
             'extras': self._extras

@@ -8,6 +8,5 @@ class NodeParser(Node):
         self._text = text
 
     async def __call__(self, chat_log) -> dict:
-        print('Node Parser', self.parents)
         output = template_parse(template=self._text, params=self.parents)
         return super().prep(output)

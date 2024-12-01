@@ -7,7 +7,8 @@ from magic_agents.node_system import (NodeChat,
                                       NodeLLM,
                                       NodeEND,
                                       NodeText,
-                                      NodeUserInput, NodeFetch,
+                                      NodeUserInput,
+                                      NodeFetch,
                                       )
 from magic_agents.node_system.NodeParser import NodeParser
 from magic_agents.util.const import HANDLE_VOID
@@ -29,46 +30,31 @@ async def execute_graph(graph: dict, load_chat: Callable, get_client: Callable):
     chat_log = ModelAgentRunLog(**chat_completion_log)
 
     for node_data in graph['nodes']:
-        nodo_tipo = node_data['type']
-        if nodo_tipo == 'chat':
+        node_type = node_data['type']
+        if node_type == 'chat':
             nodes[node_data['id']] = NodeChat(load_chat=load_chat,
                                               debug=node_data.get('debug', False),
                                               **node_data['data'])
-        elif nodo_tipo == 'llm':
+        elif node_type == 'llm':
             nodes[node_data['id']] = NodeLLM(data=node_data['data'],
                                              stream=node_data['data']['stream'],
                                              get_client=get_client,
                                              debug=node_data.get('debug', False))
-        elif nodo_tipo == 'end':
+        elif node_type == 'end':
             nodes[node_data['id']] = NodeEND(debug=node_data.get('debug', False))
-        elif nodo_tipo == 'text':
+        elif node_type == 'text':
             nodes[node_data['id']] = NodeText(text=node_data['data']['content'],
                                               debug=node_data.get('debug', False))
-        elif nodo_tipo == 'user_input':
+        elif node_type == 'user_input':
             nodes[node_data['id']] = NodeUserInput(text=node_data['data']['content'],
                                                    debug=node_data.get('debug', False))
-        elif nodo_tipo == 'findit':
-            pass
-            # nodes[node_data['id']] = NodeFindit()
-        elif nodo_tipo == 'generator':
-            pass
-            # nodes[node_data['id']] = NodeGenerator()
-        elif nodo_tipo == 'merger':
-            pass
-            # nodes[node_data['id']] = NodeMerger(text=node_data['data']['content'])
-        elif nodo_tipo == 'parser':
+        elif node_type == 'parser':
             nodes[node_data['id']] = NodeParser(debug=node_data.get('debug', False),
                                                 **node_data['data'])
-        elif nodo_tipo == 'browsing':
-            pass
-            # nodes[node_data['id']] = NodeBrowsing()
-        elif nodo_tipo == 'arxiv':
-            pass
-            # nodes[node_data['id']] = NodeArxiv(extras=graph.get('extras'))
-        elif nodo_tipo == 'fetch':
+        elif node_type == 'fetch':
             nodes[node_data['id']] = NodeFetch(debug=node_data.get('debug', False),
                                                **node_data['data'])
-        elif nodo_tipo == 'void':
+        elif node_type == 'void':
             nodes[node_data['id']] = lambda x: None
 
     # First, execute all source nodes to accumulate inputs
@@ -77,15 +63,15 @@ async def execute_graph(graph: dict, load_chat: Callable, get_client: Callable):
         target_id = edge["target"]
 
         # if not results[source_id]:  # Execute source node if not already done
-        print('RUN source', nodes[source_id].__class__.__name__)
-        print('RUN target', nodes[target_id].__class__.__name__)
+        # print('RUN source', nodes[source_id].__class__.__name__)
+        # print('RUN target', nodes[target_id].__class__.__name__)
         if nodes[source_id].__class__.__name__ == 'NodeLLM':
             async for i in nodes[source_id](chat_log):
                 yield i
-            print('NODE SOURCE', nodes[source_id].generated)
+            # print('NODE SOURCE', nodes[source_id].generated)
             nodes[target_id].add_parent({'NodeLLM': nodes[source_id].generated}, edge['targetHandle'])
         elif nodes[source_id].__class__.__name__ == 'NodeEND':
-            print('NODE END')
+            # print('NODE END')
             async for i in nodes[source_id](chat_log):
                 yield i
         elif nodes[target_id].__class__.__name__ == 'function':
@@ -126,8 +112,6 @@ async def run_agent(message: str,
                 "source": i['id'],
                 "target": void_id
             })
-
-    print('VOID EDGES', void_id)
 
     r = execute_graph(agt, load_chat, get_client)
     async for i in r:
