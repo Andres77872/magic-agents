@@ -14,11 +14,12 @@ from magic_agents.node_system.NodeParser import NodeParser
 from magic_agents.util.const import HANDLE_VOID
 
 
-# Updated graph execution function to accumulate inputs for each node
 async def execute_graph(graph: dict, load_chat: Callable, get_client: Callable):
-    # nodes = {node["id"]: node for node in graph["nodes"]}
-    edges = graph["edges"]
+    # Prepare nodes and edges
     nodes = {}
+    edges = graph["edges"]
+
+    # Initialize the logs for execution tracking
     chat_completion_log = {
         'id_chat': 'chat_id',
         'id_app': 'magic-research',
@@ -26,58 +27,69 @@ async def execute_graph(graph: dict, load_chat: Callable, get_client: Callable):
         'execution': [],
         'execution_time': 0,
     }
-
     chat_log = ModelAgentRunLog(**chat_completion_log)
 
-    for node_data in graph['nodes']:
-        node_type = node_data['type']
-        if node_type == 'chat':
-            nodes[node_data['id']] = NodeChat(load_chat=load_chat,
-                                              debug=node_data.get('debug', False),
-                                              **node_data['data'])
-        elif node_type == 'llm':
-            nodes[node_data['id']] = NodeLLM(data=node_data['data'],
-                                             stream=node_data['data']['stream'],
-                                             get_client=get_client,
-                                             debug=node_data.get('debug', False))
-        elif node_type == 'end':
-            nodes[node_data['id']] = NodeEND(debug=node_data.get('debug', False))
-        elif node_type == 'text':
-            nodes[node_data['id']] = NodeText(text=node_data['data']['content'],
-                                              debug=node_data.get('debug', False))
-        elif node_type == 'user_input':
-            nodes[node_data['id']] = NodeUserInput(text=node_data['data']['content'],
-                                                   debug=node_data.get('debug', False))
-        elif node_type == 'parser':
-            nodes[node_data['id']] = NodeParser(debug=node_data.get('debug', False),
-                                                **node_data['data'])
-        elif node_type == 'fetch':
-            nodes[node_data['id']] = NodeFetch(debug=node_data.get('debug', False),
-                                               **node_data['data'])
-        elif node_type == 'void':
-            nodes[node_data['id']] = lambda x: None
+    # Helper function to instantiate node objects
+    def create_node(node_data):
+        """Create a node instance based on its type."""
+        nodo_tipo = node_data['type']
+        debug = node_data.get('debug', False)
+        data = node_data.get('data', {})
 
-    # First, execute all source nodes to accumulate inputs
-    for edge in edges:
-        source_id = edge["source"]
-        target_id = edge["target"]
-
-        # if not results[source_id]:  # Execute source node if not already done
-        # print('RUN source', nodes[source_id].__class__.__name__)
-        # print('RUN target', nodes[target_id].__class__.__name__)
-        if nodes[source_id].__class__.__name__ == 'NodeLLM':
-            async for i in nodes[source_id](chat_log):
-                yield i
-            # print('NODE SOURCE', nodes[source_id].generated)
-            nodes[target_id].add_parent({'NodeLLM': nodes[source_id].generated}, edge['targetHandle'])
-        elif nodes[source_id].__class__.__name__ == 'NodeEND':
-            # print('NODE END')
-            async for i in nodes[source_id](chat_log):
-                yield i
-        elif nodes[target_id].__class__.__name__ == 'function':
-            nodes[source_id](chat_log)
+        if nodo_tipo == 'chat':
+            return NodeChat(load_chat=load_chat, debug=debug, **data)
+        elif nodo_tipo == 'llm':
+            return NodeLLM(data=data, stream=data['stream'], get_client=get_client, debug=debug)
+        elif nodo_tipo == 'end':
+            return NodeEND(debug=debug)
+        elif nodo_tipo == 'text':
+            return NodeText(text=data['content'], debug=debug)
+        elif nodo_tipo == 'user_input':
+            return NodeUserInput(text=data['content'], debug=debug)
+        elif nodo_tipo == 'parser':
+            return NodeParser(debug=debug, **data)
+        elif nodo_tipo == 'fetch':
+            return NodeFetch(debug=debug, **data)
+        elif nodo_tipo == 'void':  # 'Void' node does nothing
+            return lambda _: None
         else:
-            nodes[target_id].add_parent(await nodes[source_id](chat_log), edge['targetHandle'])
+            raise ValueError(f"Unsupported node type: {nodo_tipo}")
+
+    # Initialize all nodes based on the graph
+    for nd in graph['nodes']:
+        try:
+            nodes[nd['id']] = create_node(nd)
+        except ValueError as e:
+            print(f"Error creating node: {e}")
+            continue  # Skip unsupported nodes
+
+    # Helper function to handle node execution
+    async def process_node(source_id, target_id, target_handle=None):
+        """Executes a source node and forwards its output to the target node."""
+        source_node = nodes[source_id]
+        target_node = nodes[target_id]
+
+        # If the source node is an async generator
+        if isinstance(source_node, NodeLLM):
+            async for item in source_node(chat_log):
+                yield item
+            output = {'NodeLLM': source_node.generated}
+        elif isinstance(source_node, NodeEND):
+            async for item in source_node(chat_log):
+                yield item
+            return
+        else:  # For sync or other nodes
+            output = await source_node(chat_log)
+
+        # Send the output of the source node to the target node
+        if target_handle:
+            target_node.add_parent(output, target_handle)
+
+    # Iterate through edges and connect source to targets
+    for edge in edges:
+        # Trigger processing of source-to-target execution
+        async for result in process_node(edge["source"], edge["target"], edge.get('targetHandle')):
+            yield result
 
 
 async def run_agent(message: str,
