@@ -9,12 +9,13 @@ from magic_agents.node_system import (NodeChat,
                                       NodeText,
                                       NodeUserInput,
                                       NodeFetch,
+                                      NodeClientLLM,
                                       )
 from magic_agents.node_system.NodeParser import NodeParser
 from magic_agents.util.const import HANDLE_VOID
 
 
-async def execute_graph(graph: dict, load_chat: Callable, get_client: Callable):
+async def execute_graph(graph: dict, load_chat: Callable):
     # Prepare nodes and edges
     nodes = {}
     edges = graph["edges"]
@@ -38,7 +39,7 @@ async def execute_graph(graph: dict, load_chat: Callable, get_client: Callable):
         if nodo_tipo == 'chat':
             return NodeChat(load_chat=load_chat, debug=debug, **data)
         elif nodo_tipo == 'llm':
-            return NodeLLM(data=data, stream=data['stream'], get_client=get_client, debug=debug)
+            return NodeLLM(debug=debug, **data)
         elif nodo_tipo == 'end':
             return NodeEND(debug=debug)
         elif nodo_tipo == 'text':
@@ -49,6 +50,8 @@ async def execute_graph(graph: dict, load_chat: Callable, get_client: Callable):
             return NodeParser(debug=debug, **data)
         elif nodo_tipo == 'fetch':
             return NodeFetch(debug=debug, **data)
+        elif nodo_tipo == 'client':
+            return NodeClientLLM(debug=debug, **data)
         elif nodo_tipo == 'void':  # 'Void' node does nothing
             return lambda _: None
         else:
@@ -90,7 +93,6 @@ async def execute_graph(graph: dict, load_chat: Callable, get_client: Callable):
 async def run_agent(message: str,
                     agt: dict,
                     load_chat: Callable,
-                    get_client: Callable,
                     extras: str = None):
     if extras:
         agt.update({
@@ -120,6 +122,6 @@ async def run_agent(message: str,
                 "target": void_id
             })
 
-    r = execute_graph(agt, load_chat, get_client)
+    r = execute_graph(agt, load_chat)
     async for i in r:
         yield i
