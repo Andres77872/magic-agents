@@ -11,8 +11,7 @@ def magic_telemetry(func):
 
     @functools.wraps(func)
     async def wrapper(self, chat_log, *args, **kwargs):
-        debug = self.get_debug() if args and hasattr(self, "get_debug") else False
-        print('chat_log: ', chat_log)
+        debug = self.get_debug()
         start_time = time.monotonic()
         if debug:
             print(f"Executing {qualname}...")

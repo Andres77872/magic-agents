@@ -1,3 +1,5 @@
+import json
+
 from magic_llm.model import ModelChat
 
 from magic_agents.node_system.Node import Node
@@ -7,9 +9,11 @@ from magic_agents.util.const import HANDLE_CHAT, HANDLE_SYSTEM_CONTEXT, HANDLE_U
 class NodeLLM(Node):
     def __init__(self,
                  stream: bool = True,
+                 json_output: bool = False,
                  **kwargs):
         super().__init__(**kwargs)
         self.stream = stream
+        self.json_output = json_output
         self.extra_data = kwargs
         self.generated = ''
 
@@ -37,6 +41,8 @@ class NodeLLM(Node):
                     'type': 'content',
                     'content': i
                 }
+        if self.json_output:
+            self.generated = json.loads(self.generated)
         yield {
             'type': 'end',
             'content': super().prep(self.generated)
