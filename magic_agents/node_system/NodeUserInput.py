@@ -8,7 +8,7 @@ class NodeUserInput(Node):
         super().__init__(**kwargs)
         self._text = text
 
-    async def __call__(self, chat_log) -> dict:
+    async def process(self, chat_log):
         if not chat_log.id_chat:
             chat_log.id_chat = str(uuid.uuid4())
         if not chat_log.id_thread:

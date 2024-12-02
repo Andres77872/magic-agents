@@ -15,7 +15,7 @@ class NodeClientLLM(Node):
                                base_url=base_url,
                                **kwargs)
 
-    async def __call__(self, chat_log) -> dict:
+    async def process(self, chat_log):
         yield {
             'type': 'end',
             'content': super().prep(self.client)

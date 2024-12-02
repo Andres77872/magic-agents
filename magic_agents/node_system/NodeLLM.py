@@ -17,7 +17,7 @@ class NodeLLM(Node):
         self.extra_data = kwargs
         self.generated = ''
 
-    async def __call__(self, chat_log):
+    async def process(self, chat_log):
         params = self.parents
         client = self.parents['handle-client-provider']
         if c := params.get(HANDLE_CHAT):

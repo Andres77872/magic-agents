@@ -38,7 +38,7 @@ class NodeFetch(Node):
         self.url = url
         self.data = data
 
-    async def __call__(self, chat_log) -> dict:
+    async def process(self, chat_log):
         data_str = json.dumps(self.data)
         template = Template(data_str)
         output = template.render(self.parents)

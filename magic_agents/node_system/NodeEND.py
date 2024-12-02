@@ -7,7 +7,7 @@ class NodeEND(Node):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
 
-    async def __call__(self, chat_log):
+    async def process(self, chat_log):
         yield {
             'type': 'content',
             'content': ChatCompletionModel(id='', model='', choices=[ChoiceModel()])

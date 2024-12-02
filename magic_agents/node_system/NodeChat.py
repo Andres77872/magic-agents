@@ -22,7 +22,7 @@ class NodeChat(Node):
         else:
             self.chat = ModelChat()
 
-    async def __call__(self, chat_log):
+    async def process(self, chat_log):
         print('Node chat')
         params = self.parents
         print('PARENTS', params)

@@ -7,7 +7,7 @@ class NodeParser(Node):
         super().__init__(**kwargs)
         self._text = text
 
-    async def __call__(self, chat_log) -> dict:
+    async def process(self, chat_log):
         output = template_parse(template=self._text, params=self.parents)
         yield {
             'type': 'end',

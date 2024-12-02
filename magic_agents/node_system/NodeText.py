@@ -6,7 +6,7 @@ class NodeText(Node):
         super().__init__(**kwargs)
         self._text = text
 
-    async def __call__(self, chat_log) -> dict:
+    async def process(self, chat_log):
         yield {
             'type': 'end',
             'content': super().prep(self._text)

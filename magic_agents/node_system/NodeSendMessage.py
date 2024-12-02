@@ -15,7 +15,7 @@ class NodeSendMessage(Node):
         self.message = message
         self.json_extras = json_extras
 
-    async def __call__(self, chat_log) -> dict:
+    async def process(self, chat_log):
         output = self.parents['handle_send_extra']
         if self.json_extras:
             output = json.loads(output)
