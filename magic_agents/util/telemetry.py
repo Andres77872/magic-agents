@@ -14,12 +14,12 @@ def magic_telemetry(func):
         debug = self.get_debug()
         start_time = time.monotonic()
         if debug:
-            print(f"Executing {qualname}...")
+            print(f"Executing {qualname}:{self.node_id}...")
         async for i in func(self, chat_log, *args, **kwargs):
             yield i
         end_time = time.monotonic()
         execution_time = end_time - start_time
         if debug:
-            print(f"{qualname} execution time: {execution_time:.4f} seconds")
+            print(f"{qualname}:{self.node_id} execution time: {execution_time:.4f} seconds")
 
     return wrapper

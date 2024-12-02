@@ -41,25 +41,29 @@ async def execute_graph(graph: dict,
         """Create a node instance based on its type."""
         nodo_tipo = node_data['type']
         data = node_data.get('data', {})
-
+        node_id = node_data['id']
+        extra = {
+            'debug': debug,
+            'node_id': node_id
+        }
         if nodo_tipo == 'chat':
-            return NodeChat(load_chat=load_chat, debug=debug, **data)
+            return NodeChat(load_chat=load_chat, **extra, **data)
         elif nodo_tipo == 'llm':
-            return NodeLLM(debug=debug, **data)
+            return NodeLLM(**extra, **data)
         elif nodo_tipo == 'end':
-            return NodeEND(debug=debug)
+            return NodeEND(**extra)
         elif nodo_tipo == 'text':
-            return NodeText(text=data['content'], debug=debug)
+            return NodeText(text=data['content'], **extra)
         elif nodo_tipo == 'user_input':
-            return NodeUserInput(text=data['content'], debug=debug)
+            return NodeUserInput(text=data['content'], **extra)
         elif nodo_tipo == 'parser':
-            return NodeParser(debug=debug, **data)
+            return NodeParser(**extra, **data)
         elif nodo_tipo == 'fetch':
-            return NodeFetch(debug=debug, **data)
+            return NodeFetch(**extra, **data)
         elif nodo_tipo == 'client':
-            return NodeClientLLM(debug=debug, **data)
+            return NodeClientLLM(**extra, **data)
         elif nodo_tipo == 'send_message':
-            return NodeSendMessage(debug=debug, **data)
+            return NodeSendMessage(**extra, **data)
         elif nodo_tipo == 'void':  # 'Void' node does nothing
             return lambda _: None
         else:
@@ -75,7 +79,7 @@ async def execute_graph(graph: dict,
             continue  # Skip unsupported nodes
 
     # Helper function to handle node execution
-    async def process_node(source_id, target_id, target_handle=None):
+    async def process_node(source_id, target_id, source_handle=None, target_handle=None):
         """Executes a source node and forwards its output to the target node."""
         source_node = nodes[source_id]
         target_node = nodes[target_id]
@@ -86,15 +90,17 @@ async def execute_graph(graph: dict,
                 output = item['content']
             elif item['type'] == 'content':
                 yield item['content']
-
         # Send the output of the source node to the target node
-        if target_handle and output:
-            target_node.add_parent(output, target_handle)
+        if target_handle and source_handle and output:
+            target_node.add_parent(output, source_handle, target_handle)
 
     # Iterate through edges and connect source to targets
     for edge in edges:
         # Trigger processing of source-to-target execution
-        async for result in process_node(edge["source"], edge["target"], edge.get('targetHandle')):
+        async for result in process_node(edge["source"],
+                                         edge["target"],
+                                         edge.get('sourceHandle'),
+                                         edge.get('targetHandle')):
             yield result
 
 
