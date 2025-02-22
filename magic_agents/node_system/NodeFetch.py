@@ -15,7 +15,7 @@ async def make_request(url, data, headers):
         }
 
     async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, data=data) as response:
+        async with session.post(url, headers=headers, data=json.dumps(data)) as response:
             json_response = await response.json()
             return json_response
 
@@ -46,7 +46,7 @@ class NodeFetch(Node):
 
         with ThreadPoolExecutor() as executor:
             res = executor.submit(sync_make_request, self.url, data, self.headers).result()
-
+        print('NodeFetch:', res)
         yield {
             'type': 'end',
             'content': super().prep(res)

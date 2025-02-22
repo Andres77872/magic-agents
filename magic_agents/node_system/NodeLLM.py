@@ -1,5 +1,6 @@
 import json
 
+from magic_llm import MagicLLM
 from magic_llm.model import ModelChat
 
 from magic_agents.node_system.Node import Node
@@ -8,10 +9,15 @@ from magic_agents.util.const import HANDLE_CHAT, HANDLE_SYSTEM_CONTEXT, HANDLE_U
 
 class NodeLLM(Node):
     def __init__(self,
+                 node_id: str,
                  stream: bool = True,
                  json_output: bool = False,
+                 debug: bool = False,
                  **kwargs):
-        super().__init__(**kwargs)
+        super().__init__(
+            debug=debug,
+            node_id=node_id,
+            **kwargs)
         self.stream = stream
         self.json_output = json_output
         self.extra_data = kwargs
@@ -19,7 +25,7 @@ class NodeLLM(Node):
 
     async def process(self, chat_log):
         params = self.parents
-        client = self.parents['handle-client-provider']
+        client: MagicLLM = self.parents['handle-client-provider']
         if c := params.get(HANDLE_CHAT):
             chat = c['chat']
         else:
@@ -33,6 +39,7 @@ class NodeLLM(Node):
             else:
                 chat.messages = chat.messages[-4:]
             intention = await client.llm.async_generate(chat, **self.extra_data)
+            print('INTENTION', intention)
             self.generated = intention.content
         else:
             async for i in client.llm.async_stream_generate(chat, **self.extra_data):

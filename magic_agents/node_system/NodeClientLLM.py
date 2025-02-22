@@ -8,8 +8,14 @@ class NodeClientLLM(Node):
                  engine: str,
                  api_key: str,
                  base_url: str,
+                 node_id: str,
+                 debug: bool = False,
                  **kwargs) -> None:
-        super().__init__(**kwargs)
+        super().__init__(
+            node_id=node_id,
+            debug=debug,
+            **kwargs
+        )
         self.client = MagicLLM(engine=engine,
                                private_key=api_key,
                                base_url=base_url,
