@@ -1,88 +1,120 @@
 import json
+import logging
 import uuid
-from typing import Callable
+from typing import Callable, Dict, Any, AsyncGenerator, Optional, Union
+
+from pydantic import BaseModel, Field, ValidationError
 
 from magic_agents.models.model_agent_run_log import ModelAgentRunLog
-from magic_agents.node_system import (NodeChat,
-                                      NodeLLM,
-                                      NodeEND,
-                                      NodeText,
-                                      NodeUserInput,
-                                      NodeFetch,
-                                      NodeClientLLM,
-                                      NodeSendMessage,
-                                      )
-from magic_agents.node_system.NodeParser import NodeParser
+from magic_agents.node_system import (
+    NodeChat,
+    NodeLLM,
+    NodeEND,
+    NodeText,
+    NodeUserInput,
+    NodeFetch,
+    NodeClientLLM,
+    NodeSendMessage,
+    NodeParser
+)
 from magic_agents.util.const import HANDLE_VOID
 
+logger = logging.getLogger(__name__)
 
-async def execute_graph(graph: dict,
-                        load_chat: Callable,
-                        id_chat: int | str = None,
-                        id_thread: int | str = None,
-                        id_user: int | str = None):
-    # Prepare nodes and edges
-    nodes = {}
-    edges = graph["edges"]
 
-    # Initialize the logs for execution tracking
-    chat_completion_log = {
-        'id_chat': id_chat,
-        'id_thread': id_thread,
-        'id_user': id_user,
-        'id_app': 'magic-research',
-        'execution': [],
-        'execution_time': 0,
-    }
-    chat_log = ModelAgentRunLog(**chat_completion_log)
+class NodeTypes:
+    CHAT = 'chat'
+    LLM = 'llm'
+    END = 'end'
+    TEXT = 'text'
+    USER_INPUT = 'user_input'
+    PARSER = 'parser'
+    FETCH = 'fetch'
+    CLIENT = 'client'
+    SEND_MESSAGE = 'send_message'
+    VOID = 'void'
 
-    # Helper function to instantiate node objects
-    def create_node(node_data):
-        """Create a node instance based on its type."""
-        nodo_tipo = node_data['type']
-        data = node_data.get('data', {})
-        node_id = node_data['id']
-        extra = {
-            'debug': debug,
-            'node_id': node_id
-        }
-        if nodo_tipo == 'chat':
-            return NodeChat(load_chat=load_chat, **extra, **data)
-        elif nodo_tipo == 'llm':
-            return NodeLLM(**extra, **data)
-        elif nodo_tipo == 'end':
+
+class GraphNode(BaseModel):
+    type: str
+    id: str
+    data: Dict[str, Any] = Field(default_factory=dict)
+
+
+class GraphEdge(BaseModel):
+    id: str
+    source: str
+    target: str
+    sourceHandle: Optional[str] = None
+    targetHandle: Optional[str] = HANDLE_VOID
+
+
+class Graph(BaseModel):
+    nodes: list[GraphNode]
+    edges: list[GraphEdge]
+    debug: bool = False
+    extras: Optional[Dict[str, Any]] = None
+
+
+def create_node(node: GraphNode, load_chat: Callable, debug: bool = False):
+    """Factory method to create node instances."""
+    extra = {'debug': debug, 'node_id': node.id}
+    match node.type:
+        case NodeTypes.CHAT:
+            return NodeChat(load_chat=load_chat, **extra, **node.data)
+        case NodeTypes.LLM:
+            return NodeLLM(**extra, **node.data)
+        case NodeTypes.END:
             return NodeEND(**extra)
-        elif nodo_tipo == 'text':
-            return NodeText(text=data['content'], **extra)
-        elif nodo_tipo == 'user_input':
-            return NodeUserInput(text=data['content'], **extra)
-        elif nodo_tipo == 'parser':
-            return NodeParser(**extra, **data)
-        elif nodo_tipo == 'fetch':
-            return NodeFetch(**extra, **data)
-        elif nodo_tipo == 'client':
-            return NodeClientLLM(**extra, **data)
-        elif nodo_tipo == 'send_message':
-            return NodeSendMessage(**extra, **data)
-        elif nodo_tipo == 'void':  # 'Void' node does nothing
+        case NodeTypes.TEXT:
+            return NodeText(text=node.data.get('content', ''), **extra)
+        case NodeTypes.USER_INPUT:
+            return NodeUserInput(text=node.data.get('content', ''), **extra)
+        case NodeTypes.PARSER:
+            return NodeParser(**extra, **node.data)
+        case NodeTypes.FETCH:
+            return NodeFetch(**extra, **node.data)
+        case NodeTypes.CLIENT:
+            return NodeClientLLM(**extra, **node.data)
+        case NodeTypes.SEND_MESSAGE:
+            return NodeSendMessage(**extra, **node.data)
+        case NodeTypes.VOID:
             return lambda _: None
-        else:
-            raise ValueError(f"Unsupported node type: {nodo_tipo}")
+        case _:
+            raise ValueError(f"Unsupported node type: {node.type}")
 
-    # Initialize all nodes based on the graph
-    debug = graph.get('debug', False)
-    for nd in graph['nodes']:
-        try:
-            nodes[nd['id']] = create_node(nd)
-        except ValueError as e:
-            print(f"Error creating node: {e}")
-            continue  # Skip unsupported nodes
 
-    # Helper function to handle node execution
-    async def process_node(source_id, target_id, source_handle=None, target_handle=None):
-        """Executes a source node and forwards its output to the target node."""
-        source_node = nodes[source_id]
-        target_node = nodes[target_id]
+async def execute_graph(graph_data: dict,
+                        load_chat: Callable,
+                        id_chat: Optional[Union[int, str]] = None,
+                        id_thread: Optional[Union[int, str]] = None,
+                        id_user: Optional[Union[int, str]] = None
+                        ) -> AsyncGenerator[str, None]:
+    try:
+        graph = Graph(**graph_data)
+    except ValidationError as e:
+        logger.error(f"Validation error while loading graph: {e}")
+        return
+
+    nodes: Dict[str, Any] = {
+        node.id: create_node(node, load_chat, graph.debug) for node in graph.nodes
+    }
+
+    chat_log = ModelAgentRunLog(
+        id_chat=id_chat, id_thread=id_thread, id_user=id_user,
+        id_app='magic-research'
+    )
+
+    async def process_edge(edge: GraphEdge) -> AsyncGenerator[str, None]:
+        source_node = nodes.get(edge.source)
+        target_node = nodes.get(edge.target)
+
+        if not source_node:
+            logger.error(f"Source node {edge.source} not found.")
+            return
+        if not target_node:
+            logger.error(f"Target node {edge.target} not found.")
+            return
 
         output = None
         async for item in source_node(chat_log):
@@ -90,59 +122,54 @@ async def execute_graph(graph: dict,
                 output = item['content']
             elif item['type'] == 'content':
                 yield item['content']
-        # Send the output of the source node to the target node
-        if target_handle and source_handle and output:
-            target_node.add_parent(output, source_handle, target_handle)
 
-    # Iterate through edges and connect source to targets
-    for edge in edges:
-        # Trigger processing of source-to-target execution
-        async for result in process_node(edge["source"],
-                                         edge["target"],
-                                         edge.get('sourceHandle'),
-                                         edge.get('targetHandle')):
+        if edge.targetHandle and edge.sourceHandle and output:
+            target_node.add_parent(output, edge.sourceHandle, edge.targetHandle)
+
+    for edge in graph.edges:
+        async for result in process_edge(edge):
             yield result
 
 
-async def run_agent(message: str,
-                    agt: dict,
-                    load_chat: Callable,
-                    id_chat: int | str = None,
-                    id_thread: int | str = None,
-                    id_user: int | str = None,
-                    extras: str = None):
+async def run_agent(
+        message: str,
+        agt_data: dict,
+        load_chat: Callable,
+        id_chat: Optional[Union[int, str]] = None,
+        id_thread: Optional[Union[int, str]] = None,
+        id_user: Optional[Union[int, str]] = None,
+        extras: Optional[str] = None) -> AsyncGenerator[str, None]:
     if extras:
-        agt.update({
-            'extras': json.loads(extras)
-        })
+        try:
+            agt_data['extras'] = json.loads(extras)
+        except json.JSONDecodeError:
+            logger.error("Invalid extras format. Should be valid JSON.")
+            return
+
     void_id = uuid.uuid4().hex
-    agt['nodes'].append({
-        'type': 'void',
-        'id': void_id
-    })
+    agt_data['nodes'].append({'type': NodeTypes.VOID, 'id': void_id})
 
-    for i in agt['edges']:
-        if 'targetHandle' not in i:
-            i['targetHandle'] = HANDLE_VOID
-        if i['targetHandle'] == HANDLE_VOID:
-            i['target'] = void_id
+    # Prepare graph data
+    for edge in agt_data['edges']:
+        edge.setdefault('targetHandle', HANDLE_VOID)
+        if edge['targetHandle'] == HANDLE_VOID:
+            edge['target'] = void_id
 
-    for i in agt['nodes']:
-        if i['type'] == 'user_input':
-            i['data'] = {'content': message}
-        if i['type'] == 'chat':
-            i['data'].update({'message': message})
-        if i['type'] == 'end':
-            agt['edges'].append({
+    for node in agt_data['nodes']:
+        if node['type'] in [NodeTypes.USER_INPUT, NodeTypes.CHAT]:
+            node['data'] = node.get('data', {})
+            node['data']['content' if node['type'] == NodeTypes.USER_INPUT else 'message'] = message
+        elif node['type'] == NodeTypes.END:
+            agt_data['edges'].append({
                 "id": uuid.uuid4().hex,
-                "source": i['id'],
+                "source": node['id'],
                 "target": void_id
             })
 
-    r = execute_graph(graph=agt,
-                      id_chat=id_chat,
-                      id_thread=id_thread,
-                      id_user=id_user,
-                      load_chat=load_chat)
-    async for i in r:
-        yield i
+    async for result in execute_graph(
+            graph_data=agt_data,
+            id_chat=id_chat,
+            id_thread=id_thread,
+            id_user=id_user,
+            load_chat=load_chat):
+        yield result

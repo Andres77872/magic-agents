@@ -16,9 +16,10 @@ idna==3.7
 iniconfig==2.0.0
 Jinja2==3.1.4
 jmespath==1.0.1
-magic_llm @ git+https://github.com/Andres77872/magic-llm.git@3e00b9732686a968991a516944d1613c7aef1045
+magic_llm @ git+https://github.com/Andres77872/magic-llm.git@55e4aa3a093021e21347c56464c5060b6b046712
 MarkupSafe==3.0.2
 multidict==6.0.5
+networkx==3.4.2
 packaging==24.2
 pluggy==1.5.0
 pydantic==2.5.3

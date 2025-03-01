@@ -5,10 +5,10 @@ from magic_agents.util.template_parser import template_parse
 class NodeParser(Node):
     def __init__(self, text: str, **kwargs) -> None:
         super().__init__(**kwargs)
-        self._text = text
+        self.text = text
 
     async def process(self, chat_log):
-        output = template_parse(template=self._text, params=self.parents)
+        output = template_parse(template=self.text, params=self.parents)
         yield {
             'type': 'end',
             'content': super().prep(output)
