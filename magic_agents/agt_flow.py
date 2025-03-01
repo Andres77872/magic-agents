@@ -79,7 +79,7 @@ def create_node(node: GraphNode, load_chat: Callable, debug: bool = False):
         case NodeTypes.SEND_MESSAGE:
             return NodeSendMessage(**extra, **node.data)
         case NodeTypes.VOID:
-            return lambda _: None
+            return NodeEND(**extra)
         case _:
             raise ValueError(f"Unsupported node type: {node.type}")
 
@@ -105,9 +105,9 @@ async def execute_graph(graph_data: dict,
         id_app='magic-research'
     )
 
-    async def process_edge(edge: GraphEdge) -> AsyncGenerator[str, None]:
-        source_node = nodes.get(edge.source)
-        target_node = nodes.get(edge.target)
+    async def process_edge(edge: GraphEdge):
+        source_node = nodes[edge.source]
+        target_node = nodes[edge.target]
 
         if not source_node:
             logger.error(f"Source node {edge.source} not found.")
@@ -116,15 +116,19 @@ async def execute_graph(graph_data: dict,
             logger.error(f"Target node {edge.target} not found.")
             return
 
-        output = None
-        async for item in source_node(chat_log):
-            if item['type'] == 'end':
-                output = item['content']
-            elif item['type'] == 'content':
-                yield item['content']
+        # Execute source node (only if outputs not already computed)
+        if not source_node.outputs:
+            async for item in source_node(chat_log):
+                if item["type"] == "end":
+                    source_node.outputs[edge.sourceHandle] = item["content"]  # outputs must be structured as dict
+                elif item["type"] == "content":
+                    yield item["content"]
 
-        if edge.targetHandle and edge.sourceHandle and output:
-            target_node.add_parent(output, edge.sourceHandle, edge.targetHandle)
+        # Pass output at source_handle to target_handle input
+        source_handle = edge.sourceHandle
+        target_handle = edge.targetHandle
+        print('target_node : ', target_node)
+        target_node.add_parent(source_node.outputs, source_handle, target_handle)
 
     for edge in graph.edges:
         async for result in process_edge(edge):
