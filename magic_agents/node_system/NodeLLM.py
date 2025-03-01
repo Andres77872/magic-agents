@@ -24,8 +24,8 @@ class NodeLLM(Node):
         self.generated = ''
 
     async def process(self, chat_log):
-        params = self.parents
-        client: MagicLLM = self.parents['handle-client-provider']
+        params = self.inputs
+        client: MagicLLM = self.inputs['handle-client-provider']
         if c := params.get(HANDLE_CHAT):
             chat = c['chat']
         else:

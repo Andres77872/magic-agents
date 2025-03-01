@@ -24,7 +24,7 @@ class NodeChat(Node):
 
     async def process(self, chat_log):
         print('Node chat')
-        params = self.parents
+        params = self.inputs
         print('PARENTS', params)
         if c := params.get(HANDLE_SYSTEM_CONTEXT):
             # chat_log.chat_system = c

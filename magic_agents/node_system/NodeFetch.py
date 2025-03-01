@@ -41,7 +41,7 @@ class NodeFetch(Node):
     async def process(self, chat_log):
         data_str = json.dumps(self.data)
         template = Template(data_str)
-        output = template.render(self.parents)
+        output = template.render(self.inputs)
         data = json.loads(output)
 
         with ThreadPoolExecutor() as executor:

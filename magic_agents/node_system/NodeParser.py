@@ -8,7 +8,7 @@ class NodeParser(Node):
         self.text = text
 
     async def process(self, chat_log):
-        output = template_parse(template=self.text, params=self.parents)
+        output = template_parse(template=self.text, params=self.inputs)
         yield {
             'type': 'end',
             'content': super().prep(output)
