@@ -4,10 +4,14 @@ from magic_llm import MagicLLM
 from magic_llm.model import ModelChat
 
 from magic_agents.node_system.Node import Node
-from magic_agents.util.const import HANDLE_CHAT, HANDLE_SYSTEM_CONTEXT, HANDLE_USER_MESSAGE
 
 
 class NodeLLM(Node):
+    INPUT_HANDLER_CLIENT_PROVIDER = 'handle-client-provider'
+    INPUT_HANDLER_CHAT = 'handle-chat'
+    INPUT_HANDLER_SYSTEM_CONTEXT = 'handle-system-context'
+    INPUT_HANDLER_USER_MESSAGE = 'handle_user_message'
+
     def __init__(self,
                  node_id: str,
                  stream: bool = True,
@@ -25,13 +29,15 @@ class NodeLLM(Node):
 
     async def process(self, chat_log):
         params = self.inputs
-        client: MagicLLM = self.inputs['handle-client-provider']
-        if c := params.get(HANDLE_CHAT):
-            chat = c['chat']
+        client: MagicLLM = self.inputs[self.INPUT_HANDLER_CLIENT_PROVIDER]
+        if c := params.get(self.INPUT_HANDLER_CHAT):
+            chat = c
         else:
-            chat = ModelChat(params.get(HANDLE_SYSTEM_CONTEXT))
-            if k := params.get(HANDLE_USER_MESSAGE):
+            chat = ModelChat(params.get(self.INPUT_HANDLER_SYSTEM_CONTEXT))
+            if k := params.get(self.INPUT_HANDLER_USER_MESSAGE):
                 chat.add_user_message(k)
+            else:
+                raise ValueError('No message provided')
 
         if not self.stream:
             if chat.messages[0]['role'] == 'system':

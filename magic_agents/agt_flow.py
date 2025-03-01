@@ -127,7 +127,6 @@ async def execute_graph(graph_data: dict,
         # Pass output at source_handle to target_handle input
         source_handle = edge.sourceHandle
         target_handle = edge.targetHandle
-        print('target_node : ', target_node)
         target_node.add_parent(source_node.outputs, source_handle, target_handle)
 
     for edge in graph.edges:
