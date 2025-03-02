@@ -16,10 +16,12 @@ class NodeClientLLM(Node):
             debug=debug,
             **kwargs
         )
-        self.client = MagicLLM(engine=engine,
-                               private_key=api_key,
-                               base_url=base_url,
-                               **kwargs)
+
+        kwargs['private_key'] = api_key
+        kwargs['base_url'] = base_url
+        kwargs['engine'] = engine
+
+        self.client = MagicLLM(**kwargs)
 
     async def process(self, chat_log):
         yield {

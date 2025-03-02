@@ -1,29 +1,7 @@
 import json
-from concurrent.futures import ThreadPoolExecutor
-
 import aiohttp
 from jinja2 import Template
-
 from magic_agents.node_system.Node import Node
-
-
-async def make_request(url, data, headers):
-    if headers is None:
-        headers = {
-            'accept': 'application/json',
-            'Content-Type': 'application/x-www-form-urlencoded'
-        }
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, data=json.dumps(data)) as response:
-            json_response = await response.json()
-            return json_response
-
-
-def sync_make_request(url: str, data: dict, headers: dict = None):
-    import asyncio
-    return asyncio.run(make_request(url, data, headers))
-
 
 class NodeFetch(Node):
     def __init__(self,
@@ -33,21 +11,28 @@ class NodeFetch(Node):
                  headers: dict = None,
                  **kwargs) -> None:
         super().__init__(**kwargs)
-        self.method = method
-        self.headers = headers
+        self.method = method.upper()
+        self.headers = headers or {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        }
         self.url = url
-        self.data = data
+        self.data = data or {}
+
+    async def fetch(self, session, url, data):
+        async with session.post(url, headers=self.headers, json=data) as response:
+            response.raise_for_status()  # Lanzar excepción si falla la petición HTTP
+            return await response.json()
 
     async def process(self, chat_log):
-        data_str = json.dumps(self.data)
-        template = Template(data_str)
-        output = template.render(self.inputs)
-        data = json.loads(output)
+        # Renderizar dinámicamente el payload con Jinja
+        template = Template(json.dumps(self.data))
+        rendered_data = json.loads(template.render(self.inputs))
 
-        with ThreadPoolExecutor() as executor:
-            res = executor.submit(sync_make_request, self.url, data, self.headers).result()
-        print('NodeFetch:', res)
+        async with aiohttp.ClientSession() as session:
+            response_json = await self.fetch(session, self.url, rendered_data)
+
         yield {
             'type': 'end',
-            'content': super().prep(res)
+            'content': super().prep(response_json)
         }

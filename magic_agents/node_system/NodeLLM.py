@@ -40,12 +40,7 @@ class NodeLLM(Node):
                 raise ValueError('No message provided')
 
         if not self.stream:
-            if chat.messages[0]['role'] == 'system':
-                chat.messages = chat.messages[-5:]
-            else:
-                chat.messages = chat.messages[-4:]
             intention = await client.llm.async_generate(chat, **self.extra_data)
-            print('INTENTION', intention)
             self.generated = intention.content
         else:
             async for i in client.llm.async_stream_generate(chat, **self.extra_data):
