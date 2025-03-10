@@ -3,6 +3,7 @@ import json
 from magic_llm import MagicLLM
 from magic_llm.model import ModelChat
 
+from magic_agents.models.factory.Nodes.LlmNodeModel import LlmNodeModel
 from magic_agents.node_system.Node import Node
 
 
@@ -13,18 +14,17 @@ class NodeLLM(Node):
     INPUT_HANDLER_USER_MESSAGE = 'handle_user_message'
 
     def __init__(self,
+                 data: LlmNodeModel,
                  node_id: str,
-                 stream: bool = True,
-                 json_output: bool = False,
                  debug: bool = False,
                  **kwargs):
         super().__init__(
             debug=debug,
             node_id=node_id,
             **kwargs)
-        self.stream = stream
-        self.json_output = json_output
-        self.extra_data = kwargs
+        self.stream = data.stream
+        self.json_output = data.json_output
+        self.extra_data = data.extra_data
         self.generated = ''
 
     async def process(self, chat_log):

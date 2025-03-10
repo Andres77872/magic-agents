@@ -17,11 +17,11 @@ class Node(abc.ABC):
     """
 
     def __init__(
-        self,
-        cost: float = 0.0,
-        node_id: Optional[str] = None,
-        debug: bool = False,
-        **kwargs,
+            self,
+            cost: float = 0.0,
+            node_id: Optional[str] = None,
+            debug: bool = False,
+            **kwargs,
     ):
         """
         Initialize a Node instance.
@@ -72,7 +72,7 @@ class Node(abc.ABC):
             cls.process = magic_telemetry(process_method)
 
     async def __call__(
-        self, chat_log: ModelAgentRunLog
+            self, chat_log: ModelAgentRunLog
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Invoke the node execution. Return precomputed result if already computed.
@@ -88,7 +88,7 @@ class Node(abc.ABC):
 
     @abc.abstractmethod
     async def process(
-        self, chat_log: ModelAgentRunLog
+            self, chat_log: ModelAgentRunLog
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Abstract method. Subclasses implement their specific processing logic here.

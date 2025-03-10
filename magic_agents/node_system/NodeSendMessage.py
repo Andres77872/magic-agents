@@ -2,18 +2,18 @@ import json
 
 from magic_llm.model.ModelChatStream import ChatCompletionModel, ChoiceModel
 
+from magic_agents.models.factory.Nodes.SendMessageNodeModel import SendMessageNodeModel
 from magic_agents.node_system.Node import Node
 
 
 class NodeSendMessage(Node):
     def __init__(self,
-                 message: str = '',
-                 json_extras: bool = False,
+                 data: SendMessageNodeModel,
                  **kwargs
                  ) -> None:
         super().__init__(**kwargs)
-        self.message = message
-        self.json_extras = json_extras
+        self.message = data.message
+        self.json_extras = data.json_extras
 
     async def process(self, chat_log):
         output = self.inputs['handle_send_extra']

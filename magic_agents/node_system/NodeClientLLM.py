@@ -1,13 +1,12 @@
 from magic_llm import MagicLLM
 
+from magic_agents.models.factory.Nodes.ClientNodeModel import ClientNodeModel
 from magic_agents.node_system.Node import Node
 
 
 class NodeClientLLM(Node):
     def __init__(self,
-                 engine: str,
-                 api_key: str,
-                 base_url: str,
+                 data: ClientNodeModel,
                  node_id: str,
                  debug: bool = False,
                  **kwargs) -> None:
@@ -17,11 +16,15 @@ class NodeClientLLM(Node):
             **kwargs
         )
 
-        kwargs['private_key'] = api_key
-        kwargs['base_url'] = base_url
-        kwargs['engine'] = engine
+        args = {
+            'private_key': data.api_key,
+            'base_url': data.base_url,
+            'engine': data.engine,
+            'model': data.model,
+            **data.extra_data
+        }
 
-        self.client = MagicLLM(**kwargs)
+        self.client = MagicLLM(**args)
 
     async def process(self, chat_log):
         yield {
