@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Literal
 
 from magic_llm.engine import (EngineOpenAI,
                               EngineAnthropic,
@@ -7,12 +7,21 @@ from magic_llm.engine import (EngineOpenAI,
                               EngineAmazon,
                               EngineCohere,
                               EngineCloudFlare)
-from pydantic import BaseModel
 
 from magic_agents.models.factory.Nodes.BaseNodeModel import BaseNodeModel
 
+ModelClientAvailableType = Literal[
+    EngineOpenAI.engine,
+    EngineAnthropic.engine,
+    EngineGoogle.engine,
+    EngineAzure.engine,
+    EngineAmazon.engine,
+    EngineCohere.engine,
+    EngineCloudFlare.engine
+]
 
-class ClientEngineAvailableModel(BaseModel):
+
+class ClientEngineAvailableModel:
     OPENAI = EngineOpenAI.engine
     ANTHROPIC = EngineAnthropic.engine
     GOOGLE = EngineGoogle.engine
@@ -22,12 +31,8 @@ class ClientEngineAvailableModel(BaseModel):
     CLOUDFLARE = EngineCloudFlare.engine
 
 
-class ClientDataModel(BaseModel):
-    engine: ClientEngineAvailableModel
+class ClientNodeModel(BaseNodeModel):
+    engine: ModelClientAvailableType
     api_key: Optional[str]
     base_url: Optional[str]
     model: str
-
-
-class ClientNodeModel(BaseNodeModel):
-    data: ClientDataModel

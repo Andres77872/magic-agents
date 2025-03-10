@@ -1,16 +1,34 @@
-from pydantic import BaseModel
+from typing import Literal, Optional, Any
+
+from pydantic import BaseModel, Field
+
+ModelAgentFlowType = Literal[
+    'user_input',
+    'end',
+    'parser',
+    'client',
+    'llm',
+    'fetch',
+    'send_message',
+    'chat',
+    'text',
+    'void'
+]
 
 
-class ModelAgentFlowTypesModel(BaseModel):
-    USER_INPUT = 'user_input'
-    END = 'end'
-    PARSER = 'parser'
-    CLIENT = 'client'
+class ModelAgentFlowTypesModel:
+    CHAT = 'chat'
     LLM = 'llm'
+    END = 'end'
+    TEXT = 'text'
+    USER_INPUT = 'user_input'
+    PARSER = 'parser'
     FETCH = 'fetch'
+    CLIENT = 'client'
     SEND_MESSAGE = 'send_message'
+    VOID = 'void'
 
 
 class BaseNodeModel(BaseModel):
-    id_model: int | str
-    type: ModelAgentFlowTypesModel
+    position: Optional[dict[str, int]] = {'x': 0, 'y': 0}
+    extra_data: Optional[dict[str, Any]] = Field(default_factory=dict)
