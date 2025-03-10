@@ -1,4 +1,4 @@
-from magic_agents.models.factory.Nodes.TextNodeModel import TextNodeModel
+from magic_agents.models.factory.Nodes import TextNodeModel
 from magic_agents.node_system.Node import Node
 
 

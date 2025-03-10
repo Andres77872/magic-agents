@@ -1,6 +1,6 @@
 import uuid
 
-from magic_agents.models.factory.Nodes.UserInputNodeModel import UserInputNodeModel
+from magic_agents.models.factory.Nodes import UserInputNodeModel
 from magic_agents.node_system.Node import Node
 
 

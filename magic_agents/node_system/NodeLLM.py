@@ -3,7 +3,7 @@ import json
 from magic_llm import MagicLLM
 from magic_llm.model import ModelChat
 
-from magic_agents.models.factory.Nodes.LlmNodeModel import LlmNodeModel
+from magic_agents.models.factory.Nodes import LlmNodeModel
 from magic_agents.node_system.Node import Node
 
 

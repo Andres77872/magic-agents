@@ -2,7 +2,7 @@ import json
 
 from magic_llm.model.ModelChatStream import ChatCompletionModel, ChoiceModel
 
-from magic_agents.models.factory.Nodes.SendMessageNodeModel import SendMessageNodeModel
+from magic_agents.models.factory.Nodes import SendMessageNodeModel
 from magic_agents.node_system.Node import Node
 
 

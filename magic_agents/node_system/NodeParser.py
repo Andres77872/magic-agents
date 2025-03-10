@@ -1,4 +1,4 @@
-from magic_agents.models.factory.Nodes.ParserNodeModel import ParserNodeModel
+from magic_agents.models.factory.Nodes import ParserNodeModel
 from magic_agents.node_system.Node import Node
 from magic_agents.util.template_parser import template_parse
 

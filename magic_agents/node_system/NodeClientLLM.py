@@ -1,6 +1,6 @@
 from magic_llm import MagicLLM
 
-from magic_agents.models.factory.Nodes.ClientNodeModel import ClientNodeModel
+from magic_agents.models.factory.Nodes import ClientNodeModel
 from magic_agents.node_system.Node import Node
 
 

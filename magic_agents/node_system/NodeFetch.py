@@ -3,7 +3,7 @@ import json
 import aiohttp
 from jinja2 import Template
 
-from magic_agents.models.factory.Nodes.FetchNodeModel import FetchNodeModel
+from magic_agents.models.factory.Nodes import FetchNodeModel
 from magic_agents.node_system.Node import Node
 
 
