@@ -2,6 +2,8 @@ import logging
 import uuid
 from typing import Callable, Dict, Any, AsyncGenerator, Optional, Union
 
+from magic_llm.model.ModelChatStream import ChatCompletionModel
+
 from magic_agents.models.factory.AgentFlowModel import AgentFlowModel
 from magic_agents.models.factory.EdgeNodeModel import EdgeNodeModel
 from magic_agents.models.factory.Nodes import (ModelAgentFlowTypesModel,
@@ -62,7 +64,7 @@ async def execute_graph(graph: AgentFlowModel,
                         id_chat: Optional[Union[int, str]] = None,
                         id_thread: Optional[Union[int, str]] = None,
                         id_user: Optional[Union[int, str]] = None
-                        ) -> AsyncGenerator[str, None]:
+                        ) -> AsyncGenerator[ChatCompletionModel, None]:
     nodes = graph.nodes
 
     chat_log = ModelAgentRunLog(
@@ -136,7 +138,7 @@ async def run_agent(
         graph: AgentFlowModel,
         id_chat: Optional[Union[int, str]] = None,
         id_thread: Optional[Union[int, str]] = None,
-        id_user: Optional[Union[int, str]] = None) -> AsyncGenerator[str, None]:
+        id_user: Optional[Union[int, str]] = None) -> AsyncGenerator[ChatCompletionModel, None]:
     async for result in execute_graph(
             graph=graph,
             id_chat=id_chat,
