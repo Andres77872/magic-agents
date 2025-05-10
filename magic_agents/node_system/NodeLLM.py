@@ -29,7 +29,7 @@ class NodeLLM(Node):
 
     async def process(self, chat_log):
         params = self.inputs
-        client: MagicLLM = self.inputs[self.INPUT_HANDLER_CLIENT_PROVIDER]
+        client: MagicLLM = self.get_input(self.INPUT_HANDLER_CLIENT_PROVIDER, required=True)
         if c := params.get(self.INPUT_HANDLER_CHAT):
             chat = c
         else:
@@ -45,13 +45,7 @@ class NodeLLM(Node):
         else:
             async for i in client.llm.async_stream_generate(chat, **self.extra_data):
                 self.generated += i.choices[0].delta.content
-                yield {
-                    'type': 'content',
-                    'content': i
-                }
+                yield self.yield_static(i, content_type='content')
         if self.json_output:
             self.generated = json.loads(self.generated)
-        yield {
-            'type': 'end',
-            'content': super().prep(self.generated)
-        }
+        yield self.yield_static(self.generated)

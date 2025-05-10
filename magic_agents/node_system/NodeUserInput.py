@@ -14,7 +14,4 @@ class NodeUserInput(Node):
             chat_log.id_chat = str(uuid.uuid4())
         if not chat_log.id_thread:
             chat_log.id_thread = str(uuid.uuid4())
-        yield {
-            'type': 'end',
-            'content': super().prep(self._text)
-        }
+        yield self.yield_static(self._text)

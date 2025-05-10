@@ -16,10 +16,11 @@ class NodeSendMessage(Node):
         self.json_extras = data.json_extras
 
     async def process(self, chat_log):
-        output = self.inputs['handle_send_extra']
+        output = self.get_input('handle_send_extra')
         if self.json_extras:
             output = json.loads(output)
-        yield {
-            'type': 'content',
-            'content': ChatCompletionModel(id='', model='', choices=[ChoiceModel()], extras=output)
-        }
+        yield self.yield_static(ChatCompletionModel(id='',
+                                                    model='',
+                                                    choices=[ChoiceModel()],
+                                                    extras=output),
+                                content_type='content')

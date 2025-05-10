@@ -26,14 +26,11 @@ class NodeChat(Node):
             self.chat = ModelChat(max_input_tokens=memory.get('max_input_tokens'))
 
     async def process(self, chat_log):
-        if c := self.inputs.get(self.INPUT_HANDLER_MESSAGES):
+        if c := self.get_input(self.INPUT_HANDLER_MESSAGES):
             self.chat.messages = c
         else:
-            if c := self.inputs.get(self.INPUT_HANDLER_SYSTEM_CONTEXT):
+            if c := self.get_input(self.INPUT_HANDLER_SYSTEM_CONTEXT):
                 self.chat.set_system(c)
-            if c := self.inputs.get(self.INPUT_HANDLER_USER_MESSAGE):
+            if c := self.get_input(self.INPUT_HANDLER_USER_MESSAGE):
                 self.chat.add_user_message(c)
-        yield {
-            'type': 'end',
-            'content': super().prep(self.chat)
-        }
+        yield self.yield_static(self.chat)

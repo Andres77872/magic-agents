@@ -26,14 +26,9 @@ class NodeFetch(Node):
             return await response.json()
 
     async def process(self, chat_log):
-        # Renderizar dinámicamente el payload con Jinja
+        # Render dynamically the payload with Jinja
         template = Template(json.dumps(self.data))
         rendered_data = json.loads(template.render(self.inputs))
-
         async with aiohttp.ClientSession() as session:
             response_json = await self.fetch(session, self.url, rendered_data)
-
-        yield {
-            'type': 'end',
-            'content': super().prep(response_json)
-        }
+        yield self.yield_static(response_json)

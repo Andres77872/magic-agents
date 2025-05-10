@@ -80,3 +80,23 @@ def sort_nodes(nodes: List[Dict], edges: List[Dict]) -> Tuple[List[Dict], List[D
     sorted_nodes_with_positions = assign_node_positions(nodes, graph, sorted_node_ids)
 
     return sorted_nodes_with_positions, sorted_edges
+
+
+# Expose only the main node classes and utilities
+__all__ = [
+    "NodeChat",
+    "NodeClientLLM",
+    "NodeEND",
+    "NodeFetch",
+    "NodeLLM",
+    "NodeParser",
+    "NodeSendMessage",
+    "NodeText",
+    "NodeUserInput",
+    "build_graph",
+    "detect_cycles",
+    "perform_topological_sort",
+    "sort_edges_by_nodes_order",
+    "assign_node_positions",
+    "sort_nodes"
+]

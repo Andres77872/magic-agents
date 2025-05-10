@@ -8,7 +8,4 @@ class NodeEND(Node):
         super().__init__(**kwargs)
 
     async def process(self, chat_log):
-        yield {
-            'type': 'content',
-            'content': ChatCompletionModel(id='', model='', choices=[ChoiceModel()])
-        }
+        yield self.yield_static(ChatCompletionModel(id='', model='', choices=[ChoiceModel()]))

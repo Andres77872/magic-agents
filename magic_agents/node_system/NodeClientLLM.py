@@ -27,7 +27,4 @@ class NodeClientLLM(Node):
         self.client = MagicLLM(**args)
 
     async def process(self, chat_log):
-        yield {
-            'type': 'end',
-            'content': super().prep(self.client)
-        }
+        yield self.yield_static(self.client)

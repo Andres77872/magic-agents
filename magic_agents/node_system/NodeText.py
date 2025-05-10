@@ -8,7 +8,4 @@ class NodeText(Node):
         self._text = data.text
 
     async def process(self, chat_log):
-        yield {
-            'type': 'end',
-            'content': super().prep(self._text)
-        }
+        yield self.yield_static(self._text)

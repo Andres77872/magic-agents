@@ -64,6 +64,24 @@ class Node(abc.ABC):
                     f"Node ({self.node_id}): Received input '{content}' from handle '{source_handle}' into '{target_handle}'"
                 )
 
+    def get_input(self, key: str, default=None, required: bool = False):
+        """
+        Utility to fetch an input value from self.inputs, with optional default and required flag.
+        """
+        value = self.inputs.get(key, default)
+        if required and value is None:
+            raise ValueError(f"Required input '{key}' not found in node '{self.node_id or self.__class__.__name__}'")
+        return value
+
+    def yield_static(self, content: any, content_type: str = 'end'):
+        """
+        Utility to yield a static/prepared content in the node's process method.
+        """
+        return {
+            'type': content_type,
+            'content': self.prep(content)
+        }
+
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         # Automatically decorate the `process` method of the subclass with telemetry
