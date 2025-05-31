@@ -1,7 +1,9 @@
 import json
+import uuid
 
 from magic_llm import MagicLLM
 from magic_llm.model import ModelChat
+from magic_llm.model.ModelChatStream import ChatCompletionModel, ChoiceModel
 
 from magic_agents.models.factory.Nodes import LlmNodeModel
 from magic_agents.node_system.Node import Node
@@ -42,6 +44,12 @@ class NodeLLM(Node):
         if not self.stream:
             intention = await client.llm.async_generate(chat, **self.extra_data)
             self.generated = intention.content
+            yield self.yield_static(ChatCompletionModel(
+                id=uuid.uuid4().hex,
+                model=client.llm.model,
+                choices=[ChoiceModel()],
+                usage=intention.usage),
+                content_type='content')
         else:
             async for i in client.llm.async_stream_generate(chat, **self.extra_data):
                 self.generated += i.choices[0].delta.content
