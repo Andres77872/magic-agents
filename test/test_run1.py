@@ -196,11 +196,12 @@ agt = {
             "id": "fetch",
             "data": {
                 "url": "https://google.serper.dev/search",
+                "method": "POST",
                 "headers": {
                     "Content-Type": "application/json",
                     "X-API-KEY": var_env['serper_key'],
                 },
-                "data": {
+                "json_data": {
                     "q": '{{handle_fetch_input}}'
                 }
             },
