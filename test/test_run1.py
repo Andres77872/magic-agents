@@ -166,8 +166,10 @@ agt = {
             "id": "llm-client",
             "data": {
                 "engine": "openai",
-                "api_key": var_env['openai_key'],
-                "base_url": "https://api.openai.com/v1",
+                "api_info": {
+                    "api_key": var_env['openai_key'],
+                    "base_url": "https://api.openai.com/v1"
+                },
                 "model": "gpt-4.1-mini-2025-04-14"
             },
             "type": "client"
@@ -251,6 +253,7 @@ agt = {
 async def test_run_agent():
     def load_chat(**kwargs):
         print(kwargs)
+
     print(agt)
     graph = build(agt_data=agt,
                   message='que es la entropia?, dame las referencias',

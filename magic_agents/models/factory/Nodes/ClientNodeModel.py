@@ -33,6 +33,5 @@ class ClientEngineAvailableModel:
 
 class ClientNodeModel(BaseNodeModel):
     engine: ModelClientAvailableType
-    api_key: Optional[str]
-    base_url: Optional[str]
+    api_info: Optional[dict]
     model: str

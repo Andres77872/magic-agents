@@ -17,12 +17,16 @@ class NodeClientLLM(Node):
         )
 
         args = {
-            'private_key': data.api_key,
-            'base_url': data.base_url,
+            # 'private_key': data.api_key,
+            # 'base_url': data.base_url,
             'engine': data.engine,
             'model': data.model,
+            **data.api_info,
             **data.extra_data
         }
+
+        if 'api_key' in args:
+            args['private_key'] = args['api_key']
 
         self.client = MagicLLM(**args)
 
