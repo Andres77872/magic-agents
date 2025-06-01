@@ -33,5 +33,5 @@ class ClientEngineAvailableModel:
 
 class ClientNodeModel(BaseNodeModel):
     engine: ModelClientAvailableType
-    api_info: Optional[dict]
+    api_info: Optional[dict | str]
     model: str

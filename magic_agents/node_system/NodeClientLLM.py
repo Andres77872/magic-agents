@@ -1,7 +1,8 @@
-from magic_llm import MagicLLM
+import json
 
 from magic_agents.models.factory.Nodes import ClientNodeModel
 from magic_agents.node_system.Node import Node
+from magic_llm import MagicLLM
 
 
 class NodeClientLLM(Node):
@@ -16,12 +17,12 @@ class NodeClientLLM(Node):
             **kwargs
         )
 
+        api_info = data.api_info if type(data.api_info) is dict else json.loads(data.api_info)
+
         args = {
-            # 'private_key': data.api_key,
-            # 'base_url': data.base_url,
             'engine': data.engine,
             'model': data.model,
-            **data.api_info,
+            **api_info,
             **data.extra_data
         }
 
