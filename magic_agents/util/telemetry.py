@@ -18,11 +18,13 @@ def magic_telemetry(func):
         if debug:
             print(f"Executing {qualname}:{self.node_id}...")
         e_intput = {
-            'node_id': self.node_id,
-            'node_type': self.extra_params['node_type'],
-            'node_class': qualname,
-            'start_time': start_time,
-            'end_time': 0,
+            'meta': {
+                'node_id': self.node_id,
+                'node_type': self.extra_params['node_type'],
+                'node_class': qualname,
+                'start_time': start_time,
+                'end_time': 0,
+            }
         }
         yield {
             'type': 'content',
@@ -43,12 +45,14 @@ def magic_telemetry(func):
             print(f"{qualname}:{self.node_id} execution time: {execution_time:.4f} seconds")
 
         e_intput = {
-            'node_id': self.node_id,
-            'node_type': self.extra_params['node_type'],
-            'node_class': qualname,
-            'start_time': start_time,
-            'end_time': end_time,
-            'execution_time': execution_time,
+            'meta': {
+                'node_id': self.node_id,
+                'node_type': self.extra_params['node_type'],
+                'node_class': qualname,
+                'start_time': start_time,
+                'end_time': end_time,
+                'execution_time': execution_time,
+            }
         }
         yield {
             'type': 'content',
