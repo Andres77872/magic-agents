@@ -44,7 +44,7 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False) -> Any:
     Returns:
     Any: Node instance.
     """
-    extra = {'debug': debug, 'node_id': node['id']}
+    extra = {'debug': debug, 'node_id': node['id'], 'node_type': node['type']}
     node_type = node['type']
     node_data = node.get('data', {})
     # Mapping of node types to (constructor, model)
