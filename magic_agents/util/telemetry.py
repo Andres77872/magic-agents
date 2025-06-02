@@ -24,6 +24,7 @@ def magic_telemetry(func):
                 'node_class': qualname,
                 'start_time': start_time,
                 'end_time': 0,
+                'execution_time': 0,
             }
         }
         yield {
