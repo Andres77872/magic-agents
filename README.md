@@ -81,6 +81,7 @@ magic_agents provides a set of built-in node types for common steps:
 | `send_message` | NodeSendMessage      | Send extra JSON payloads (via ChatCompletionModel.extras).    |
 | `end`          | NodeEND              | Terminal node to finalize output or drop into void.           |
 | `void`         | NodeEND (internal)   | Internal drop node for unhandled outputs.                    |
+| `loop`         | NodeLoop             | Iterate over a list and aggregate per-item results.          |
 
 ----
 
@@ -162,6 +163,21 @@ class NodeParser(Node):
         output = template_parse(template=self.text, params=self.inputs)
         yield self.yield_static(output)
 ```
+
+#### `loop` (`NodeLoop`)
+Iterates over a list (JSON string or Python list) via input handle `list`, emitting each element downstream and collecting per-iteration inputs on handle `loop`.
+
+**Example usage:**
+```json
+{
+  "id": "item_loop",
+  "type": "loop"
+}
+```
+
+**What it does:**
+- Emits each list item as an independent content event (handle `item`).
+- Aggregates any inputs received on handle `loop` into a list and emits that at the end via handle `end`.
 
 #### `fetch` (`NodeFetch`)
 Sends an HTTP request (GET/POST/etc.) with optional Jinja2 templated body or JSON, returns parsed JSON.
