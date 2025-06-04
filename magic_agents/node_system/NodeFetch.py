@@ -2,7 +2,6 @@ import json
 
 import aiohttp
 from jinja2 import Template
-
 from magic_agents.models.factory.Nodes import FetchNodeModel
 from magic_agents.node_system.Node import Node
 
@@ -41,6 +40,9 @@ class NodeFetch(Node):
             data = data if type(data) is dict else json.loads(data)
             kwargs['data'] = data
 
+        if 'json' not in kwargs and 'data' not in kwargs:
+            return {}
+
         async with method(**kwargs) as response:
             response.raise_for_status()
             return await response.json()
@@ -49,6 +51,14 @@ class NodeFetch(Node):
         # Prepare the data to send
         data_to_send = None
         json_data_to_send = None
+        run = False
+        for i in self.inputs.values():
+            if i:
+                run = True
+                break
+        if not run:
+            yield self.yield_static({})
+            return
 
         if self.jsondata is not None:
             # Render JSON data with Jinja if jsondata exists

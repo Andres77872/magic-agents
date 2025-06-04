@@ -1,4 +1,8 @@
 import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import pytest
 
@@ -265,13 +269,14 @@ async def test_run_agent():
     ):
         # print(i)
         print(i['content'].choices[0].delta.content, end='')
+        # print(i['content'].extras)
         # print(i, end='')
         # print(i)
 
 
-def test_build_agent():
-    print(agt)
-
-    res = build(agt_data=agt, message='que es la entropia?, dame las referencias')
-
-    print(res)
+# def test_build_agent():
+#     print(agt)
+#
+#     res = build(agt_data=agt, message='que es la entropia?, dame las referencias')
+#
+#     print(res)
