@@ -15,10 +15,10 @@ class NodeLoop(Node):
       - 'item': each element from the list, as a 'content' event.
       - 'end': final aggregation of all 'loop' inputs, as an 'end' event.
     """
-    INPUT_HANDLE_LIST = 'list'
-    INPUT_HANDLE_LOOP = 'loop'
-    OUTPUT_HANDLE_ITEM = 'item'
-    OUTPUT_HANDLE_END = 'end'
+    INPUT_HANDLE_LIST = 'handle_list'
+    INPUT_HANDLE_LOOP = 'handle_loop'
+    OUTPUT_HANDLE_ITEM = 'handle_item'
+    OUTPUT_HANDLE_END = 'handle_end'
 
     async def process(self, chat_log):
         raw = self.get_input(self.INPUT_HANDLE_LIST, required=True)
