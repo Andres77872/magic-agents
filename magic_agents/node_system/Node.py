@@ -57,6 +57,10 @@ class Node(abc.ABC):
         Adds specific content from source_handle (in parent's outputs) into this node's inputs at target_handle.
         """
         content = parent_outputs.get(source_handle)
+        if self.debug:
+            logger.debug(
+                f"Node ({self.node_id}): Adding input '{content}' from handle '{source_handle}' into '{target_handle}'"
+            )
         if content is not None:
             self.inputs[target_handle] = content['content']
             if self.debug:

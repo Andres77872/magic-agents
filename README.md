@@ -76,7 +76,7 @@ magic_agents provides a set of built-in node types for common steps:
 | `parser`       | NodeParser           | Render a Jinja2 template against previous node outputs.      |
 | `fetch`        | NodeFetch            | Perform an HTTP request (GET/POST) and parse JSON result.     |
 | `client`       | NodeClientLLM        | Configure and provide a MagicLLM client instance.            |
-| `llm`          | NodeLLM              | Invoke an LLM (streaming or batch), optional JSON output.     |
+| `llm`          | NodeLLM              | Invoke an LLM (streaming or batch), optional JSON output; supports `iterate` to re-run per Loop iteration. |
 | `chat`         | NodeChat             | Memory-enabled chat interface (system + user messages).       |
 | `send_message` | NodeSendMessage      | Send extra JSON payloads (via ChatCompletionModel.extras).    |
 | `end`          | NodeEND              | Terminal node to finalize output or drop into void.           |
@@ -259,7 +259,8 @@ Generates LLM outputs (streamed or batch) via `MagicLLM`, optionally parsing JSO
     "stream": true,
     "temperature": 0.7,
     "max_tokens": 512,
-    "json_output": false
+    "json_output": false,
+    "iterate": true      // re-run on each Loop iteration when inside a Loop node
   }
 }
 ```

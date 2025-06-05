@@ -9,3 +9,4 @@ class LlmNodeModel(BaseNodeModel):
     json_output: Optional[bool] = False
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
+    iterate: Optional[bool] = False  # if true, rerun this LLM node on each Loop iteration

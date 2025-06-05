@@ -53,17 +53,17 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False) -> Any:
     node_data = node.get('data', {})
     # Mapping of node types to (constructor, model)
     node_map = {
-        ModelAgentFlowTypesModel.CHAT:   (NodeChat, None),
-        ModelAgentFlowTypesModel.LLM:    (NodeLLM, LlmNodeModel),
-        ModelAgentFlowTypesModel.END:    (NodeEND, None),
-        ModelAgentFlowTypesModel.TEXT:   (NodeText, TextNodeModel),
+        ModelAgentFlowTypesModel.CHAT: (NodeChat, None),
+        ModelAgentFlowTypesModel.LLM: (NodeLLM, LlmNodeModel),
+        ModelAgentFlowTypesModel.END: (NodeEND, None),
+        ModelAgentFlowTypesModel.TEXT: (NodeText, TextNodeModel),
         ModelAgentFlowTypesModel.USER_INPUT: (NodeUserInput, UserInputNodeModel),
         ModelAgentFlowTypesModel.PARSER: (NodeParser, ParserNodeModel),
-        ModelAgentFlowTypesModel.FETCH:  (NodeFetch, FetchNodeModel),
+        ModelAgentFlowTypesModel.FETCH: (NodeFetch, FetchNodeModel),
         ModelAgentFlowTypesModel.CLIENT: (NodeClientLLM, ClientNodeModel),
         ModelAgentFlowTypesModel.SEND_MESSAGE: (NodeSendMessage, SendMessageNodeModel),
-        ModelAgentFlowTypesModel.LOOP:         (NodeLoop, LoopNodeModel),
-        ModelAgentFlowTypesModel.VOID:         (NodeEND, None),
+        ModelAgentFlowTypesModel.LOOP: (NodeLoop, LoopNodeModel),
+        ModelAgentFlowTypesModel.VOID: (NodeEND, None),
     }
     if node_type not in node_map:
         raise ValueError(f"Unsupported node type: {node_type}")
@@ -77,10 +77,10 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False) -> Any:
 
 
 async def execute_graph_loop(
-    graph: AgentFlowModel,
-    id_chat: Optional[Union[int, str]] = None,
-    id_thread: Optional[Union[int, str]] = None,
-    id_user: Optional[Union[int, str]] = None,
+        graph: AgentFlowModel,
+        id_chat: Optional[Union[int, str]] = None,
+        id_thread: Optional[Union[int, str]] = None,
+        id_user: Optional[Union[int, str]] = None,
 ) -> AsyncGenerator[ChatCompletionModel, None]:
     """
     Execute an agent flow graph that contains a Loop node, handling dynamic iteration.
@@ -90,110 +90,85 @@ async def execute_graph_loop(
         id_chat=id_chat, id_thread=id_thread, id_user=id_user,
         id_app='magic-research'
     )
-    # Identify the single Loop node
-    loop_id = next(nid for nid, node in nodes.items() if isinstance(node, NodeLoop))
-    # Partition edges based on Loop handles and spec ordering
-    all_edges = list(graph.edges)
-    idx_list = next(i for i, e in enumerate(all_edges)
-                    if e.target == loop_id and e.targetHandle == NodeLoop.INPUT_HANDLE_LIST)
-    idx_loop_in = next(i for i, e in enumerate(all_edges)
-                       if e.target == loop_id and e.targetHandle == NodeLoop.INPUT_HANDLE_LOOP)
-    idx_end = next(i for i, e in enumerate(all_edges)
-                   if e.source == loop_id and e.sourceHandle == NodeLoop.OUTPUT_HANDLE_END)
-    pre_loop = all_edges[: idx_list + 1]
-    iteration_edges = all_edges[idx_list + 1 : idx_loop_in]
-    loop_in_edges = all_edges[idx_loop_in : idx_loop_in + 1]
-    end_edges = all_edges[idx_end : idx_end + 1]
-    post_loop = all_edges[idx_end + 1 :]
 
-    # Helper to process a single edge
+    loop_id = next(nid for nid, node in nodes.items() if isinstance(node, NodeLoop))
+    loop_node = nodes[loop_id]
+
     async def _process_edge(edge: EdgeNodeModel):
-        source = nodes.get(edge.source)
-        target = nodes.get(edge.target)
-        if not source or not target:
+        src = nodes.get(edge.source)
+        tgt = nodes.get(edge.target)
+        if not src or not tgt:
             return
-        if not source.outputs:
-            async for msg in source(chat_log):
+        if edge.source != loop_id and not src.outputs:
+            async for msg in src(chat_log):
                 if msg['type'] == 'end':
-                    source.outputs[edge.sourceHandle] = msg['content']
+                    src.outputs[edge.sourceHandle] = msg['content']
                 elif msg['type'] == 'content':
                     yield msg['content']
-        target.add_parent(source.outputs, edge.sourceHandle, edge.targetHandle)
+        tgt.add_parent(src.outputs, edge.sourceHandle, edge.targetHandle)
 
-    # Execute edges up to loop start
-    for edge in pre_loop:
+    all_edges = list(graph.edges)
+    item_edges = [e for e in all_edges
+                  if e.source == loop_id and e.sourceHandle == NodeLoop.OUTPUT_HANDLE_ITEM]
+    loop_back_edges = [e for e in all_edges
+                       if e.target == loop_id and e.targetHandle == NodeLoop.INPUT_HANDLE_LOOP]
+    end_edges = [e for e in all_edges
+                 if e.source == loop_id and e.sourceHandle == NodeLoop.OUTPUT_HANDLE_END]
+    static_edges = [e for e in all_edges
+                    if e not in item_edges + loop_back_edges + end_edges]
+
+    for edge in static_edges:
         async for out in _process_edge(edge):
             yield out
 
-    loop_node = nodes[loop_id]
-    # Prepare items to iterate
     raw = loop_node.inputs.get(NodeLoop.INPUT_HANDLE_LIST)
     if isinstance(raw, str):
-        import json as _json
-
-        items = _json.loads(raw)
+        items = __import__('json').loads(raw)
     else:
         items = raw
     if not isinstance(items, list):
         raise ValueError(f"Loop node '{loop_id}' expects a list, got {type(items)}")
 
-    # Identify body nodes for state reset
-    body_node_ids = set()
-    for e in iteration_edges:
-        if e.source != loop_id:
-            body_node_ids.add(e.source)
-        if e.target != loop_id:
-            body_node_ids.add(e.target)
-    body_nodes = [nodes[n] for n in body_node_ids]
-
-    # Iterate and process loop body
+    loop_agg = []
     for item in items:
-        # reset state for each iteration
         loop_node._response = None
         loop_node.outputs.clear()
-        for bn in body_nodes:
-            bn._response = None
-            bn.outputs.clear()
-            bn.inputs.clear()
-        # inject current item to body edges
-        loop_node.outputs[NodeLoop.OUTPUT_HANDLE_ITEM] = loop_node.prep(item)
-        for edge in iteration_edges:
+        for node in nodes.values():
+            if getattr(node, 'iterate', False):
+                node._response = None
+                node.outputs.clear()
+
+        loop_node.outputs[NodeLoop.OUTPUT_HANDLE_ITEM] = loop_node.prep(str(item))
+
+        for edge in item_edges + loop_back_edges:
             async for out in _process_edge(edge):
                 yield out
-        # collect iteration result into loop inputs
-        for edge in loop_in_edges:
-            src = nodes.get(edge.source)
-            loop_node.add_parent(src.outputs, edge.sourceHandle, edge.targetHandle)
+        fb = loop_node.inputs.get(NodeLoop.INPUT_HANDLE_LOOP)
+        loop_agg.append(fb)
 
-    # After looping, handle aggregation end
+    loop_node._response = None
+    loop_node.outputs.clear()
+    loop_node.outputs[NodeLoop.OUTPUT_HANDLE_END] = loop_node.prep(loop_agg)
+
     for edge in end_edges:
-        loop_node.outputs.clear()
-        loop_node.outputs[edge.sourceHandle] = loop_node.prep(
-            loop_node.inputs.get(NodeLoop.INPUT_HANDLE_LOOP, [])
-        )
-        async for out in _process_edge(edge):
-            yield out
-
-    # Continue with remaining edges
-    for edge in post_loop:
         async for out in _process_edge(edge):
             yield out
 
 
 async def execute_graph(graph: AgentFlowModel,
-                       id_chat: Optional[Union[int, str]] = None,
-                       id_thread: Optional[Union[int, str]] = None,
-                       id_user: Optional[Union[int, str]] = None
-                       ) -> AsyncGenerator[ChatCompletionModel, None]:
+                        id_chat: Optional[Union[int, str]] = None,
+                        id_thread: Optional[Union[int, str]] = None,
+                        id_user: Optional[Union[int, str]] = None
+                        ) -> AsyncGenerator[ChatCompletionModel, None]:
     """
     Execute the agent flow graph asynchronously, yielding ChatCompletionModel results as generated.
-    
+
     Args:
     graph (AgentFlowModel): Agent flow graph.
     id_chat (Optional[Union[int, str]]): Chat ID. Defaults to None.
     id_thread (Optional[Union[int, str]]): Thread ID. Defaults to None.
     id_user (Optional[Union[int, str]]): User ID. Defaults to None.
-    
+
     Yields:
     AsyncGenerator[ChatCompletionModel, None]: ChatCompletionModel results.
     """
@@ -203,12 +178,24 @@ async def execute_graph(graph: AgentFlowModel,
         async for msg in execute_graph_loop(graph, id_chat=id_chat, id_thread=id_thread, id_user=id_user):
             yield msg
         return
+
     # Standard execution for acyclic graphs
     nodes = graph.nodes
     chat_log = ModelAgentRunLog(
         id_chat=id_chat, id_thread=id_thread, id_user=id_user,
         id_app='magic-research'
     )
+
+    # Track which nodes have been executed
+    executed_nodes = set()
+
+    # Helper to check if all dependencies of a node are satisfied
+    def are_dependencies_satisfied(node_id: str) -> bool:
+        for edge in graph.edges:
+            if edge.target == node_id and edge.source not in executed_nodes:
+                return False
+        return True
+
     async def process_edge(edge: EdgeNodeModel):
         source_node = nodes.get(edge.source)
         target_node = nodes.get(edge.target)
@@ -218,20 +205,49 @@ async def execute_graph(graph: AgentFlowModel,
         if not target_node:
             logger.error(f"Target node {edge.target} not found.")
             return
-        # Execute source node (only if outputs not already computed)
-        if not source_node.outputs:
-            async for item in source_node(chat_log):
-                if item["type"] == "end":
-                    source_node.outputs[edge.sourceHandle] = item["content"]  # outputs must be structured as dict
-                elif item["type"] == "content":
-                    yield item["content"]
-        # Pass output at source_handle to target_handle input
-        source_handle = edge.sourceHandle
-        target_handle = edge.targetHandle
-        target_node.add_parent(source_node.outputs, source_handle, target_handle)
-    for edge in graph.edges:
-        async for result in process_edge(edge):
-            yield result
+
+        # Execute source node only if not already executed and dependencies are satisfied
+        if edge.source not in executed_nodes:
+            if are_dependencies_satisfied(edge.source):
+                if not source_node.outputs:
+                    async for item in source_node(chat_log):
+                        if item["type"] == "end":
+                            source_node.outputs[edge.sourceHandle] = item["content"]
+                        elif item["type"] == "content":
+                            yield item["content"]
+                executed_nodes.add(edge.source)
+
+        # Pass output to target only if source has been executed
+        if edge.source in executed_nodes:
+            source_handle = edge.sourceHandle
+            target_handle = edge.targetHandle
+            target_node.add_parent(source_node.outputs, source_handle, target_handle)
+
+    # Process edges in topological order
+    remaining_edges = list(graph.edges)
+    while remaining_edges:
+        made_progress = False
+        for i, edge in enumerate(remaining_edges):
+            # Check if this edge can be processed
+            if are_dependencies_satisfied(edge.target) or edge.source in executed_nodes:
+                async for result in process_edge(edge):
+                    yield result
+                remaining_edges.pop(i)
+                made_progress = True
+                break
+
+        if not made_progress:
+            # Try to find a node with all dependencies satisfied
+            for edge in remaining_edges:
+                if edge.source not in executed_nodes and are_dependencies_satisfied(edge.source):
+                    async for result in process_edge(edge):
+                        yield result
+                    made_progress = True
+                    break
+
+            if not made_progress:
+                # No progress could be made - likely circular dependency
+                raise ValueError("Circular dependency detected or missing node in graph")
 
 
 def build(agt_data, message: str, load_chat=None) -> AgentFlowModel:

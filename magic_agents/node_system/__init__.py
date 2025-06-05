@@ -7,11 +7,11 @@ from magic_agents.node_system.NodeClientLLM import NodeClientLLM
 from magic_agents.node_system.NodeEND import NodeEND
 from magic_agents.node_system.NodeFetch import NodeFetch
 from magic_agents.node_system.NodeLLM import NodeLLM
+from magic_agents.node_system.NodeLoop import NodeLoop
 from magic_agents.node_system.NodeParser import NodeParser
 from magic_agents.node_system.NodeSendMessage import NodeSendMessage
 from magic_agents.node_system.NodeText import NodeText
 from magic_agents.node_system.NodeUserInput import NodeUserInput
-from magic_agents.node_system.NodeLoop import NodeLoop
 
 
 def build_graph(edges: List[Dict]) -> nx.DiGraph:
@@ -59,7 +59,7 @@ def assign_node_positions(nodes: List[Dict], graph: nx.DiGraph, sorted_nodes: Li
         if not preds:
             levels[node] = 0
         else:
-            levels[node] = 1 + max(levels[pred] for pred in preds)
+            levels[node] = 1 + max(levels.get(pred, 0) for pred in preds)
 
     node_positions = {
         node_id: {
