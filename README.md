@@ -1,4 +1,4 @@
-https://deepwiki.com/badge-maker?url=https%3A%2F%2Fdeepwiki.com%2FAndres77872%2Fmagic-agents
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Andres77872/magic-agents)
 
 # magic_agents
 
