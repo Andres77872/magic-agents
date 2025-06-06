@@ -1,3 +1,5 @@
+https://deepwiki.com/badge-maker?url=https%3A%2F%2Fdeepwiki.com%2FAndres77872%2Fmagic-agents
+
 # magic_agents
 
 A lightweight and flexible orchestration library for building LLM-based agent flows.
