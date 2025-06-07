@@ -101,15 +101,22 @@ Injects the initial user message and initializes `chat_log.id_chat` and `id_thre
 **What it does:**
 - Initializes a new chat session with unique IDs
 - Captures the user's initial message
-- Passes the message to downstream nodes via `handle_user_message` output
+- Passes the message text to downstream nodes via `handle_user_message` output
+- Passes any attached files via `handle_user_files` output
+- Passes any attached images via `handle_user_images` output
 
 ```python
 class NodeUserInput(Node):
+    HANDLER_USER_MESSAGE = 'handle_user_message'
+    HANDLER_USER_FILES = 'handle_user_files'
+    HANDLER_USER_IMAGES = 'handle_user_images'
     ...
     async def process(self, chat_log):
         if not chat_log.id_chat: ...
         if not chat_log.id_thread: ...
-        yield self.yield_static(self._text)
+        yield self.yield_static(self._text, content_type=self.HANDLER_USER_MESSAGE)
+        yield self.yield_static(self.files, content_type=self.HANDLER_USER_FILES)
+        yield self.yield_static(self.images, content_type=self.HANDLER_USER_IMAGES)
 ```
 
 #### `text` (`NodeText`)

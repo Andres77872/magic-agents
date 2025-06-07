@@ -101,10 +101,12 @@ async def execute_graph_loop(
             return
         if edge.source != loop_id and not src.outputs:
             async for msg in src(chat_log):
-                if msg['type'] == 'end':
-                    src.outputs[edge.sourceHandle] = msg['content']
-                elif msg['type'] == 'content':
-                    yield msg['content']
+                if msg["type"] == "content":
+                    yield msg["content"]
+                elif msg["type"] == "end":
+                    src.outputs[edge.sourceHandle] = msg["content"]
+                else:
+                    src.outputs[msg["type"]] = msg["content"]
         tgt.add_parent(src.outputs, edge.sourceHandle, edge.targetHandle)
 
     all_edges = list(graph.edges)
@@ -211,10 +213,12 @@ async def execute_graph(graph: AgentFlowModel,
             if are_dependencies_satisfied(edge.source):
                 if not source_node.outputs:
                     async for item in source_node(chat_log):
-                        if item["type"] == "end":
-                            source_node.outputs[edge.sourceHandle] = item["content"]
-                        elif item["type"] == "content":
+                        if item["type"] == "content":
                             yield item["content"]
+                        elif item["type"] == "end":
+                            source_node.outputs[edge.sourceHandle] = item["content"]
+                        else:
+                            source_node.outputs[item["type"]] = item["content"]
                 executed_nodes.add(edge.source)
 
         # Pass output to target only if source has been executed
