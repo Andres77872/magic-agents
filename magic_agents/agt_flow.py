@@ -39,12 +39,12 @@ logger = logging.getLogger(__name__)
 def create_node(node: dict, load_chat: Callable, debug: bool = False) -> Any:
     """
     Factory method to create node instances.
-    
+
     Args:
     node (dict): Node data.
     load_chat (Callable): Load chat function.
     debug (bool): Debug mode. Defaults to False.
-    
+
     Returns:
     Any: Node instance.
     """
@@ -257,12 +257,12 @@ async def execute_graph(graph: AgentFlowModel,
 def build(agt_data, message: str, images: list[str] = None, load_chat=None) -> AgentFlowModel:
     """
     Prepare and build the agent flow graph from input data and message.
-    
+
     Args:
     agt_data: Agent data.
     message (str): Message.
     load_chat: Load chat function. Defaults to None.
-    
+
     Returns:
     AgentFlowModel: Agent flow graph.
     """
@@ -280,7 +280,7 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None) -> A
         if node['type'] in [ModelAgentFlowTypesModel.USER_INPUT, ModelAgentFlowTypesModel.CHAT]:
             node['data'] = node.get('data', {})
             node['data']['text' if node['type'] == ModelAgentFlowTypesModel.USER_INPUT else 'message'] = message
-            if  node['type'] == ModelAgentFlowTypesModel.USER_INPUT:
+            if node['type'] == ModelAgentFlowTypesModel.USER_INPUT:
                 node['data']['images'] = images
         elif node['type'] == ModelAgentFlowTypesModel.END:
             agt_data['edges'].append({
@@ -303,13 +303,13 @@ async def run_agent(
         id_user: Optional[Union[int, str]] = None) -> AsyncGenerator[ChatCompletionModel, None]:
     """
     Run the agent flow and yield ChatCompletionModel results as they are generated.
-    
+
     Args:
     graph (AgentFlowModel): Agent flow graph.
     id_chat (Optional[Union[int, str]]): Chat ID. Defaults to None.
     id_thread (Optional[Union[int, str]]): Thread ID. Defaults to None.
     id_user (Optional[Union[int, str]]): User ID. Defaults to None.
-    
+
     Yields:
     AsyncGenerator[ChatCompletionModel, None]: ChatCompletionModel results.
     """

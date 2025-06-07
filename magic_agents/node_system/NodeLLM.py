@@ -38,14 +38,17 @@ class NodeLLM(Node):
 
     async def process(self, chat_log):
         params = self.inputs
+        no_inputs = False
         if not params.get(self.INPUT_HANDLER_SYSTEM_CONTEXT) and not params.get(self.INPUT_HANDLER_USER_MESSAGE):
-            yield self.yield_static('')
-            return
+            no_inputs = True
 
         client: MagicLLM = self.get_input(self.INPUT_HANDLER_CLIENT_PROVIDER, required=True)
         if c := params.get(self.INPUT_HANDLER_CHAT):
             chat = c
         else:
+            if no_inputs:
+                yield self.yield_static('')
+                return
             chat = ModelChat(params.get(self.INPUT_HANDLER_SYSTEM_CONTEXT))
             if k := params.get(self.INPUT_HANDLER_USER_MESSAGE):
                 chat.add_user_message(k)

@@ -23,8 +23,8 @@ class NodeChat(Node):
         if load_chat:
             self.chat = load_chat(
                 message=message,
-                memory_chat=memory['stm'],
-                long_memory_chat=memory['ltm'])
+                memory_chat=memory.get('stm', 0),
+                long_memory_chat=memory.get('ltm', 0))
         else:
             self.chat = ModelChat(max_input_tokens=memory.get('max_input_tokens'))
 
