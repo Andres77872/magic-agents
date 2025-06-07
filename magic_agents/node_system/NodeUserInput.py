@@ -8,10 +8,16 @@ class NodeUserInput(Node):
     def __init__(self, data: UserInputNodeModel, **kwargs) -> None:
         super().__init__(**kwargs)
         self._text = data.text
+        self.files = data.files
+        self.images = data.images
 
     async def process(self, chat_log):
         if not chat_log.id_chat:
             chat_log.id_chat = str(uuid.uuid4())
         if not chat_log.id_thread:
             chat_log.id_thread = str(uuid.uuid4())
-        yield self.yield_static(self._text)
+        yield self.yield_static({
+            'message': self._text,
+            'files': self.files,
+            'images': self.images,
+        })
