@@ -254,7 +254,7 @@ async def execute_graph(graph: AgentFlowModel,
                 raise ValueError("Circular dependency detected or missing node in graph")
 
 
-def build(agt_data, message: str, load_chat=None) -> AgentFlowModel:
+def build(agt_data, message: str, images: list[str] = None, load_chat=None) -> AgentFlowModel:
     """
     Prepare and build the agent flow graph from input data and message.
     
@@ -280,6 +280,8 @@ def build(agt_data, message: str, load_chat=None) -> AgentFlowModel:
         if node['type'] in [ModelAgentFlowTypesModel.USER_INPUT, ModelAgentFlowTypesModel.CHAT]:
             node['data'] = node.get('data', {})
             node['data']['text' if node['type'] == ModelAgentFlowTypesModel.USER_INPUT else 'message'] = message
+            if  node['type'] == ModelAgentFlowTypesModel.USER_INPUT:
+                node['data']['images'] = images
         elif node['type'] == ModelAgentFlowTypesModel.END:
             agt_data['edges'].append({
                 "id": uuid.uuid4().hex,
