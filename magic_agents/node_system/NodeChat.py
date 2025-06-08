@@ -14,9 +14,9 @@ class NodeChat(Node):
     INPUT_HANDLER_USER_IMAGES = 'handle_user_images'
 
     def __init__(self,
-                 memory: dict,
                  message: str,
                  load_chat: Callable,
+                 memory: dict = {},
                  **kwargs) -> None:
         super().__init__(**kwargs)
         self._memory = memory
