@@ -38,6 +38,7 @@ class NodeLLM(Node):
 
     async def process(self, chat_log):
         params = self.inputs
+        print(params)
         no_inputs = False
         if not params.get(self.INPUT_HANDLER_SYSTEM_CONTEXT) and not params.get(self.INPUT_HANDLER_USER_MESSAGE):
             no_inputs = True
@@ -45,6 +46,10 @@ class NodeLLM(Node):
         client: MagicLLM = self.get_input(self.INPUT_HANDLER_CLIENT_PROVIDER, required=True)
         if c := params.get(self.INPUT_HANDLER_CHAT):
             chat = c
+            if sys_prompt := self.get_input(self.INPUT_HANDLER_SYSTEM_CONTEXT):
+                chat.set_system(sys_prompt)
+            if user_prompt := self.get_input(self.INPUT_HANDLER_USER_MESSAGE):
+                chat.add_user_message(user_prompt)
         else:
             if no_inputs:
                 yield self.yield_static('')
@@ -54,6 +59,7 @@ class NodeLLM(Node):
                 chat.add_user_message(k)
             else:
                 raise ValueError(f"NodeLLM '{self.INPUT_HANDLER_USER_MESSAGE}' requires either a user message.")
+
         if not self.stream:
             intention = await client.llm.async_generate(chat, **self.extra_data)
             self.generated = intention.content
