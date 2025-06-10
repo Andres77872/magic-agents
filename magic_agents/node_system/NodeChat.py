@@ -38,7 +38,21 @@ class NodeChat(Node):
                 if im := self.get_input(self.INPUT_HANDLER_USER_IMAGES):
                     if isinstance(im, str):
                         im = json.loads(im)
-                    self.chat.add_user_message(c, im)
+                    is_list_single = False
+                    is_list_pair = False
+                    for i in im:
+                        if isinstance(i, str):
+                            is_list_single = True
+                        elif isinstance(i, list):
+                            is_list_pair = True
+                    if is_list_single and is_list_pair:
+                        raise ValueError("UserImage and UserFile cannot be used together")
+                    if is_list_single:
+                        self.chat.add_user_message(c, im)
+                    elif is_list_pair:
+                        for i in im:
+                            self.chat.add_user_message(i[0], i[1])
+                        self.chat.add_user_message(c)
                 else:
                     self.chat.add_user_message(c)
 
