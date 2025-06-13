@@ -8,6 +8,7 @@ from magic_agents.node_system.NodeEND import NodeEND
 from magic_agents.node_system.NodeFetch import NodeFetch
 from magic_agents.node_system.NodeLLM import NodeLLM
 from magic_agents.node_system.NodeLoop import NodeLoop
+from magic_agents.node_system.NodeInner import NodeInner
 from magic_agents.node_system.NodeParser import NodeParser
 from magic_agents.node_system.NodeSendMessage import NodeSendMessage
 from magic_agents.node_system.NodeText import NodeText
@@ -99,6 +100,7 @@ __all__ = [
     "NodeText",
     "NodeUserInput",
     "NodeLoop",
+    "NodeInner",
     "build_graph",
     "detect_cycles",
     "perform_topological_sort",

@@ -82,6 +82,7 @@ magic_agents provides a set of built-in node types for common steps:
 | `end`          | NodeEND              | Terminal node to finalize output or drop into void.           |
 | `void`         | NodeEND (internal)   | Internal drop node for unhandled outputs.                    |
 | `loop`         | NodeLoop             | Iterate over a list and aggregate per-item results.          |
+| `inner`        | NodeInner            | Execute a nested agent flow graph (`magic_flow`) and stream its outputs. |
 
 ----
 

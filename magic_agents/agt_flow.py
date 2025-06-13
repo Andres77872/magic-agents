@@ -16,6 +16,7 @@ from magic_agents.models.factory.Nodes import (
     ClientNodeModel,
     SendMessageNodeModel,
     LoopNodeModel,
+    InnerNodeModel,
 )
 from magic_agents.models.model_agent_run_log import ModelAgentRunLog
 from magic_agents.node_system import (
@@ -29,6 +30,7 @@ from magic_agents.node_system import (
     NodeSendMessage,
     NodeParser,
     NodeLoop,
+    NodeInner,
     sort_nodes,
 )
 from magic_agents.util.const import HANDLE_VOID
@@ -63,6 +65,7 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False) -> Any:
         ModelAgentFlowTypesModel.CLIENT: (NodeClientLLM, ClientNodeModel),
         ModelAgentFlowTypesModel.SEND_MESSAGE: (NodeSendMessage, SendMessageNodeModel),
         ModelAgentFlowTypesModel.LOOP: (NodeLoop, LoopNodeModel),
+        ModelAgentFlowTypesModel.INNER: (NodeInner, InnerNodeModel),
         ModelAgentFlowTypesModel.VOID: (NodeEND, None),
     }
     if node_type not in node_map:
@@ -70,6 +73,8 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False) -> Any:
     constructor, model_cls = node_map[node_type]
     if node_type == ModelAgentFlowTypesModel.CHAT:
         return constructor(load_chat=load_chat, **extra, **node_data)
+    elif node_type == ModelAgentFlowTypesModel.INNER:
+        return constructor(load_chat=load_chat, **extra, data=InnerNodeModel(**extra, **node_data))
     elif model_cls:
         return constructor(**extra, data=model_cls(**extra, **node_data))
     else:

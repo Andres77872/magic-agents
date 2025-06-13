@@ -13,7 +13,8 @@ ModelAgentFlowType = Literal[
     'chat',
     'text',
     'void',
-    'loop'
+    'loop',
+    'inner'
 ]
 
 
@@ -29,6 +30,7 @@ class ModelAgentFlowTypesModel:
     SEND_MESSAGE = 'send_message'
     VOID = 'void'
     LOOP = 'loop'
+    INNER = 'inner'
 
 
 class BaseNodeModel(BaseModel):

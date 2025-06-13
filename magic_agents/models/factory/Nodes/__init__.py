@@ -7,3 +7,4 @@ from magic_agents.models.factory.Nodes.SendMessageNodeModel import SendMessageNo
 from magic_agents.models.factory.Nodes.TextNodeModel import TextNodeModel
 from magic_agents.models.factory.Nodes.UserInputNodeModel import UserInputNodeModel
 from magic_agents.models.factory.Nodes.LoopNodeModel import LoopNodeModel
+from magic_agents.models.factory.Nodes.InnerNodeModel import InnerNodeModel
