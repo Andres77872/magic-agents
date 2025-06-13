@@ -1,8 +1,8 @@
-from typing import Any, Dict, AsyncGenerator, Callable
+from typing import Callable
 
-from magic_agents.node_system.Node import Node
-from magic_agents.models.factory.Nodes import InnerNodeModel
 from magic_agents.agt_flow import build, execute_graph
+from magic_agents.models.factory.Nodes import InnerNodeModel
+from magic_agents.node_system.Node import Node
 
 
 class NodeInner(Node):
@@ -14,13 +14,15 @@ class NodeInner(Node):
     to the outer flow.
     """
     INPUT_HANDLE = 'handle_user_message'
+    HANDLER_EXECUTION_CONTENT = 'handle_execution_content'
+    HANDLER_EXECUTION_EXTRAS = 'handle_execution_extras'
 
     def __init__(self, data: InnerNodeModel, load_chat: Callable, **kwargs) -> None:
         super().__init__(**kwargs)
         self.magic_flow = data.magic_flow
         self._load_chat = load_chat
 
-    async def process(self, chat_log) -> AsyncGenerator[Dict[str, Any], None]:
+    async def process(self, chat_log):
         input_message = self.inputs.get(self.INPUT_HANDLE)
         if input_message is None:
             raise ValueError(f"NodeInner '{self.node_id}' requires input '{self.INPUT_HANDLE}'")
@@ -31,10 +33,17 @@ class NodeInner(Node):
             message=input_message,
             load_chat=self._load_chat
         )
+        content = ''
+        extras = []
         async for event in execute_graph(
-            inner_graph,
-            id_chat=chat_log.id_chat,
-            id_thread=chat_log.id_thread,
-            id_user=chat_log.id_user
+                inner_graph,
+                id_chat=chat_log.id_chat,
+                id_thread=chat_log.id_thread,
+                id_user=chat_log.id_user
         ):
-            yield {'type': 'content', 'content': event}
+            content += event.choices[0].delta.content
+            if e := event.extras:
+                extras.append(e)
+
+        yield self.yield_static(content, content_type=self.HANDLER_EXECUTION_CONTENT)
+        yield self.yield_static(extras, content_type=self.HANDLER_EXECUTION_EXTRAS)
