@@ -40,7 +40,7 @@ class NodeInner(Node):
             node_type = getattr(node, 'node_type', None)
             if node_type in [ModelAgentFlowTypesModel.USER_INPUT, ModelAgentFlowTypesModel.CHAT]:
                 if node_type == ModelAgentFlowTypesModel.USER_INPUT:
-                    node.data.text = input_message
+                    node._text = input_message  # Update the internal text directly
                 elif node_type == ModelAgentFlowTypesModel.CHAT:
                     node.message = input_message
         
@@ -48,16 +48,28 @@ class NodeInner(Node):
         from magic_agents.agt_flow import execute_graph
         content = ''
         extras = []
-        async for event in execute_graph(
+        async for evt in execute_graph(
                 self.inner_graph,
                 id_chat=chat_log.id_chat,
                 id_thread=chat_log.id_thread,
                 id_user=chat_log.id_user
         ):
-            event_content = event['content']
-            content += event_content.choices[0].delta.content
-            if e := event_content.extras:
-                extras.append(e)
+            event = evt['content']
+            # Check if event is a ChatCompletionModel
+            if hasattr(event, 'choices') and event.choices:
+                # It's a ChatCompletionModel
+                event_content = event
+                if event_content.choices[0].delta.content:
+                    content += event_content.choices[0].delta.content
+                if hasattr(event_content, 'extras') and event_content.extras:
+                    extras.append(event_content.extras)
+            else:
+                # It's some other type of output - try to convert to string
+                if self.debug:
+                    print(f"NodeInner received non-ChatCompletionModel: {type(event)}")
+                # For now, we'll skip non-ChatCompletionModel outputs
+                # In a full implementation, you might want to handle these differently
+                pass
         
         yield self.yield_static(content, content_type=self.HANDLER_EXECUTION_CONTENT)
         if extras:

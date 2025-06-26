@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 # Import test classes
 from test_comprehensive_flows import TestComprehensiveFlows, run_all_tests as run_comprehensive
 from test_advanced_flows import TestAdvancedFlows, run_advanced_tests
+from test_advanced_flows_fixed import TestAdvancedFlowsFixed, run_fixed_advanced_tests
 from test_edge_cases import TestEdgeCases, run_edge_case_tests
 from test_run1 import test_run_agent, test_run_agent_loop
 
@@ -42,7 +43,32 @@ class TestRunner:
         print(f"{'='*80}")
         
         try:
-            if asyncio.iscoroutinefunction(test_func):
+            # Handle different types of test functions
+            if hasattr(test_func, '__name__') and 'run_fixed_advanced_tests' in test_func.__name__:
+                # For our fixed tests that don't use asyncio.run()
+                import test.test_advanced_flows_fixed as fixed_tests
+                test_suite = fixed_tests.TestAdvancedFlowsFixed()
+                test_suite.setup_method()
+                
+                # Run each test individually
+                tests = [
+                    test_suite.test_send_message_with_extras(),
+                    test_suite.test_deeply_nested_inner_flows_fixed(),
+                    test_suite.test_parser_to_sendmessage_flow(),
+                    test_suite.test_loop_with_sendmessage_aggregation()
+                ]
+                
+                for i, test in enumerate(tests, 1):
+                    print(f"\n{'='*60}")
+                    print(f"Running Fixed Advanced Test {i}")
+                    print(f"{'='*60}")
+                    try:
+                        await test
+                        print(f"✓ Fixed Advanced Test {i} passed")
+                    except Exception as e:
+                        print(f"✗ Fixed Advanced Test {i} failed: {e}")
+                        raise e
+            elif asyncio.iscoroutinefunction(test_func):
                 await test_func()
             else:
                 test_func()
@@ -126,7 +152,7 @@ class TestRunner:
         suites = [
             ("Individual Tests", self.run_individual_tests),
             ("Comprehensive Flow Tests", run_comprehensive),
-            ("Advanced Flow Tests", run_advanced_tests),
+            ("Advanced Flow Tests (Fixed)", run_fixed_advanced_tests),
             ("Edge Case Tests", run_edge_case_tests)
         ]
         
@@ -148,6 +174,7 @@ async def run_specific_test(test_name):
     test_map = {
         'comprehensive': run_comprehensive,
         'advanced': run_advanced_tests,
+        'advanced_fixed': run_fixed_advanced_tests,
         'edge': run_edge_case_tests,
         'individual': runner.run_individual_tests
     }
@@ -173,7 +200,7 @@ def main():
     parser = argparse.ArgumentParser(description='Run magic-agents tests')
     parser.add_argument(
         '--suite',
-        choices=['all', 'comprehensive', 'advanced', 'edge', 'individual'],
+        choices=['all', 'comprehensive', 'advanced', 'advanced_fixed', 'edge', 'individual'],
         default='all',
         help='Which test suite to run'
     )

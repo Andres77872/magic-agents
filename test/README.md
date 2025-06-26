@@ -34,6 +34,13 @@ Tests complex and advanced scenarios:
 - State management across nodes
 - Recursive summarization patterns
 
+### 3a. **test_advanced_flows_fixed.py** - Fixed Advanced Pattern Tests
+Fixed version of advanced tests that properly handle node outputs:
+- Correctly accesses content from run_agent dictionary format
+- Uses SendMessage nodes to display parser outputs
+- Proper extras handling from SendMessage nodes only
+- Updated assertions for realistic expectations
+
 ### 4. **test_edge_cases.py** - Edge Case & Error Handling Tests
 Tests robustness and error scenarios:
 - Empty input handling
@@ -156,6 +163,37 @@ When adding new tests:
 - Parallel tests demonstrate efficiency gains
 - Timeout tests ensure graceful handling of slow operations
 - Long input tests verify truncation and handling of large data
+
+## Key Findings and Fixes
+
+### Node Output Understanding
+Through comprehensive testing and analysis, we discovered that:
+
+1. **Only 3 node types yield visible content**:
+   - `NodeLLM` - Actual LLM responses
+   - `NodeSendMessage` - Custom messages with extras
+   - `NodeEND` - Empty completion (no visible content)
+
+2. **Parser and other nodes don't produce visible output**:
+   - These nodes only process/transform data internally
+   - To display their results, use `NodeSendMessage`
+
+3. **run_agent yields dictionaries**, not ChatCompletionModel directly:
+   ```python
+   async for event in run_agent(graph):
+       if isinstance(event, dict) and 'content' in event:
+           content = event['content']  # This is the ChatCompletionModel
+   ```
+
+4. **Extras are only meaningful from SendMessage nodes**:
+   - Other nodes may have metadata in extras, but not processing results
+   - Parser output appears in extras['text'] when sent to SendMessage
+
+### Test Fixes Applied
+- Updated all tests to properly access content via dictionary format
+- Added SendMessage nodes where parser output needed to be visible
+- Fixed assertions to match realistic expectations
+- Created `test_advanced_flows_fixed.py` with proper node usage patterns
 
 ## Future Enhancements
 
