@@ -23,7 +23,7 @@ class NodeInner(Node):
         self._load_chat = load_chat
 
     async def process(self, chat_log):
-        pass
+        yield self.yield_static('', content_type=self.HANDLER_EXECUTION_CONTENT)
         # input_message = self.inputs.get(self.INPUT_HANDLE)
         # if input_message is None:
         #     raise ValueError(f"NodeInner '{self.node_id}' requires input '{self.INPUT_HANDLE}'")
