@@ -54,8 +54,9 @@ class NodeInner(Node):
                 id_thread=chat_log.id_thread,
                 id_user=chat_log.id_user
         ):
-            content += event.choices[0].delta.content
-            if e := event.extras:
+            event_content = event['content']
+            content += event_content.choices[0].delta.content
+            if e := event_content.extras:
                 extras.append(e)
         
         yield self.yield_static(content, content_type=self.HANDLER_EXECUTION_CONTENT)
