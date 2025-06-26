@@ -1,8 +1,11 @@
-from typing import Callable
+from typing import Callable, TYPE_CHECKING
 
 # from magic_agents.agt_flow import build, execute_graph
 from magic_agents.models.factory.Nodes import InnerNodeModel
 from magic_agents.node_system.Node import Node
+
+if TYPE_CHECKING:
+    from magic_agents.models.factory.AgentFlowModel import AgentFlowModel
 
 
 class NodeInner(Node):
@@ -21,30 +24,40 @@ class NodeInner(Node):
         super().__init__(**kwargs)
         self.magic_flow = data.magic_flow
         self._load_chat = load_chat
+        self.inner_graph: 'AgentFlowModel' = None  # Will be set by build()
 
     async def process(self, chat_log):
-        yield self.yield_static('', content_type=self.HANDLER_EXECUTION_CONTENT)
-        # input_message = self.inputs.get(self.INPUT_HANDLE)
-        # if input_message is None:
-        #     raise ValueError(f"NodeInner '{self.node_id}' requires input '{self.INPUT_HANDLE}'")
-        #
-        # # Build and execute the inner graph with the same chat context
-        # inner_graph = build(
-        #     self.magic_flow,
-        #     message=input_message,
-        #     load_chat=self._load_chat
-        # )
-        # content = ''
-        # extras = []
-        # async for event in execute_graph(
-        #         inner_graph,
-        #         id_chat=chat_log.id_chat,
-        #         id_thread=chat_log.id_thread,
-        #         id_user=chat_log.id_user
-        # ):
-        #     content += event.choices[0].delta.content
-        #     if e := event.extras:
-        #         extras.append(e)
-        #
-        # yield self.yield_static(content, content_type=self.HANDLER_EXECUTION_CONTENT)
-        # yield self.yield_static(extras, content_type=self.HANDLER_EXECUTION_EXTRAS)
+        input_message = self.inputs.get(self.INPUT_HANDLE)
+        if input_message is None:
+            raise ValueError(f"NodeInner '{self.node_id}' requires input '{self.INPUT_HANDLE}'")
+        
+        if self.inner_graph is None:
+            raise ValueError(f"NodeInner '{self.node_id}' has no inner_graph set")
+        
+        # Update input nodes in the inner graph with the current message
+        from magic_agents.models.factory.Nodes import ModelAgentFlowTypesModel
+        for node_id, node in self.inner_graph.nodes.items():
+            node_type = getattr(node, 'node_type', None)
+            if node_type in [ModelAgentFlowTypesModel.USER_INPUT, ModelAgentFlowTypesModel.CHAT]:
+                if node_type == ModelAgentFlowTypesModel.USER_INPUT:
+                    node.data.text = input_message
+                elif node_type == ModelAgentFlowTypesModel.CHAT:
+                    node.message = input_message
+        
+        # Execute the inner graph
+        from magic_agents.agt_flow import execute_graph
+        content = ''
+        extras = []
+        async for event in execute_graph(
+                self.inner_graph,
+                id_chat=chat_log.id_chat,
+                id_thread=chat_log.id_thread,
+                id_user=chat_log.id_user
+        ):
+            content += event.choices[0].delta.content
+            if e := event.extras:
+                extras.append(e)
+        
+        yield self.yield_static(content, content_type=self.HANDLER_EXECUTION_CONTENT)
+        if extras:
+            yield self.yield_static(extras, content_type=self.HANDLER_EXECUTION_EXTRAS)

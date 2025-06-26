@@ -296,6 +296,20 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None) -> A
     nodes: Dict[str, Any] = {
         node['id']: create_node(node, load_chat, agt_data.get('debug', False)) for node in agt_data['nodes']
     }
+    
+    # Build inner graphs for NodeInner nodes
+    for node_id, node_instance in nodes.items():
+        if isinstance(node_instance, NodeInner):
+            # Build the inner graph from the magic_flow dict
+            inner_graph = build(
+                node_instance.magic_flow,
+                message="",  # Will be overridden by the input at runtime
+                images=None,
+                load_chat=load_chat
+            )
+            # Set the built graph on the NodeInner instance
+            node_instance.inner_graph = inner_graph
+    
     agt_data['nodes'] = nodes
     agt = AgentFlowModel(**agt_data)
     return agt
