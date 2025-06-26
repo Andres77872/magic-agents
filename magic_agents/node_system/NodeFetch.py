@@ -61,7 +61,6 @@ class NodeFetch(Node):
         if not run:
             yield self.yield_static({})
             return
-
         if self.jsondata is not None:
             # Render JSON data with Jinja if jsondata exists
             template = Template(json.dumps(self.jsondata))
@@ -69,7 +68,7 @@ class NodeFetch(Node):
         elif self.data:
             # Render regular data with Jinja if data exists
             template = Template(json.dumps(self.data))
-            data_to_send = json.loads(template.render(self.inputs))
+            data_to_send = json.loads(template.render(self.inputs).replace('\n', ''))
 
         async with aiohttp.ClientSession() as session:
             response_json = await self.fetch(
