@@ -49,6 +49,9 @@ class NodeLLM(Node):
             if sys_prompt := self.get_input(self.INPUT_HANDLER_SYSTEM_CONTEXT):
                 chat.set_system(sys_prompt)
             if user_prompt := self.get_input(self.INPUT_HANDLER_USER_MESSAGE):
+                # Convert list to string for loop aggregation results
+                if isinstance(user_prompt, list):
+                    user_prompt = json.dumps(user_prompt)
                 chat.add_user_message(user_prompt)
         else:
             if no_inputs:
@@ -56,6 +59,9 @@ class NodeLLM(Node):
                 return
             chat = ModelChat(params.get(self.INPUT_HANDLER_SYSTEM_CONTEXT))
             if k := params.get(self.INPUT_HANDLER_USER_MESSAGE):
+                # Convert list to string for loop aggregation results
+                if isinstance(k, list):
+                    k = json.dumps(k)
                 chat.add_user_message(k)
             else:
                 raise ValueError(f"NodeLLM '{self.INPUT_HANDLER_USER_MESSAGE}' requires either a user message.")

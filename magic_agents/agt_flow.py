@@ -104,15 +104,44 @@ async def execute_graph_loop(
         tgt = nodes.get(edge.target)
         if not src or not tgt:
             return
-        if edge.source != loop_id and not src.outputs:
-            async for msg in src(chat_log):
+        
+        # Special handling for end edges - always process them to transfer data
+        is_end_edge = edge.source == loop_id and edge.sourceHandle == NodeLoop.OUTPUT_HANDLE_END
+        
+        # For end edges, just transfer existing data without re-executing
+        if is_end_edge:
+            pass  # Just transfer data below
+        else:
+            # For loop node sources, always execute if no outputs
+            # For other nodes, execute if no outputs OR if response was cleared (indicating it should re-execute)
+            should_execute = (edge.source == loop_id and not src.outputs) or \
+                            (edge.source != loop_id and (not src.outputs or src._response is None))
+            
+            if should_execute:
+                async for msg in src(chat_log):
+                    if msg["type"] == "content":
+                        yield msg["content"]
+                    elif msg["type"] == "end":
+                        src.outputs[edge.sourceHandle] = msg["content"]
+                    else:
+                        src.outputs[msg["type"]] = msg["content"]
+        
+        tgt.add_parent(src.outputs, edge.sourceHandle, edge.targetHandle)
+        
+        # For end edges, execute the target node after adding the input
+        if is_end_edge and tgt._response is None:
+            async for msg in tgt(chat_log):
                 if msg["type"] == "content":
                     yield msg["content"]
                 elif msg["type"] == "end":
-                    src.outputs[edge.sourceHandle] = msg["content"]
+                    # Find appropriate handle for this output
+                    if hasattr(tgt, 'OUTPUT_HANDLE_GENERATED_END'):
+                        handle = tgt.OUTPUT_HANDLE_GENERATED_END
+                    else:
+                        handle = "handle_generated_end"
+                    tgt.outputs[handle] = msg["content"]
                 else:
-                    src.outputs[msg["type"]] = msg["content"]
-        tgt.add_parent(src.outputs, edge.sourceHandle, edge.targetHandle)
+                    tgt.outputs[msg["type"]] = msg["content"]
 
     all_edges = list(graph.edges)
     item_edges = [e for e in all_edges
@@ -156,6 +185,13 @@ async def execute_graph_loop(
     loop_node._response = None
     loop_node.outputs.clear()
     loop_node.outputs[NodeLoop.OUTPUT_HANDLE_END] = loop_node.prep(loop_agg)
+
+    # Clear response for nodes that will receive loop end results so they can re-execute
+    for edge in end_edges:
+        target_node = nodes.get(edge.target)
+        if target_node:
+            target_node._response = None
+            target_node.outputs.clear()
 
     for edge in end_edges:
         async for out in _process_edge(edge):
