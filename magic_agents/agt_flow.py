@@ -173,6 +173,9 @@ async def execute_graph_loop(
             if getattr(node, 'iterate', False):
                 node._response = None
                 node.outputs.clear()
+                # Clear generated content for NodeLLM instances
+                if hasattr(node, 'generated'):
+                    node.generated = ''
 
         loop_node.outputs[NodeLoop.OUTPUT_HANDLE_ITEM] = loop_node.prep(str(item))
 
