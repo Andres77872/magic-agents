@@ -78,11 +78,13 @@ magic_agents provides a set of built-in node types for common steps:
 | `parser`       | NodeParser           | Render a Jinja2 template against previous node outputs.      |
 | `fetch`        | NodeFetch            | Perform an HTTP request (GET/POST) and parse JSON result.     |
 | `client`       | NodeClientLLM        | Configure and provide a MagicLLM client instance.            |
-| `llm`          | NodeLLM              | Invoke an LLM (streaming or batch), optional JSON output.     |
+| `llm`          | NodeLLM              | Invoke an LLM (streaming or batch), optional JSON output; supports `iterate` to re-run per Loop iteration. |
 | `chat`         | NodeChat             | Memory-enabled chat interface (system + user messages).       |
 | `send_message` | NodeSendMessage      | Send extra JSON payloads (via ChatCompletionModel.extras).    |
 | `end`          | NodeEND              | Terminal node to finalize output or drop into void.           |
 | `void`         | NodeEND (internal)   | Internal drop node for unhandled outputs.                    |
+| `loop`         | NodeLoop             | Iterate over a list and aggregate per-item results.          |
+| `inner`        | NodeInner            | Execute a nested agent flow graph (`magic_flow`) and stream its outputs. |
 
 ----
 
@@ -102,15 +104,22 @@ Injects the initial user message and initializes `chat_log.id_chat` and `id_thre
 **What it does:**
 - Initializes a new chat session with unique IDs
 - Captures the user's initial message
-- Passes the message to downstream nodes via `handle_user_message` output
+- Passes the message text to downstream nodes via `handle_user_message` output
+- Passes any attached files via `handle_user_files` output
+- Passes any attached images via `handle_user_images` output
 
 ```python
 class NodeUserInput(Node):
+    HANDLER_USER_MESSAGE = 'handle_user_message'
+    HANDLER_USER_FILES = 'handle_user_files'
+    HANDLER_USER_IMAGES = 'handle_user_images'
     ...
     async def process(self, chat_log):
         if not chat_log.id_chat: ...
         if not chat_log.id_thread: ...
-        yield self.yield_static(self._text)
+        yield self.yield_static(self._text, content_type=self.HANDLER_USER_MESSAGE)
+        yield self.yield_static(self.files, content_type=self.HANDLER_USER_FILES)
+        yield self.yield_static(self.images, content_type=self.HANDLER_USER_IMAGES)
 ```
 
 #### `text` (`NodeText`)
@@ -164,6 +173,21 @@ class NodeParser(Node):
         output = template_parse(template=self.text, params=self.inputs)
         yield self.yield_static(output)
 ```
+
+#### `loop` (`NodeLoop`)
+Iterates over a list (JSON string or Python list) via input handle `list`, emitting each element downstream and collecting per-iteration inputs on handle `loop`.
+
+**Example usage:**
+```json
+{
+  "id": "item_loop",
+  "type": "loop"
+}
+```
+
+**What it does:**
+- Emits each list item as an independent content event (handle `item`).
+- Aggregates any inputs received on handle `loop` into a list and emits that at the end via handle `end`.
 
 #### `fetch` (`NodeFetch`)
 Sends an HTTP request (GET/POST/etc.) with optional Jinja2 templated body or JSON, returns parsed JSON.
@@ -245,7 +269,8 @@ Generates LLM outputs (streamed or batch) via `MagicLLM`, optionally parsing JSO
     "stream": true,
     "temperature": 0.7,
     "max_tokens": 512,
-    "json_output": false
+    "json_output": false,
+    "iterate": true      // re-run on each Loop iteration when inside a Loop node
   }
 }
 ```

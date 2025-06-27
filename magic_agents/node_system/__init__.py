@@ -7,6 +7,8 @@ from magic_agents.node_system.NodeClientLLM import NodeClientLLM
 from magic_agents.node_system.NodeEND import NodeEND
 from magic_agents.node_system.NodeFetch import NodeFetch
 from magic_agents.node_system.NodeLLM import NodeLLM
+from magic_agents.node_system.NodeLoop import NodeLoop
+from magic_agents.node_system.NodeInner import NodeInner
 from magic_agents.node_system.NodeParser import NodeParser
 from magic_agents.node_system.NodeSendMessage import NodeSendMessage
 from magic_agents.node_system.NodeText import NodeText
@@ -32,8 +34,12 @@ def detect_cycles(graph: nx.DiGraph):
 
 def perform_topological_sort(graph: nx.DiGraph) -> List[str]:
     """Performs topological sort using networkx."""
-    detect_cycles(graph)
-    return list(nx.topological_sort(graph))
+    try:
+        # allow cycles for specialized nodes (e.g., loop), fallback to insertion order on cycle
+        return list(nx.topological_sort(graph))
+    except nx.NetworkXUnfeasible:
+        # cycle(s) detected: skip strict topological sort, use current node order
+        return list(graph.nodes())
 
 
 def sort_edges_by_nodes_order(edges: List[Dict], sorted_node_ids: List[str]) -> List[Dict]:
@@ -54,7 +60,7 @@ def assign_node_positions(nodes: List[Dict], graph: nx.DiGraph, sorted_nodes: Li
         if not preds:
             levels[node] = 0
         else:
-            levels[node] = 1 + max(levels[pred] for pred in preds)
+            levels[node] = 1 + max(levels.get(pred, 0) for pred in preds)
 
     node_positions = {
         node_id: {
@@ -93,6 +99,8 @@ __all__ = [
     "NodeSendMessage",
     "NodeText",
     "NodeUserInput",
+    "NodeLoop",
+    "NodeInner",
     "build_graph",
     "detect_cycles",
     "perform_topological_sort",

@@ -274,6 +274,230 @@ async def test_run_agent():
         # print(i)
 
 
+agt_2 = {
+    "type": "chat",
+    "debug": True,
+    "edges": [
+        {
+            "id": "xy-edge__0handle_user_message-bb3c62ae-396c-4743-9f61-71064f19b65fhandle-system-context",
+            "source": "0",
+            "target": "bb3c62ae-396c-4743-9f61-71064f19b65f",
+            "sourceHandle": "handle_user_message",
+            "targetHandle": "handle-system-context"
+        },
+        {
+            "id": "xy-edge__a7c43855-5b27-4a56-9f81-84a3ad1ae662handle-client-provider-bb3c62ae-396c-4743-9f61-71064f19b65fhandle-client-provider",
+            "source": "a7c43855-5b27-4a56-9f81-84a3ad1ae662",
+            "target": "bb3c62ae-396c-4743-9f61-71064f19b65f",
+            "sourceHandle": "handle-client-provider",
+            "targetHandle": "handle-client-provider"
+        },
+        {
+            "id": "xy-edge__a7c43855-5b27-4a56-9f81-84a3ad1ae662handle-client-provider-77984a46-f85c-4fb4-917a-787058bdafaehandle-client-provider",
+            "source": "a7c43855-5b27-4a56-9f81-84a3ad1ae662",
+            "target": "77984a46-f85c-4fb4-917a-787058bdafae",
+            "sourceHandle": "handle-client-provider",
+            "targetHandle": "handle-client-provider"
+        },
+        {
+            "id": "xy-edge__7a8ee9ee-adc3-4472-a53a-921f7ced36a0handle_text_output-3cd55aef-e446-4614-8fe4-9310dbe77ccahandle_list",
+            "source": "7a8ee9ee-adc3-4472-a53a-921f7ced36a0",
+            "target": "3cd55aef-e446-4614-8fe4-9310dbe77cca",
+            "sourceHandle": "handle_text_output",
+            "targetHandle": "handle_list"
+        },
+        {
+            "id": "xy-edge__bb3c62ae-396c-4743-9f61-71064f19b65fhandle_generated_content-3cd55aef-e446-4614-8fe4-9310dbe77ccahandle_loop",
+            "source": "bb3c62ae-396c-4743-9f61-71064f19b65f",
+            "target": "3cd55aef-e446-4614-8fe4-9310dbe77cca",
+            "sourceHandle": "handle_generated_content",
+            "targetHandle": "handle_loop"
+        },
+        {
+            "id": "xy-edge__feb1223d-8f98-43cb-b428-2a87714fce41handle_text_output-77984a46-f85c-4fb4-917a-787058bdafaehandle-system-context",
+            "source": "feb1223d-8f98-43cb-b428-2a87714fce41",
+            "target": "77984a46-f85c-4fb4-917a-787058bdafae",
+            "sourceHandle": "handle_text_output",
+            "targetHandle": "handle-system-context"
+        },
+        {
+            "id": "xy-edge__3cd55aef-e446-4614-8fe4-9310dbe77ccahandle_item-bb3c62ae-396c-4743-9f61-71064f19b65fhandle_user_message",
+            "source": "3cd55aef-e446-4614-8fe4-9310dbe77cca",
+            "target": "bb3c62ae-396c-4743-9f61-71064f19b65f",
+            "sourceHandle": "handle_item",
+            "targetHandle": "handle_user_message"
+        },
+        {
+            "id": "xy-edge__3cd55aef-e446-4614-8fe4-9310dbe77ccahandle_end-77984a46-f85c-4fb4-917a-787058bdafaehandle_user_message",
+            "source": "3cd55aef-e446-4614-8fe4-9310dbe77cca",
+            "target": "77984a46-f85c-4fb4-917a-787058bdafae",
+            "sourceHandle": "handle_end",
+            "targetHandle": "handle_user_message"
+        },
+        {
+            "id": "xy-edge__77984a46-f85c-4fb4-917a-787058bdafaehandle_generated_end-5handle_generated_end",
+            "source": "77984a46-f85c-4fb4-917a-787058bdafae",
+            "target": "5",
+            "sourceHandle": "handle_generated_end",
+            "targetHandle": "handle_generated_end"
+        }
+    ],
+    "nodes": [
+        {
+            "id": "0",
+            "type": "user_input",
+            "measured": {
+                "width": 506,
+                "height": 179
+            },
+            "position": {
+                "x": -1666.7350815992695,
+                "y": 369.6754907927339
+            }
+        },
+        {
+            "id": "5",
+            "type": "end",
+            "dragging": False,
+            "measured": {
+                "width": 370,
+                "height": 179
+            },
+            "position": {
+                "x": 1827.6361753428084,
+                "y": 1327.8314985233858
+            },
+            "selected": False
+        },
+        {
+            "id": "3cd55aef-e446-4614-8fe4-9310dbe77cca",
+            "data": {},
+            "type": "loop",
+            "measured": {
+                "width": 355,
+                "height": 324
+            },
+            "position": {
+                "x": 305.0178762547595,
+                "y": 1549.5650238720527
+            }
+        },
+        {
+            "id": "a7c43855-5b27-4a56-9f81-84a3ad1ae662",
+            "data": {
+                "model": "gpt-4.1-2025-04-14",
+                "engine": "openai",
+                "api_info": {
+                    "api_key": var_env['openai_key'],
+                    "base_url": "https://api.openai.com/v1"
+                }
+            },
+            "type": "client",
+            "measured": {
+                "width": 329,
+                "height": 739
+            },
+            "position": {
+                "x": -986.4856640928764,
+                "y": 762.5258604478856
+            }
+        },
+        {
+            "id": "bb3c62ae-396c-4743-9f61-71064f19b65f",
+            "data": {
+                "model": "",
+                "top_p": 1,
+                "stream": True,
+                "iterate": True,
+                "max_tokens": 512,
+                "json_output": False,
+                "temperature": 0.7
+            },
+            "type": "llm",
+            "measured": {
+                "width": 280,
+                "height": 1323
+            },
+            "position": {
+                "x": 386.89511202650374,
+                "y": -11.550584590174504
+            }
+        },
+        {
+            "id": "7a8ee9ee-adc3-4472-a53a-921f7ced36a0",
+            "data": {
+                "text": "[1,2,3]"
+            },
+            "type": "text",
+            "measured": {
+                "width": 294,
+                "height": 325
+            },
+            "position": {
+                "x": -462.64093948861154,
+                "y": 1592.8627621547648
+            }
+        },
+        {
+            "id": "77984a46-f85c-4fb4-917a-787058bdafae",
+            "data": {
+                "model": "",
+                "top_p": 1,
+                "stream": True,
+                "iterate": False,
+                "max_tokens": 512,
+                "json_output": False,
+                "temperature": 0.7
+            },
+            "type": "llm",
+            "measured": {
+                "width": 280,
+                "height": 1323
+            },
+            "position": {
+                "x": 1203.0720591976494,
+                "y": 516.8306555430545
+            }
+        },
+        {
+            "id": "feb1223d-8f98-43cb-b428-2a87714fce41",
+            "data": {
+                "text": "Describe the content"
+            },
+            "type": "text",
+            "measured": {
+                "width": 294,
+                "height": 325
+            },
+            "position": {
+                "x": 739.8972164714987,
+                "y": 1090.8467279103088
+            }
+        }
+    ],
+    "master": "1"
+}
+
+
+@pytest.mark.asyncio
+async def test_run_agent_loop():
+    def load_chat(**kwargs):
+        print(kwargs)
+
+    print(agt_2)
+    graph = build(agt_data=agt_2,
+                  message='Write N times the user input',
+                  load_chat=load_chat)
+
+    async for i in run_agent(
+            graph=graph,
+    ):
+        # print(i)
+        print(i['content'].choices[0].delta.content, end='')
+        # print(i['content'].extras)
+        # print(i, end='')
+        # print(i)
+
 # def test_build_agent():
 #     print(agt)
 #

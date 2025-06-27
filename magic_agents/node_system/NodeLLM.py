@@ -2,11 +2,12 @@ import json
 import re
 import uuid
 
-from magic_agents.models.factory.Nodes import LlmNodeModel
-from magic_agents.node_system.Node import Node
 from magic_llm import MagicLLM
 from magic_llm.model import ModelChat
 from magic_llm.model.ModelChatStream import ChatCompletionModel, ChoiceModel
+
+from magic_agents.models.factory.Nodes import LlmNodeModel
+from magic_agents.node_system.Node import Node
 
 
 class NodeLLM(Node):
@@ -24,6 +25,8 @@ class NodeLLM(Node):
             debug=debug,
             node_id=node_id,
             **kwargs)
+        # allow re-execution inside Loop when requested
+        self.iterate = getattr(data, 'iterate', False)
         self.stream = data.stream
         self.json_output = data.json_output
         self.extra_data = data.extra_data
@@ -35,21 +38,33 @@ class NodeLLM(Node):
 
     async def process(self, chat_log):
         params = self.inputs
-
+        print(params)
+        no_inputs = False
         if not params.get(self.INPUT_HANDLER_SYSTEM_CONTEXT) and not params.get(self.INPUT_HANDLER_USER_MESSAGE):
-            yield self.yield_static('')
-            return
+            no_inputs = True
 
         client: MagicLLM = self.get_input(self.INPUT_HANDLER_CLIENT_PROVIDER, required=True)
         if c := params.get(self.INPUT_HANDLER_CHAT):
             chat = c
+            if sys_prompt := self.get_input(self.INPUT_HANDLER_SYSTEM_CONTEXT):
+                chat.set_system(sys_prompt)
+            if user_prompt := self.get_input(self.INPUT_HANDLER_USER_MESSAGE):
+                # Convert list to string for loop aggregation results
+                if isinstance(user_prompt, list):
+                    user_prompt = json.dumps(user_prompt)
+                chat.add_user_message(user_prompt)
         else:
-            chat = ModelChat(params.get(self.INPUT_HANDLER_SYSTEM_CONTEXT))
-            if k := params.get(self.INPUT_HANDLER_USER_MESSAGE):
-                chat.add_user_message(k)
-            else:
+            if no_inputs:
                 yield self.yield_static('')
                 return
+            chat = ModelChat(params.get(self.INPUT_HANDLER_SYSTEM_CONTEXT))
+            if k := params.get(self.INPUT_HANDLER_USER_MESSAGE):
+                # Convert list to string for loop aggregation results
+                if isinstance(k, list):
+                    k = json.dumps(k)
+                chat.add_user_message(k)
+            else:
+                raise ValueError(f"NodeLLM '{self.INPUT_HANDLER_USER_MESSAGE}' requires either a user message.")
 
         if not self.stream:
             intention = await client.llm.async_generate(chat, **self.extra_data)
@@ -93,5 +108,11 @@ class NodeLLM(Node):
                 self.generated = json.loads(json_content)
             else:
                 raise ValueError('No JSON content found', self.generated)
-
         yield self.yield_static(self.generated)
+
+    async def __call__(self, chat_log):
+        # if configured to iterate inside a Loop, always re-run instead of using cached response
+        if getattr(self, 'iterate', False):
+            self._response = None
+        async for result in super().__call__(chat_log):
+            yield result

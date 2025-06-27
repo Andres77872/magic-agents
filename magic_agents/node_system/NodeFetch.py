@@ -2,6 +2,7 @@ import json
 
 import aiohttp
 from jinja2 import Template
+
 from magic_agents.models.factory.Nodes import FetchNodeModel
 from magic_agents.node_system.Node import Node
 
@@ -11,7 +12,7 @@ class NodeFetch(Node):
                  data: FetchNodeModel,
                  **kwargs) -> None:
         super().__init__(**kwargs)
-        self.method = data.method.upper()
+        self.method = data.method.upper().strip()
         self.headers = data.headers or {
             'Accept': 'application/json',
             'Content-Type': 'application/json'
@@ -41,7 +42,8 @@ class NodeFetch(Node):
             kwargs['data'] = data
 
         if 'json' not in kwargs and 'data' not in kwargs:
-            return {}
+            if self.method != 'GET':
+                return {}
 
         async with method(**kwargs) as response:
             response.raise_for_status()
@@ -59,7 +61,6 @@ class NodeFetch(Node):
         if not run:
             yield self.yield_static({})
             return
-
         if self.jsondata is not None:
             # Render JSON data with Jinja if jsondata exists
             template = Template(json.dumps(self.jsondata))
@@ -67,7 +68,7 @@ class NodeFetch(Node):
         elif self.data:
             # Render regular data with Jinja if data exists
             template = Template(json.dumps(self.data))
-            data_to_send = json.loads(template.render(self.inputs))
+            data_to_send = json.loads(template.render(self.inputs).replace('\n', ''))
 
         async with aiohttp.ClientSession() as session:
             response_json = await self.fetch(
