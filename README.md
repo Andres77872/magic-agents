@@ -7,6 +7,12 @@ A lightweight and flexible orchestration library for building LLM-based agent fl
 magic_agents lets you compose **nodes** (user input, templating, HTTP fetch, LLM calls, etc.) in a directed graph
 and execute them in order, streaming results back as they arrive.
 
+## Documentation
+
+Full architecture diagrams, node reference, and details on the compile/execute pipeline live in the
+[`docs/`](docs/) folder. Start with [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for a guided tour.
+
+
 ## Features
 
 - **Modular Node System**: build reusable building blocks (nodes) for common tasks.
@@ -339,6 +345,52 @@ Sends extra JSON payloads back to the client via `ChatCompletionModel.extras`.
 
 ```python
 class NodeSendMessage(Node):
+    ...
+    async def process(self, chat_log):
+        output = self.get_input('handle_send_extra')
+        ...
+        yield self.yield_static(ChatCompletionModel(..., extras=output), content_type='content')
+```
+
+#### `inner` (`NodeInner`)
+Runs a **nested agent flow** (`magic_flow`). This allows reusable sub-graphs and modular flows.
+
+**Example usage:**
+```json
+{
+  "id": "summarize_each",
+  "type": "inner",
+  "magic_flow": {
+    "type": "chat",
+    "nodes": [
+      {"id": "inner_user", "type": "user_input"},
+      {"id": "inner_llm", "type": "llm"},
+      {"id": "inner_end", "type": "end"}
+    ],
+    "edges": [
+      {"source": "inner_user", "target": "inner_llm"},
+      {"source": "inner_llm", "target": "inner_end"}
+    ],
+    "master": "inner_user"
+  }
+}
+```
+
+**What it does:**
+- Receives inputs on handle `input` and forwards them as the `message` for the sub-flow’s `user_input` node.
+- Streams all outputs from the nested flow downstream via handle `loop`/`output`.
+- Useful for factoring complex flows into smaller reusable pieces.
+
+```python
+class NodeInner(Node):
+    inner_graph: AgentFlowModel
+    ...
+    async def process(self, chat_log):
+        async for chunk in run_agent(self.inner_graph):
+            yield chunk
+```
+
+
     ...
     async def process(self, chat_log):
         output = self.get_input('handle_send_extra')
