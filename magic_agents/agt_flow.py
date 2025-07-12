@@ -16,6 +16,7 @@ from magic_agents.models.factory.Nodes import (
     ClientNodeModel,
     SendMessageNodeModel,
     LoopNodeModel,
+    BaseNodeModel,
     InnerNodeModel,
 )
 from magic_agents.models.model_agent_run_log import ModelAgentRunLog
@@ -31,6 +32,7 @@ from magic_agents.node_system import (
     NodeParser,
     NodeLoop,
     NodeInner,
+    NodeConditional,
     sort_nodes,
 )
 from magic_agents.util.const import HANDLE_VOID
@@ -65,6 +67,7 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False) -> Any:
         ModelAgentFlowTypesModel.CLIENT: (NodeClientLLM, ClientNodeModel),
         ModelAgentFlowTypesModel.SEND_MESSAGE: (NodeSendMessage, SendMessageNodeModel),
         ModelAgentFlowTypesModel.LOOP: (NodeLoop, LoopNodeModel),
+        ModelAgentFlowTypesModel.CONDITIONAL: (NodeConditional, None),
         ModelAgentFlowTypesModel.INNER: (NodeInner, InnerNodeModel),
         ModelAgentFlowTypesModel.VOID: (NodeEND, None),
     }
@@ -73,6 +76,9 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False) -> Any:
     constructor, model_cls = node_map[node_type]
     if node_type == ModelAgentFlowTypesModel.CHAT:
         return constructor(load_chat=load_chat, **extra, **node_data)
+    elif node_type == ModelAgentFlowTypesModel.CONDITIONAL:
+        # Pass condition and other params directly
+        return constructor(**extra, **node_data)
     elif node_type == ModelAgentFlowTypesModel.INNER:
         return constructor(load_chat=load_chat, **extra, data=InnerNodeModel(**extra, **node_data))
     elif model_cls:
@@ -232,14 +238,39 @@ async def execute_graph(graph: AgentFlowModel,
         id_app='magic-research'
     )
 
-    # Track which nodes have been executed
-    executed_nodes = set()
+    # Track status of nodes: 'executed' | 'bypassed'
+    executed_nodes: set[str] = set()
+    node_state: Dict[str, str] = {}
 
-    # Helper to check if all dependencies of a node are satisfied
+    # Store ids of bypassed edges produced from conditional branching
+    bypass_edges: set[str] = set()
+
+    # Convenience predicate helpers
+    def is_edge_bypassed(edge: EdgeNodeModel) -> bool:
+        return edge.id in bypass_edges
+
+    def mark_edge_bypass(edge: EdgeNodeModel):
+        bypass_edges.add(edge.id)
+
+    def propagate_bypass(node_id: str):
+        """Recursively mark node and outgoing edges as bypassed if all parents bypassed."""
+        if node_state.get(node_id) == "bypassed":
+            return
+        incoming = [e for e in graph.edges if e.target == node_id]
+        if incoming and all(is_edge_bypassed(e) for e in incoming):
+            node_state[node_id] = "bypassed"
+            for e in graph.edges:
+                if e.source == node_id:
+                    mark_edge_bypass(e)
+                    propagate_bypass(e.target)
+
+    # Helper to check if all non-bypassed dependencies of a node are satisfied
     def are_dependencies_satisfied(node_id: str) -> bool:
         for edge in graph.edges:
-            if edge.target == node_id and edge.source not in executed_nodes:
-                return False
+            if edge.target == node_id and not is_edge_bypassed(edge):
+                # Edge still relevant, ensure source executed
+                if edge.source not in node_state:
+                    return False
         return True
 
     async def process_edge(edge: EdgeNodeModel):
@@ -253,7 +284,11 @@ async def execute_graph(graph: AgentFlowModel,
             return
 
         # Execute source node only if not already executed and dependencies are satisfied
-        if edge.source not in executed_nodes:
+        # Skip if this edge/path is bypassed
+        if is_edge_bypassed(edge):
+            return
+
+        if node_state.get(edge.source) not in ("executed", "bypassed"):
             if are_dependencies_satisfied(edge.source):
                 if not source_node.outputs:
                     async for item in source_node(chat_log):
@@ -263,10 +298,20 @@ async def execute_graph(graph: AgentFlowModel,
                             source_node.outputs[edge.sourceHandle] = item["content"]
                         else:
                             source_node.outputs[item["type"]] = item["content"]
+                node_state[edge.source] = "executed"
                 executed_nodes.add(edge.source)
 
+                # If the node is a Conditional, decide bypass paths
+                if isinstance(source_node, NodeConditional):
+                    produced = set(source_node.outputs.keys()) - {"end"}
+                    selected_handle = next(iter(produced), None)
+                    for e in graph.edges:
+                        if e.source == edge.source and e.sourceHandle != selected_handle:
+                            mark_edge_bypass(e)
+                            propagate_bypass(e.target)
+
         # Pass output to target only if source has been executed
-        if edge.source in executed_nodes:
+        if node_state.get(edge.source) in ("executed", "bypassed"):
             source_handle = edge.sourceHandle
             target_handle = edge.targetHandle
             target_node.add_parent(source_node.outputs, source_handle, target_handle)
@@ -276,8 +321,14 @@ async def execute_graph(graph: AgentFlowModel,
     while remaining_edges:
         made_progress = False
         for i, edge in enumerate(remaining_edges):
+            # Remove bypassed edges immediately
+            if is_edge_bypassed(edge):
+                remaining_edges.pop(i)
+                made_progress = True
+                break
+
             # Check if this edge can be processed
-            if are_dependencies_satisfied(edge.target) or edge.source in executed_nodes:
+            if are_dependencies_satisfied(edge.target) or node_state.get(edge.source) in ("executed", "bypassed"):
                 async for result in process_edge(edge):
                     yield result
                 remaining_edges.pop(i)
