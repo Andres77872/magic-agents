@@ -1,10 +1,14 @@
 import json
+import logging
 
 import aiohttp
 from jinja2 import Template
+from urllib.parse import urlsplit
 
 from magic_agents.models.factory.Nodes import FetchNodeModel
 from magic_agents.node_system.Node import Node
+
+logger = logging.getLogger(__name__)
 
 
 class NodeFetch(Node):
@@ -45,7 +49,17 @@ class NodeFetch(Node):
             if self.method != 'GET':
                 return {}
 
+        parts = urlsplit(url)
+        safe_url = f"{parts.scheme}://{parts.netloc}{parts.path}"
+
+        logger.info("NodeFetch:%s %s %s", self.node_id, self.method, safe_url)
+        if self.debug:
+            payload_type = 'json' if 'json' in kwargs else ('data' if 'data' in kwargs else 'none')
+            logger.debug("NodeFetch:%s request payload type=%s headers_keys=%s", self.node_id, payload_type, list(kwargs['headers'].keys()))
+
         async with method(**kwargs) as response:
+            if self.debug:
+                logger.debug("NodeFetch:%s response status=%s", self.node_id, response.status)
             response.raise_for_status()
             return await response.json()
 
@@ -59,6 +73,8 @@ class NodeFetch(Node):
                 run = True
                 break
         if not run:
+            if self.debug:
+                logger.debug("NodeFetch:%s no inputs set; skipping request", self.node_id)
             yield self.yield_static({})
             return
         if self.jsondata is not None:
@@ -71,10 +87,12 @@ class NodeFetch(Node):
             data_to_send = json.loads(template.render(self.inputs).replace('\n', ''))
 
         async with aiohttp.ClientSession() as session:
+            logger.debug("NodeFetch:%s executing fetch", self.node_id)
             response_json = await self.fetch(
                 session,
                 self.url,
                 data=data_to_send,
                 json_data=json_data_to_send
             )
+        logger.info("NodeFetch:%s request completed", self.node_id)
         yield self.yield_static(response_json)

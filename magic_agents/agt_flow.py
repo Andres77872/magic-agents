@@ -55,6 +55,8 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False) -> Any:
     extra = {'debug': debug, 'node_id': node['id'], 'node_type': node['type']}
     node_type = node['type']
     node_data = node.get('data', {})
+    # Debug ‑ log the raw node definition before instantiation
+    logger.debug("Creating node %s of type %s with data %s", node['id'], node_type, node_data)
     # Mapping of node types to (constructor, model)
     node_map = {
         ModelAgentFlowTypesModel.CHAT: (NodeChat, None),
@@ -101,6 +103,8 @@ async def execute_graph_loop(
         id_chat=id_chat, id_thread=id_thread, id_user=id_user,
         id_app='magic-research'
     )
+    logger.info("Starting execute_graph_loop: nodes=%d edges=%d ids(chat=%s, thread=%s, user=%s)",
+                len(nodes), len(graph.edges), id_chat, id_thread, id_user)
 
     loop_id = next(nid for nid, node in nodes.items() if isinstance(node, NodeLoop))
     loop_node = nodes[loop_id]
@@ -110,6 +114,9 @@ async def execute_graph_loop(
         tgt = nodes.get(edge.target)
         if not src or not tgt:
             return
+        # Trace loop edge routing
+        logger.debug("Loop process_edge edge=%s: %s[%s] -> %s[%s]",
+                     edge.id, edge.source, edge.sourceHandle, edge.target, edge.targetHandle)
         
         # Special handling for end edges - always process them to transfer data
         is_end_edge = edge.source == loop_id and edge.sourceHandle == NodeLoop.OUTPUT_HANDLE_END
@@ -124,6 +131,7 @@ async def execute_graph_loop(
                             (edge.source != loop_id and (not src.outputs or src._response is None))
             
             if should_execute:
+                logger.debug("Loop executing node %s (%s)", edge.source, src.__class__.__name__)
                 async for msg in src(chat_log):
                     if msg["type"] == "content":
                         yield msg["content"]
@@ -132,6 +140,7 @@ async def execute_graph_loop(
                     else:
                         src.outputs[msg["type"]] = msg["content"]
         
+        logger.debug("Loop passing output %s -> %s (%s -> %s)", edge.source, edge.target, edge.sourceHandle, edge.targetHandle)
         tgt.add_parent(src.outputs, edge.sourceHandle, edge.targetHandle)
         
         # For end edges, execute the target node after adding the input
@@ -159,10 +168,14 @@ async def execute_graph_loop(
     static_edges = [e for e in all_edges
                     if e not in item_edges + loop_back_edges + end_edges]
 
+    logger.debug("Loop edges: static=%d item=%d loop_back=%d end=%d",
+                 len(static_edges), len(item_edges), len(loop_back_edges), len(end_edges))
+
     for edge in static_edges:
         async for out in _process_edge(edge):
             yield out
 
+    logger.info("Starting execute_graph_loop: loop_id=%s total_edges=%d", loop_id, len(all_edges))
     raw = loop_node.inputs.get(NodeLoop.INPUT_HANDLE_LIST)
     if isinstance(raw, str):
         items = __import__('json').loads(raw)
@@ -171,6 +184,7 @@ async def execute_graph_loop(
     if not isinstance(items, list):
         raise ValueError(f"Loop node '{loop_id}' expects a list, got {type(items)}")
 
+    logger.info("Loop items to iterate: %d", len(items))
     loop_agg = []
     for item in items:
         loop_node._response = None
@@ -205,6 +219,7 @@ async def execute_graph_loop(
     for edge in end_edges:
         async for out in _process_edge(edge):
             yield out
+    logger.info("Finished execute_graph_loop: loop_id=%s", loop_id)
 
 
 async def execute_graph(graph: AgentFlowModel,
@@ -227,6 +242,7 @@ async def execute_graph(graph: AgentFlowModel,
     # Detect a Loop node for iterative dynamic execution
     loop_nodes = [nid for nid, node in graph.nodes.items() if isinstance(node, NodeLoop)]
     if loop_nodes:
+        logger.info("Detected loop nodes in graph: %s. Delegating to execute_graph_loop.", loop_nodes)
         async for msg in execute_graph_loop(graph, id_chat=id_chat, id_thread=id_thread, id_user=id_user):
             yield msg
         return
@@ -282,6 +298,8 @@ async def execute_graph(graph: AgentFlowModel,
         if not target_node:
             logger.error(f"Target node {edge.target} not found.")
             return
+        logger.debug("Processing edge=%s: %s[%s] -> %s[%s]",
+                     edge.id, edge.source, edge.sourceHandle, edge.target, edge.targetHandle)
 
         # Execute source node only if not already executed and dependencies are satisfied
         # Skip if this edge/path is bypassed
@@ -291,6 +309,7 @@ async def execute_graph(graph: AgentFlowModel,
         if node_state.get(edge.source) not in ("executed", "bypassed"):
             if are_dependencies_satisfied(edge.source):
                 if not source_node.outputs:
+                    logger.debug("Executing node %s (%s)", edge.source, source_node.__class__.__name__)
                     async for item in source_node(chat_log):
                         if item["type"] == "content":
                             yield item["content"]
@@ -300,11 +319,13 @@ async def execute_graph(graph: AgentFlowModel,
                             source_node.outputs[item["type"]] = item["content"]
                 node_state[edge.source] = "executed"
                 executed_nodes.add(edge.source)
+                logger.debug("Node %s executed", edge.source)
 
                 # If the node is a Conditional, decide bypass paths
                 if isinstance(source_node, NodeConditional):
                     produced = set(source_node.outputs.keys()) - {"end"}
                     selected_handle = next(iter(produced), None)
+                    logger.debug("Conditional %s produced handle=%s; bypassing non-selected paths", edge.source, selected_handle)
                     for e in graph.edges:
                         if e.source == edge.source and e.sourceHandle != selected_handle:
                             mark_edge_bypass(e)
@@ -314,6 +335,7 @@ async def execute_graph(graph: AgentFlowModel,
         if node_state.get(edge.source) in ("executed", "bypassed"):
             source_handle = edge.sourceHandle
             target_handle = edge.targetHandle
+            logger.debug("Passing output %s -> %s (%s -> %s)", edge.source, edge.target, source_handle, target_handle)
             target_node.add_parent(source_node.outputs, source_handle, target_handle)
 
     # Process edges in topological order
@@ -346,7 +368,10 @@ async def execute_graph(graph: AgentFlowModel,
 
             if not made_progress:
                 # No progress could be made - likely circular dependency
+                logger.error("No progress in graph execution; possible circular dependency or missing node")
                 raise ValueError("Circular dependency detected or missing node in graph")
+
+    logger.info("Finished execute_graph")
 
 
 def build(agt_data, message: str, images: list[str] = None, load_chat=None) -> AgentFlowModel:

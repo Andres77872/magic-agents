@@ -1,8 +1,11 @@
 import json
+import logging
 
 from magic_agents.models.factory.Nodes import ClientNodeModel
 from magic_agents.node_system.Node import Node
 from magic_llm import MagicLLM
+
+logger = logging.getLogger(__name__)
 
 
 class NodeClientLLM(Node):
@@ -29,7 +32,12 @@ class NodeClientLLM(Node):
         if 'api_key' in args:
             args['private_key'] = args['api_key']
 
+        if self.debug:
+            logger.debug("NodeClientLLM:%s initializing client engine=%s model=%s", self.node_id, data.engine, data.model)
         self.client = MagicLLM(**args)
+        logger.info("NodeClientLLM:%s client initialized", self.node_id)
 
     async def process(self, chat_log):
+        if self.debug:
+            logger.debug("NodeClientLLM:%s yielding MagicLLM client", self.node_id)
         yield self.yield_static(self.client)

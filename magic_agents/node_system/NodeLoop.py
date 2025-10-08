@@ -1,6 +1,9 @@
 import json
+import logging
 
 from magic_agents.node_system.Node import Node
+
+logger = logging.getLogger(__name__)
 
 
 class NodeLoop(Node):
@@ -32,9 +35,18 @@ class NodeLoop(Node):
             items = raw
         if not isinstance(items, list):
             raise ValueError(f"NodeLoop '{self.node_id}' expects a list, got {type(items)}")
+        logger.info("NodeLoop:%s iterating over %d items", self.node_id, len(items))
         # yield each item for downstream processing
-        for item in items:
+        for idx, item in enumerate(items):
+            if self.debug and idx < 5:
+                logger.debug("NodeLoop:%s yielding item index=%d", self.node_id, idx)
             yield self.yield_static(item, content_type='content')
         # after iteration, aggregate any loop inputs collected
         agg = self.inputs.get(self.INPUT_HANDLE_LOOP, [])
+        if self.debug:
+            try:
+                agg_len = len(agg)
+            except Exception:
+                agg_len = 1 if agg else 0
+            logger.debug("NodeLoop:%s yielding aggregation length=%d", self.node_id, agg_len)
         yield self.yield_static(agg)

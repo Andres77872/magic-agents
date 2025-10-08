@@ -1,6 +1,7 @@
 import json
 import re
 import uuid
+import logging
 
 from magic_llm import MagicLLM
 from magic_llm.model import ModelChat
@@ -8,6 +9,8 @@ from magic_llm.model.ModelChatStream import ChatCompletionModel, ChoiceModel
 
 from magic_agents.models.factory.Nodes import LlmNodeModel
 from magic_agents.node_system.Node import Node
+
+logger = logging.getLogger(__name__)
 
 
 class NodeLLM(Node):
@@ -38,7 +41,8 @@ class NodeLLM(Node):
 
     async def process(self, chat_log):
         params = self.inputs
-        print(params)
+        # Avoid logging full params to prevent leaking content; log keys only
+        logger.debug("NodeLLM:%s inputs keys: %s", self.node_id, list(params.keys()))
         no_inputs = False
         if not params.get(self.INPUT_HANDLER_SYSTEM_CONTEXT) and not params.get(self.INPUT_HANDLER_USER_MESSAGE):
             no_inputs = True
@@ -55,6 +59,7 @@ class NodeLLM(Node):
                 chat.add_user_message(user_prompt)
         else:
             if no_inputs:
+                logger.debug("NodeLLM:%s no inputs provided; yielding empty content", self.node_id)
                 yield self.yield_static('')
                 return
             chat = ModelChat(params.get(self.INPUT_HANDLER_SYSTEM_CONTEXT))
@@ -64,9 +69,11 @@ class NodeLLM(Node):
                     k = json.dumps(k)
                 chat.add_user_message(k)
             else:
+                logger.error("NodeLLM:%s missing required input '%s'", self.node_id, self.INPUT_HANDLER_USER_MESSAGE)
                 raise ValueError(f"NodeLLM '{self.INPUT_HANDLER_USER_MESSAGE}' requires either a user message.")
 
         if not self.stream:
+            logger.info("NodeLLM:%s generating (non-stream) with model=%s", self.node_id, client.llm.model)
             intention = await client.llm.async_generate(chat, **self.extra_data)
             self.generated = intention.content
             yield self.yield_static(ChatCompletionModel(
@@ -76,6 +83,7 @@ class NodeLLM(Node):
                 usage=intention.usage),
                 content_type='content')
         else:
+            logger.info("NodeLLM:%s streaming generation with model=%s", self.node_id, client.llm.model)
             async for i in client.llm.async_stream_generate(chat, **self.extra_data):
                 self.generated += i.choices[0].delta.content or ''
                 yield self.yield_static(i, content_type='content')
@@ -84,6 +92,7 @@ class NodeLLM(Node):
         #     self.generated = json.loads(self.generated)
 
         if self.json_output:
+            logger.debug("NodeLLM:%s parsing JSON output", self.node_id)
 
             # Extract JSON from markdown code blocks or plain text
             json_content = None
@@ -106,7 +115,9 @@ class NodeLLM(Node):
                     json_content = self.generated.strip()
             if json_content:
                 self.generated = json.loads(json_content)
+                logger.debug("NodeLLM:%s JSON parsed successfully", self.node_id)
             else:
+                logger.error("NodeLLM:%s no JSON content found in generated output (%d chars)", self.node_id, len(self.generated))
                 raise ValueError('No JSON content found', self.generated)
         yield self.yield_static(self.generated)
 

@@ -1,9 +1,12 @@
 import json
+import logging
 from typing import Callable
 
 from magic_llm.model import ModelChat
 
 from magic_agents.node_system.Node import Node
+
+logger = logging.getLogger(__name__)
 
 
 class NodeChat(Node):
@@ -30,9 +33,11 @@ class NodeChat(Node):
 
     async def process(self, chat_log):
         if c := self.get_input(self.INPUT_HANDLER_MESSAGES):
+            logger.debug("NodeChat:%s loading messages directly", self.node_id)
             self.chat.messages = c
         else:
             if c := self.get_input(self.INPUT_HANDLER_SYSTEM_CONTEXT):
+                logger.debug("NodeChat:%s setting system context", self.node_id)
                 self.chat.set_system(c)
             if c := self.get_input(self.INPUT_HANDLER_USER_MESSAGE):
                 if im := self.get_input(self.INPUT_HANDLER_USER_IMAGES):
@@ -46,14 +51,18 @@ class NodeChat(Node):
                         elif isinstance(i, list):
                             is_list_pair = True
                     if is_list_single and is_list_pair:
+                        logger.error("NodeChat:%s UserImage and UserFile cannot be used together", self.node_id)
                         raise ValueError("UserImage and UserFile cannot be used together")
                     if is_list_single:
+                        logger.debug("NodeChat:%s adding user message with images (single list)", self.node_id)
                         self.chat.add_user_message(c, im)
                     elif is_list_pair:
+                        logger.debug("NodeChat:%s adding user message with images (pair list)", self.node_id)
                         for i in im:
                             self.chat.add_user_message(i[0], i[1])
                         self.chat.add_user_message(c)
                 else:
+                    logger.debug("NodeChat:%s adding user message", self.node_id)
                     self.chat.add_user_message(c)
-
+        logger.info("NodeChat:%s chat prepared with %d messages", self.node_id, len(self.chat.messages))
         yield self.yield_static(self.chat)

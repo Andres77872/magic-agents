@@ -1,4 +1,5 @@
 from typing import Callable, TYPE_CHECKING
+import logging
 
 # from magic_agents.agt_flow import build, execute_graph
 from magic_agents.models.factory.Nodes import InnerNodeModel
@@ -6,6 +7,8 @@ from magic_agents.node_system.Node import Node
 
 if TYPE_CHECKING:
     from magic_agents.models.factory.AgentFlowModel import AgentFlowModel
+
+logger = logging.getLogger(__name__)
 
 
 class NodeInner(Node):
@@ -66,7 +69,7 @@ class NodeInner(Node):
             else:
                 # It's some other type of output - try to convert to string
                 if self.debug:
-                    print(f"NodeInner received non-ChatCompletionModel: {type(event)}")
+                    logger.debug("NodeInner:%s received non-ChatCompletionModel: %s", self.node_id, type(event))
                 # For now, we'll skip non-ChatCompletionModel outputs
                 # In a full implementation, you might want to handle these differently
                 pass
