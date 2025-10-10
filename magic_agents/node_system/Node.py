@@ -3,8 +3,10 @@ from __future__ import annotations
 import abc
 import logging
 from typing import Any, Dict, Optional, AsyncGenerator
+from datetime import datetime
 
 from magic_agents.models.model_agent_run_log import ModelAgentRunLog
+from magic_agents.models.debug_feedback import NodeDebugInfo
 from magic_agents.util.telemetry import magic_telemetry
 
 logger = logging.getLogger(__name__)
@@ -20,6 +22,7 @@ class Node(abc.ABC):
             self,
             cost: float = 0.0,
             node_id: Optional[str] = None,
+            node_type: Optional[str] = None,
             debug: bool = False,
             **kwargs,
     ):
@@ -29,6 +32,7 @@ class Node(abc.ABC):
         Parameters:
         - cost (float): Cost associated with the node.
         - node_id (Optional[str]): Unique identifier for the node.
+        - node_type (Optional[str]): Type identifier for the node.
         - debug (bool): Whether to enable debugging logs.
         """
         self.cost = cost
@@ -37,10 +41,19 @@ class Node(abc.ABC):
         self.debug = debug
         self._response: Optional[Any] = None
         self.node_id = node_id
+        self.node_type = node_type
         self.extra_params = kwargs
-
+        # Add node_type to extra_params for telemetry
+        self.extra_params['node_type'] = node_type
+        
+        # Debug tracking
+        self._debug_info: Optional[NodeDebugInfo] = None
+        self._execution_start: Optional[datetime] = None
+        self._execution_end: Optional[datetime] = None
+        
         if self.debug:
             logger.debug(f"Node ({self.node_id}) initialized with params: {kwargs}")
+            self._init_debug_info()
 
     def prep(self, content: Any) -> Dict[str, Any]:
         """
@@ -54,7 +67,22 @@ class Node(abc.ABC):
 
     def add_parent(self, parent_outputs: Dict[str, Any], source_handle: str, target_handle: str):
         """
-        Adds specific content from source_handle (in parent's outputs) into this node's inputs at target_handle.
+        Connects output from a parent node to this node's input via edge routing.
+        
+        This method implements Step 2 of the handle routing process:
+        - Matches parent's output (via source_handle) to this node's input (via target_handle)
+        - Extracts content from parent's outputs dict
+        - Stores content in this node's inputs dict using target_handle as key
+        
+        Args:
+            parent_outputs: Dict of parent node's output events, keyed by content_type
+            source_handle: The content_type of the parent's output event (from edge.sourceHandle)
+            target_handle: The key to store this input under (from edge.targetHandle)
+        
+        Example:
+            Parent yields: yield_static(data, content_type='handle_user_message')
+            Edge: {"sourceHandle": "handle_user_message", "targetHandle": "user_input"}
+            Result: self.inputs['user_input'] = parent_data
         """
         content = parent_outputs.get(source_handle)
         if self.debug:
@@ -77,9 +105,72 @@ class Node(abc.ABC):
             raise ValueError(f"Required input '{key}' not found in node '{self.node_id or self.__class__.__name__}'")
         return value
 
+    def yield_debug_error(self, error_type: str, error_message: str, context: dict = None):
+        """
+        Yield a debug error message without raising an exception.
+        
+        Args:
+            error_type: Type of error (e.g., 'ValidationError', 'InputError', 'TemplateError')
+            error_message: Detailed error message
+            context: Additional context information (optional)
+        
+        Returns:
+            Dict with debug error information
+        """
+        error_info = {
+            "node_id": self.node_id or "unknown",
+            "node_type": self.node_type or "unknown",
+            "node_class": self.__class__.__name__,
+            "error_type": error_type,
+            "error_message": error_message,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        if context:
+            error_info["context"] = context
+        
+        if self.debug:
+            logger.error(
+                "Node (%s): %s - %s",
+                self.node_id,
+                error_type,
+                error_message
+            )
+        
+        return {
+            "type": "debug",
+            "content": error_info
+        }
+    
     def yield_static(self, content: any, content_type: str = 'end'):
         """
-        Utility to yield a static/prepared content in the node's process method.
+        Creates an output event for routing to connected nodes.
+        
+        This method implements Step 1 of the handle routing process:
+        - Wraps content in a typed event structure
+        - The content_type becomes the routing key for edge matching
+        - Must be called from within the process() method
+        
+        Args:
+            content: The data to output (any type: dict, str, list, etc.)
+            content_type: The event type for routing (default: 'end')
+                         This MUST match the sourceHandle in downstream edges
+        
+        Returns:
+            Dict with 'type' (routing key) and 'content' (wrapped data)
+        
+        Example:
+            # In your node's process method:
+            yield self.yield_static(result, content_type='handle_success')
+            
+            # Edge must use:
+            {"sourceHandle": "handle_success", "target": "next-node", ...}
+        
+        Common content_types:
+            - 'end' or 'default': Standard output for most nodes
+            - 'handle_user_message': User input from NodeUserInput
+            - 'content': Loop item iteration from NodeLoop
+            - Custom types: Any string for specialized routing
         """
         return {
             'type': content_type,
@@ -104,9 +195,42 @@ class Node(abc.ABC):
             yield {"type": "end", "content": self.prep(self._response)}
             return
 
-        # Execute subclass-specific logic.
-        async for result in self.process(chat_log):
-            yield result
+        # Start debug tracking if enabled
+        self._start_debug_tracking()
+        
+        error_msg = None
+        try:
+            # Execute subclass-specific logic.
+            async for result in self.process(chat_log):
+                yield result
+        except Exception as e:
+            error_msg = str(e)
+            if self.debug:
+                logger.error(f"Node ({self.node_id}): Execution failed with error: {error_msg}")
+            
+            # End debug tracking and yield debug info on error
+            self._end_debug_tracking(error=error_msg)
+            
+            # Always yield debug info on error (not just in debug mode)
+            if self._debug_info:
+                yield {
+                    "type": "debug",
+                    "content": self._debug_info.model_dump()
+                }
+            else:
+                # Create minimal error debug info if debug tracking wasn't initialized
+                yield self.yield_debug_error(
+                    error_type=type(e).__name__,
+                    error_message=error_msg,
+                    context={"inputs": list(self.inputs.keys())}
+                )
+            
+            # Don't raise - just return after yielding debug info
+            return
+        finally:
+            # End debug tracking if not already done (normal execution path)
+            if error_msg is None:
+                self._end_debug_tracking(error=None)
 
     @abc.abstractmethod
     async def process(
@@ -129,3 +253,135 @@ class Node(abc.ABC):
         Check if debug mode is enabled for this node.
         """
         return self.debug
+    
+    def _init_debug_info(self):
+        """Initialize debug information structure."""
+        self._debug_info = NodeDebugInfo(
+            node_id=self.node_id or "unknown",
+            node_type=self.node_type or "unknown",
+            node_class=self.__class__.__name__
+        )
+    
+    def _start_debug_tracking(self):
+        """Start tracking debug information for this node execution."""
+        if not self.debug:
+            return
+        
+        if self._debug_info is None:
+            self._init_debug_info()
+        
+        self._execution_start = datetime.utcnow()
+        self._debug_info.start_time = self._execution_start.isoformat()
+        self._debug_info.inputs = self._safe_copy_dict(self.inputs)
+        
+        if self.debug:
+            logger.debug(f"Node ({self.node_id}): Started execution tracking")
+    
+    def _end_debug_tracking(self, error: Optional[str] = None):
+        """End tracking debug information and capture final state."""
+        if not self.debug or self._debug_info is None:
+            return
+        
+        self._execution_end = datetime.utcnow()
+        self._debug_info.end_time = self._execution_end.isoformat()
+        
+        # Calculate execution duration
+        if self._execution_start:
+            duration = (self._execution_end - self._execution_start).total_seconds() * 1000
+            self._debug_info.execution_duration_ms = duration
+        
+        # Capture outputs
+        self._debug_info.outputs = self._safe_copy_dict(self.outputs)
+        
+        # Capture internal state
+        self._debug_info.internal_variables = self._capture_internal_state()
+        
+        # Mark execution status
+        self._debug_info.was_executed = True
+        self._debug_info.error = error
+        
+        if self.debug:
+            logger.debug(
+                f"Node ({self.node_id}): Ended execution tracking "
+                f"(duration: {self._debug_info.execution_duration_ms:.2f}ms)"
+            )
+    
+    def _capture_internal_state(self) -> Dict[str, Any]:
+        """
+        Capture internal state of the node.
+        Subclasses can override this to capture specific internal variables.
+        """
+        state = {}
+        
+        # Capture common internal variables
+        if hasattr(self, '_response') and self._response is not None:
+            state['_response'] = self._safe_value(self._response)
+        
+        if hasattr(self, 'cost'):
+            state['cost'] = self.cost
+        
+        # Capture extra params if they exist
+        if hasattr(self, 'extra_params') and self.extra_params:
+            state['extra_params'] = self._safe_copy_dict(self.extra_params)
+        
+        return state
+    
+    def _safe_copy_dict(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Safely copy a dictionary, handling non-serializable objects."""
+        result = {}
+        for key, value in data.items():
+            result[key] = self._safe_value(value)
+        return result
+    
+    def _safe_value(self, value: Any) -> Any:
+        """Convert value to a safe, serializable format."""
+        # Handle basic types
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        
+        # Handle dictionaries
+        if isinstance(value, dict):
+            # For nested dicts with 'node' and 'content' keys (prep output format)
+            if 'node' in value and 'content' in value:
+                return {
+                    'node': value['node'],
+                    'content': self._safe_value(value['content'])
+                }
+            return {k: self._safe_value(v) for k, v in value.items()}
+        
+        # Handle lists
+        if isinstance(value, (list, tuple)):
+            return [self._safe_value(item) for item in value]
+        
+        # For complex objects, try to get a string representation
+        try:
+            # Try to convert to dict if it has __dict__
+            if hasattr(value, '__dict__'):
+                return f"<{value.__class__.__name__}>"
+            return str(value)
+        except:
+            return f"<{type(value).__name__}>"
+    
+    def get_debug_info(self) -> Optional[NodeDebugInfo]:
+        """Get the debug information for this node."""
+        return self._debug_info
+    
+    def mark_bypassed(self):
+        """Mark this node as bypassed (e.g., in conditional flow)."""
+        if not self.debug:
+            return
+            
+        # Initialize debug info if not already done
+        if self._debug_info is None:
+            self._init_debug_info()
+        
+        # Capture current state before marking as bypassed
+        self._debug_info.inputs = self._safe_copy_dict(self.inputs)
+        self._debug_info.outputs = self._safe_copy_dict(self.outputs)
+        self._debug_info.internal_variables = self._capture_internal_state()
+        
+        # Mark as bypassed
+        self._debug_info.was_bypassed = True
+        self._debug_info.was_executed = False
+        
+        logger.debug(f"Node ({self.node_id}): Marked as bypassed")

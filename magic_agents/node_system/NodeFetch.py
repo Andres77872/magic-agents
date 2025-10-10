@@ -77,6 +77,26 @@ class NodeFetch(Node):
                 logger.debug("NodeFetch:%s no inputs set; skipping request", self.node_id)
             yield self.yield_static({})
             return
+        
+        # Template the URL with Jinja2 to support dynamic query parameters and path segments
+        try:
+            url_template = Template(self.url)
+            rendered_url = url_template.render(self.inputs)
+            if self.debug:
+                logger.debug("NodeFetch:%s templated URL: %s", self.node_id, rendered_url)
+        except Exception as e:
+            logger.error("NodeFetch:%s URL templating failed: %s", self.node_id, e)
+            yield self.yield_debug_error(
+                error_type="TemplateError",
+                error_message=f"URL templating failed: {str(e)}",
+                context={
+                    "url_template": self.url,
+                    "available_inputs": list(self.inputs.keys()),
+                    "exception_type": type(e).__name__
+                }
+            )
+            return
+        
         if self.jsondata is not None:
             # Render JSON data with Jinja if jsondata exists
             template = Template(json.dumps(self.jsondata))
@@ -86,13 +106,48 @@ class NodeFetch(Node):
             template = Template(json.dumps(self.data))
             data_to_send = json.loads(template.render(self.inputs).replace('\n', ''))
 
-        async with aiohttp.ClientSession() as session:
-            logger.debug("NodeFetch:%s executing fetch", self.node_id)
-            response_json = await self.fetch(
-                session,
-                self.url,
-                data=data_to_send,
-                json_data=json_data_to_send
+        try:
+            async with aiohttp.ClientSession() as session:
+                logger.debug("NodeFetch:%s executing fetch", self.node_id)
+                response_json = await self.fetch(
+                    session,
+                    rendered_url,  # Use templated URL instead of static self.url
+                    data=data_to_send,
+                    json_data=json_data_to_send
+                )
+            logger.info("NodeFetch:%s request completed", self.node_id)
+            yield self.yield_static(response_json)
+        except aiohttp.ClientResponseError as e:
+            logger.error("NodeFetch:%s HTTP error %s: %s", self.node_id, e.status, e.message)
+            yield self.yield_debug_error(
+                error_type="HTTPError",
+                error_message=f"HTTP request failed with status {e.status}: {e.message}",
+                context={
+                    "url": rendered_url,
+                    "method": self.method,
+                    "status_code": e.status,
+                    "headers": dict(e.headers) if hasattr(e, 'headers') else None
+                }
             )
-        logger.info("NodeFetch:%s request completed", self.node_id)
-        yield self.yield_static(response_json)
+        except aiohttp.ClientError as e:
+            logger.error("NodeFetch:%s client error: %s", self.node_id, e)
+            yield self.yield_debug_error(
+                error_type="NetworkError",
+                error_message=f"Network request failed: {str(e)}",
+                context={
+                    "url": rendered_url,
+                    "method": self.method,
+                    "exception_type": type(e).__name__
+                }
+            )
+        except Exception as e:
+            logger.error("NodeFetch:%s unexpected error: %s", self.node_id, e)
+            yield self.yield_debug_error(
+                error_type="UnexpectedError",
+                error_message=f"Unexpected error during fetch: {str(e)}",
+                context={
+                    "url": rendered_url,
+                    "method": self.method,
+                    "exception_type": type(e).__name__
+                }
+            )

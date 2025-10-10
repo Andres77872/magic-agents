@@ -1,11 +1,13 @@
 import logging
 import uuid
 from typing import Callable, Dict, Any, AsyncGenerator, Optional, Union
+from datetime import datetime
 
 from magic_llm.model.ModelChatStream import ChatCompletionModel
 
 from magic_agents.models.factory.AgentFlowModel import AgentFlowModel
 from magic_agents.models.factory.EdgeNodeModel import EdgeNodeModel
+from magic_agents.models.debug_feedback import GraphDebugFeedback
 from magic_agents.models.factory.Nodes import (
     ModelAgentFlowTypesModel,
     LlmNodeModel,
@@ -74,7 +76,19 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False) -> Any:
         ModelAgentFlowTypesModel.VOID: (NodeEND, None),
     }
     if node_type not in node_map:
-        raise ValueError(f"Unsupported node type: {node_type}")
+        error_msg = f"Unsupported node type: {node_type}"
+        logger.error("create_node: %s (node_id=%s)", error_msg, node['id'])
+        # Return a stub node that yields an error when executed
+        # NodeEND is already imported at module level
+        stub = NodeEND(**extra)
+        stub._error_info = {
+            "error_type": "UnsupportedNodeType",
+            "error_message": error_msg,
+            "node_id": node['id'],
+            "attempted_type": node_type,
+            "available_types": list(node_map.keys())
+        }
+        return stub
     constructor, model_cls = node_map[node_type]
     if node_type == ModelAgentFlowTypesModel.CHAT:
         return constructor(load_chat=load_chat, **extra, **node_data)
@@ -98,6 +112,18 @@ async def execute_graph_loop(
     """
     Execute an agent flow graph that contains a Loop node, handling dynamic iteration.
     """
+    # Check for validation errors and yield them as debug messages
+    if hasattr(graph, '_validation_errors') and graph._validation_errors:
+        for error in graph._validation_errors:
+            yield {
+                "type": "debug",
+                "content": {
+                    **error,
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+            }
+        # Still continue execution - let nodes handle their own errors
+    
     nodes = graph.nodes
     chat_log = ModelAgentRunLog(
         id_chat=id_chat, id_thread=id_thread, id_user=id_user,
@@ -105,6 +131,16 @@ async def execute_graph_loop(
     )
     logger.info("Starting execute_graph_loop: nodes=%d edges=%d ids(chat=%s, thread=%s, user=%s)",
                 len(nodes), len(graph.edges), id_chat, id_thread, id_user)
+    
+    # Initialize debug feedback if debug mode is enabled
+    debug_feedback: Optional[GraphDebugFeedback] = None
+    if graph.debug:
+        debug_feedback = GraphDebugFeedback(
+            execution_id=uuid.uuid4().hex,
+            graph_type=graph.type,
+            start_time=datetime.utcnow().isoformat()
+        )
+        logger.info("Debug mode enabled for loop graph execution: %s", debug_feedback.execution_id)
 
     loop_id = next(nid for nid, node in nodes.items() if isinstance(node, NodeLoop))
     loop_node = nodes[loop_id]
@@ -117,6 +153,15 @@ async def execute_graph_loop(
         # Trace loop edge routing
         logger.debug("Loop process_edge edge=%s: %s[%s] -> %s[%s]",
                      edge.id, edge.source, edge.sourceHandle, edge.target, edge.targetHandle)
+        
+        # Track edge processing in debug mode
+        if debug_feedback:
+            debug_feedback.add_edge_info(
+                source=edge.source,
+                target=edge.target,
+                source_handle=edge.sourceHandle,
+                target_handle=edge.targetHandle
+            )
         
         # Special handling for end edges - always process them to transfer data
         is_end_edge = edge.source == loop_id and edge.sourceHandle == NodeLoop.OUTPUT_HANDLE_END
@@ -134,11 +179,24 @@ async def execute_graph_loop(
                 logger.debug("Loop executing node %s (%s)", edge.source, src.__class__.__name__)
                 async for msg in src(chat_log):
                     if msg["type"] == "content":
-                        yield msg["content"]
+                        # Yield content messages with type wrapper
+                        yield {
+                            "type": "content",
+                            "content": msg["content"]["content"]  # Extract actual ChatCompletionModel
+                        }
                     elif msg["type"] == "end":
                         src.outputs[edge.sourceHandle] = msg["content"]
                     else:
                         src.outputs[msg["type"]] = msg["content"]
+                
+                # Yield debug info immediately after node execution if debug mode is enabled
+                if debug_feedback and hasattr(src, 'get_debug_info'):
+                    node_debug_info = src.get_debug_info()
+                    if node_debug_info and node_debug_info.was_executed:
+                        yield {
+                            "type": "debug",
+                            "content": node_debug_info.model_dump()
+                        }
         
         logger.debug("Loop passing output %s -> %s (%s -> %s)", edge.source, edge.target, edge.sourceHandle, edge.targetHandle)
         tgt.add_parent(src.outputs, edge.sourceHandle, edge.targetHandle)
@@ -147,7 +205,11 @@ async def execute_graph_loop(
         if is_end_edge and tgt._response is None:
             async for msg in tgt(chat_log):
                 if msg["type"] == "content":
-                    yield msg["content"]
+                    # Yield content messages with type wrapper
+                    yield {
+                        "type": "content",
+                        "content": msg["content"]["content"]  # Extract actual ChatCompletionModel
+                    }
                 elif msg["type"] == "end":
                     # Find appropriate handle for this output
                     if hasattr(tgt, 'OUTPUT_HANDLE_GENERATED_END'):
@@ -157,6 +219,15 @@ async def execute_graph_loop(
                     tgt.outputs[handle] = msg["content"]
                 else:
                     tgt.outputs[msg["type"]] = msg["content"]
+            
+            # Yield debug info immediately after node execution if debug mode is enabled
+            if debug_feedback and hasattr(tgt, 'get_debug_info'):
+                node_debug_info = tgt.get_debug_info()
+                if node_debug_info and node_debug_info.was_executed:
+                    yield {
+                        "type": "debug",
+                        "content": node_debug_info.model_dump()
+                    }
 
     all_edges = list(graph.edges)
     item_edges = [e for e in all_edges
@@ -182,7 +253,23 @@ async def execute_graph_loop(
     else:
         items = raw
     if not isinstance(items, list):
-        raise ValueError(f"Loop node '{loop_id}' expects a list, got {type(items)}")
+        error_msg = f"Loop node '{loop_id}' expects a list, got {type(items)}"
+        logger.error("execute_graph_loop: %s", error_msg)
+        yield {
+            "type": "debug",
+            "content": {
+                "node_id": loop_id,
+                "node_type": "LOOP",
+                "error_type": "ValidationError",
+                "error_message": error_msg,
+                "context": {
+                    "received_type": type(items).__name__,
+                    "value_preview": str(items)[:200]
+                },
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        }
+        return
 
     logger.info("Loop items to iterate: %d", len(items))
     loop_agg = []
@@ -219,6 +306,34 @@ async def execute_graph_loop(
     for edge in end_edges:
         async for out in _process_edge(edge):
             yield out
+    
+    # Finalize and yield summary debug information if debug mode is enabled
+    if debug_feedback:
+        # Collect all node info for summary
+        for node_id, node in nodes.items():
+            if hasattr(node, 'get_debug_info'):
+                node_debug_info = node.get_debug_info()
+                # Only include nodes that were executed or bypassed (part of the execution)
+                if node_debug_info and (node_debug_info.was_executed or node_debug_info.was_bypassed):
+                    debug_feedback.add_node_info(node_debug_info)
+        
+        # Finalize debug feedback
+        debug_feedback.finalize()
+        
+        # Yield final summary debug feedback
+        yield {
+            "type": "debug_summary",
+            "content": debug_feedback.model_dump()
+        }
+        
+        logger.info(
+            "Debug summary: %d nodes (%d executed, %d bypassed, %d failed)",
+            debug_feedback.total_nodes,
+            debug_feedback.executed_nodes,
+            debug_feedback.bypassed_nodes,
+            debug_feedback.failed_nodes
+        )
+    
     logger.info("Finished execute_graph_loop: loop_id=%s", loop_id)
 
 
@@ -239,6 +354,18 @@ async def execute_graph(graph: AgentFlowModel,
     Yields:
     AsyncGenerator[ChatCompletionModel, None]: ChatCompletionModel results.
     """
+    # Check for validation errors and yield them as debug messages
+    if hasattr(graph, '_validation_errors') and graph._validation_errors:
+        for error in graph._validation_errors:
+            yield {
+                "type": "debug",
+                "content": {
+                    **error,
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+            }
+        # Still continue execution - let nodes handle their own errors
+    
     # Detect a Loop node for iterative dynamic execution
     loop_nodes = [nid for nid, node in graph.nodes.items() if isinstance(node, NodeLoop)]
     if loop_nodes:
@@ -253,6 +380,16 @@ async def execute_graph(graph: AgentFlowModel,
         id_chat=id_chat, id_thread=id_thread, id_user=id_user,
         id_app='magic-research'
     )
+    
+    # Initialize debug feedback if debug mode is enabled
+    debug_feedback: Optional[GraphDebugFeedback] = None
+    if graph.debug:
+        debug_feedback = GraphDebugFeedback(
+            execution_id=uuid.uuid4().hex,
+            graph_type=graph.type,
+            start_time=datetime.utcnow().isoformat()
+        )
+        logger.info("Debug mode enabled for graph execution: %s", debug_feedback.execution_id)
 
     # Track status of nodes: 'executed' | 'bypassed'
     executed_nodes: set[str] = set()
@@ -275,6 +412,9 @@ async def execute_graph(graph: AgentFlowModel,
         incoming = [e for e in graph.edges if e.target == node_id]
         if incoming and all(is_edge_bypassed(e) for e in incoming):
             node_state[node_id] = "bypassed"
+            # Mark node as bypassed in debug mode
+            if debug_feedback and node_id in nodes:
+                nodes[node_id].mark_bypassed()
             for e in graph.edges:
                 if e.source == node_id:
                     mark_edge_bypass(e)
@@ -300,6 +440,15 @@ async def execute_graph(graph: AgentFlowModel,
             return
         logger.debug("Processing edge=%s: %s[%s] -> %s[%s]",
                      edge.id, edge.source, edge.sourceHandle, edge.target, edge.targetHandle)
+        
+        # Track edge processing in debug mode
+        if debug_feedback:
+            debug_feedback.add_edge_info(
+                source=edge.source,
+                target=edge.target,
+                source_handle=edge.sourceHandle,
+                target_handle=edge.targetHandle
+            )
 
         # Execute source node only if not already executed and dependencies are satisfied
         # Skip if this edge/path is bypassed
@@ -312,11 +461,25 @@ async def execute_graph(graph: AgentFlowModel,
                     logger.debug("Executing node %s (%s)", edge.source, source_node.__class__.__name__)
                     async for item in source_node(chat_log):
                         if item["type"] == "content":
-                            yield item["content"]
+                            # Yield content messages with type wrapper
+                            yield {
+                                "type": "content",
+                                "content": item["content"]["content"]  # Extract actual ChatCompletionModel
+                            }
                         elif item["type"] == "end":
                             source_node.outputs[edge.sourceHandle] = item["content"]
                         else:
                             source_node.outputs[item["type"]] = item["content"]
+                
+                # Yield debug info immediately after node execution if debug mode is enabled
+                if debug_feedback and hasattr(source_node, 'get_debug_info'):
+                    node_debug_info = source_node.get_debug_info()
+                    if node_debug_info and node_debug_info.was_executed:
+                        yield {
+                            "type": "debug",
+                            "content": node_debug_info.model_dump()
+                        }
+                
                 node_state[edge.source] = "executed"
                 executed_nodes.add(edge.source)
                 logger.debug("Node %s executed", edge.source)
@@ -369,9 +532,133 @@ async def execute_graph(graph: AgentFlowModel,
             if not made_progress:
                 # No progress could be made - likely circular dependency
                 logger.error("No progress in graph execution; possible circular dependency or missing node")
-                raise ValueError("Circular dependency detected or missing node in graph")
+                remaining_node_ids = list(set(e.source for e in remaining_edges) | set(e.target for e in remaining_edges))
+                yield {
+                    "type": "debug",
+                    "content": {
+                        "error_type": "GraphExecutionError",
+                        "error_message": "Circular dependency detected or missing node in graph. No progress could be made.",
+                        "context": {
+                            "remaining_edges_count": len(remaining_edges),
+                            "remaining_node_ids": remaining_node_ids,
+                            "executed_nodes": list(executed_nodes),
+                            "node_states": node_state
+                        },
+                        "timestamp": datetime.utcnow().isoformat()
+                    }
+                }
+                return
 
+    # Finalize and yield summary debug information if debug mode is enabled
+    if debug_feedback:
+        # Collect all node info for summary
+        for node_id, node in nodes.items():
+            if hasattr(node, 'get_debug_info'):
+                node_debug_info = node.get_debug_info()
+                # Only include nodes that were executed or bypassed (part of the execution)
+                if node_debug_info and (node_debug_info.was_executed or node_debug_info.was_bypassed):
+                    debug_feedback.add_node_info(node_debug_info)
+        
+        # Finalize debug feedback
+        debug_feedback.finalize()
+        
+        # Yield final summary debug feedback
+        yield {
+            "type": "debug_summary",
+            "content": debug_feedback.model_dump()
+        }
+        
+        logger.info(
+            "Debug summary: %d nodes (%d executed, %d bypassed, %d failed)",
+            debug_feedback.total_nodes,
+            debug_feedback.executed_nodes,
+            debug_feedback.bypassed_nodes,
+            debug_feedback.failed_nodes
+        )
+    
     logger.info("Finished execute_graph")
+
+
+def validate_graph(nodes: list[dict], edges: list[dict]) -> dict:
+    """
+    Validate the agent flow graph structure.
+    
+    Args:
+    nodes (list[dict]): List of nodes in the graph.
+    edges (list[dict]): List of edges in the graph.
+    
+    Returns:
+    dict: Validation result with 'valid' (bool) and 'errors' (list) keys.
+    """
+    errors = []
+    
+    # Validation 1: Only ONE NodeUserInput (start node) is allowed
+    user_input_nodes = [node for node in nodes if node['type'] == ModelAgentFlowTypesModel.USER_INPUT]
+    if len(user_input_nodes) == 0:
+        errors.append({
+            "error_type": "GraphValidationError",
+            "error_message": "Graph must contain exactly one USER_INPUT node (start node). Found: 0",
+            "context": {"user_input_nodes_count": 0}
+        })
+    elif len(user_input_nodes) > 1:
+        node_ids = [node['id'] for node in user_input_nodes]
+        errors.append({
+            "error_type": "GraphValidationError",
+            "error_message": f"Graph must contain exactly one USER_INPUT node (start node). Found {len(user_input_nodes)} nodes.",
+            "context": {
+                "user_input_nodes_count": len(user_input_nodes),
+                "node_ids": node_ids
+            }
+        })
+    else:
+        logger.info("Validation passed: Found single USER_INPUT node (id=%s)", user_input_nodes[0]['id'])
+    
+    # Validation 2: Check for duplicate edges (same source, target, and handles)
+    # Note: Edges with same source/target but different handles are NOT duplicates
+    # as they represent different connections through different ports
+    edge_signatures = set()
+    duplicate_edges = []
+    
+    for edge in edges:
+        # Create a unique signature for the edge including handles
+        edge_signature = (
+            edge.get('source'),
+            edge.get('target'),
+            edge.get('sourceHandle'),
+            edge.get('targetHandle')
+        )
+        if edge_signature in edge_signatures:
+            duplicate_edges.append({
+                'edge_id': edge.get('id'),
+                'source': edge.get('source'),
+                'target': edge.get('target'),
+                'sourceHandle': edge.get('sourceHandle'),
+                'targetHandle': edge.get('targetHandle')
+            })
+        else:
+            edge_signatures.add(edge_signature)
+    
+    if duplicate_edges:
+        error_msg = "Found duplicate edges with same source, target, and handles"
+        errors.append({
+            "error_type": "GraphValidationError",
+            "error_message": error_msg,
+            "context": {
+                "duplicate_edges": duplicate_edges,
+                "duplicate_count": len(duplicate_edges)
+            }
+        })
+    else:
+        logger.info("Validation passed: No duplicate edges found (total edges: %d)", len(edges))
+    
+    # Note: Multiple END nodes are allowed (no validation needed)
+    end_nodes = [node for node in nodes if node['type'] == ModelAgentFlowTypesModel.END]
+    logger.info("Graph contains %d END node(s) (multiple END nodes are allowed)", len(end_nodes))
+    
+    return {
+        "valid": len(errors) == 0,
+        "errors": errors
+    }
 
 
 def build(agt_data, message: str, images: list[str] = None, load_chat=None) -> AgentFlowModel:
@@ -384,8 +671,18 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None) -> A
     load_chat: Load chat function. Defaults to None.
 
     Returns:
-    AgentFlowModel: Agent flow graph.
+    AgentFlowModel: Agent flow graph. If validation fails, the graph will contain error information.
     """
+    # Validate the graph structure before building
+    validation_result = validate_graph(agt_data['nodes'], agt_data['edges'])
+    
+    # Store validation errors in agt_data for later retrieval
+    if not validation_result['valid']:
+        agt_data['_validation_errors'] = validation_result['errors']
+        logger.error("Graph validation failed with %d error(s)", len(validation_result['errors']))
+        for err in validation_result['errors']:
+            logger.error("  - %s: %s", err['error_type'], err['error_message'])
+    
     nodes, edges = sort_nodes(agt_data['nodes'], agt_data['edges'])
     agt_data['nodes'] = nodes
     agt_data['edges'] = edges

@@ -70,7 +70,16 @@ class NodeLLM(Node):
                 chat.add_user_message(k)
             else:
                 logger.error("NodeLLM:%s missing required input '%s'", self.node_id, self.INPUT_HANDLER_USER_MESSAGE)
-                raise ValueError(f"NodeLLM '{self.INPUT_HANDLER_USER_MESSAGE}' requires either a user message.")
+                yield self.yield_debug_error(
+                    error_type="InputError",
+                    error_message=f"NodeLLM requires input '{self.INPUT_HANDLER_USER_MESSAGE}' with a user message.",
+                    context={
+                        "available_inputs": list(params.keys()),
+                        "required_input": self.INPUT_HANDLER_USER_MESSAGE,
+                        "node_config": {"stream": self.stream, "json_output": self.json_output}
+                    }
+                )
+                return
 
         if not self.stream:
             logger.info("NodeLLM:%s generating (non-stream) with model=%s", self.node_id, client.llm.model)
@@ -114,13 +123,49 @@ class NodeLLM(Node):
                 else:
                     json_content = self.generated.strip()
             if json_content:
-                self.generated = json.loads(json_content)
-                logger.debug("NodeLLM:%s JSON parsed successfully", self.node_id)
+                try:
+                    self.generated = json.loads(json_content)
+                    logger.debug("NodeLLM:%s JSON parsed successfully", self.node_id)
+                except json.JSONDecodeError as e:
+                    logger.error("NodeLLM:%s JSON parsing failed: %s", self.node_id, e)
+                    yield self.yield_debug_error(
+                        error_type="JSONParseError",
+                        error_message=f"Failed to parse JSON content: {str(e)}",
+                        context={
+                            "json_content_preview": json_content[:200] if len(json_content) > 200 else json_content,
+                            "full_generated_length": len(self.generated),
+                            "error_position": getattr(e, 'pos', None)
+                        }
+                    )
+                    return
             else:
                 logger.error("NodeLLM:%s no JSON content found in generated output (%d chars)", self.node_id, len(self.generated))
-                raise ValueError('No JSON content found', self.generated)
+                yield self.yield_debug_error(
+                    error_type="JSONExtractionError",
+                    error_message="No JSON content found in generated output. The LLM did not produce valid JSON.",
+                    context={
+                        "generated_preview": self.generated[:500] if len(self.generated) > 500 else self.generated,
+                        "generated_length": len(self.generated),
+                        "json_output_required": self.json_output,
+                        "model": getattr(client.llm, 'model', 'unknown') if 'client' in locals() else 'unknown'
+                    }
+                )
+                return
         yield self.yield_static(self.generated)
 
+    def _capture_internal_state(self):
+        """Capture LLM-specific internal state for debugging."""
+        state = super()._capture_internal_state()
+        
+        # Add LLM-specific variables
+        state['stream'] = self.stream
+        state['json_output'] = self.json_output
+        state['iterate'] = self.iterate
+        state['generated'] = self.generated[:500] if len(self.generated) > 500 else self.generated  # Truncate long outputs
+        state['extra_data'] = self.extra_data
+        
+        return state
+    
     async def __call__(self, chat_log):
         # if configured to iterate inside a Loop, always re-run instead of using cached response
         if getattr(self, 'iterate', False):

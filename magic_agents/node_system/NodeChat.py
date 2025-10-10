@@ -52,7 +52,16 @@ class NodeChat(Node):
                             is_list_pair = True
                     if is_list_single and is_list_pair:
                         logger.error("NodeChat:%s UserImage and UserFile cannot be used together", self.node_id)
-                        raise ValueError("UserImage and UserFile cannot be used together")
+                        yield self.yield_debug_error(
+                            error_type="ValidationError",
+                            error_message="UserImage and UserFile cannot be used together. Images must be either all single strings or all pairs.",
+                            context={
+                                "images_input": im,
+                                "has_single_strings": is_list_single,
+                                "has_pairs": is_list_pair
+                            }
+                        )
+                        return
                     if is_list_single:
                         logger.debug("NodeChat:%s adding user message with images (single list)", self.node_id)
                         self.chat.add_user_message(c, im)

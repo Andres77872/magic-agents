@@ -54,20 +54,24 @@ class NodeConditional(Node):
 
     INPUT_HANDLE_CTX = "handle_input"
 
-    def __init__(self, *, condition: str, merge_strategy: str = "flat", **kwargs):
-        if not condition:
-            raise ValueError("NodeConditional requires a non-empty 'condition' template")
+    def __init__(self, *, condition: str = None, merge_strategy: str = "flat", **kwargs):
         self.condition_template = condition
         self.merge_strategy = merge_strategy
+        self.init_error = None
         
-        if merge_strategy not in ("flat", "namespaced"):
-            raise ValueError(f"Invalid merge_strategy '{merge_strategy}'. Must be 'flat' or 'namespaced'")
+        if not condition:
+            self.init_error = "NodeConditional requires a non-empty 'condition' template"
+        elif merge_strategy not in ("flat", "namespaced"):
+            self.init_error = f"Invalid merge_strategy '{merge_strategy}'. Must be 'flat' or 'namespaced'"
         
         super().__init__(**kwargs)
 
-        # Pre-compile template for efficiency
-        env = jinja2.Environment()
-        self._template = env.from_string(self.condition_template)
+        # Pre-compile template for efficiency (only if condition is valid)
+        if self.condition_template:
+            env = jinja2.Environment()
+            self._template = env.from_string(self.condition_template)
+        else:
+            self._template = None
 
     def _parse_input_data(self, raw_data: Any) -> Any:
         """Parse input data, attempting JSON decode for strings."""
@@ -103,10 +107,7 @@ class NodeConditional(Node):
         ]
         
         if not available_inputs:
-            raise ValueError(
-                f"NodeConditional '{self.node_id}' requires at least one input. "
-                f"No data received on any input handle."
-            )
+            return None  # Will be handled in process method
         
         if self.debug:
             logger.debug(
@@ -154,8 +155,34 @@ class NodeConditional(Node):
 
     async def process(self, chat_log) -> AsyncGenerator[Dict[str, Any], None]:  # noqa: D401
         """Evaluate condition, emit chosen handle, update bypass metadata."""
+        
+        # Check for initialization errors
+        if self.init_error:
+            yield self.yield_debug_error(
+                error_type="ConfigurationError",
+                error_message=self.init_error,
+                context={
+                    "condition": self.condition_template,
+                    "merge_strategy": self.merge_strategy
+                }
+            )
+            return
+        
         # Merge all available inputs into a dict context
         render_ctx = self._merge_inputs()
+        
+        # Check if merge failed (no inputs available)
+        if render_ctx is None:
+            yield self.yield_debug_error(
+                error_type="InputError",
+                error_message=f"NodeConditional '{self.node_id}' requires at least one input. No data received on any input handle.",
+                context={
+                    "available_handles": list(self.inputs.keys()),
+                    "condition": self.condition_template,
+                    "merge_strategy": self.merge_strategy
+                }
+            )
+            return
 
         # Evaluate the condition template
         try:
@@ -167,45 +194,65 @@ class NodeConditional(Node):
                 e,
             )
             available_keys = list(render_ctx.keys()) if isinstance(render_ctx, dict) else []
-            raise ValueError(
-                f"NodeConditional '{self.node_id}' template references undefined variable. "
-                f"Condition: {self.condition_template}. "
-                f"Available context keys: {available_keys}. "
-                f"Error: {e}"
-            ) from e
+            yield self.yield_debug_error(
+                error_type="TemplateError",
+                error_message=f"Template references undefined variable: {str(e)}",
+                context={
+                    "condition": self.condition_template,
+                    "available_context_keys": available_keys,
+                    "context_preview": {k: str(v)[:100] for k, v in (render_ctx.items() if isinstance(render_ctx, dict) else [])},
+                    "merge_strategy": self.merge_strategy
+                }
+            )
+            return
         except jinja2.TemplateSyntaxError as e:
             logger.error(
                 "NodeConditional (%s): Invalid Jinja2 syntax: %s",
                 self.node_id,
                 e,
             )
-            raise ValueError(
-                f"NodeConditional '{self.node_id}' has invalid Jinja2 syntax in condition. "
-                f"Condition: {self.condition_template}. "
-                f"Error: {e}"
-            ) from e
+            yield self.yield_debug_error(
+                error_type="TemplateSyntaxError",
+                error_message=f"Invalid Jinja2 syntax in condition: {str(e)}",
+                context={
+                    "condition": self.condition_template,
+                    "error_line": getattr(e, 'lineno', None),
+                    "merge_strategy": self.merge_strategy
+                }
+            )
+            return
         except jinja2.TemplateError as e:
             logger.error(
                 "NodeConditional (%s): Template evaluation failed: %s",
                 self.node_id,
                 e,
             )
-            raise ValueError(
-                f"NodeConditional '{self.node_id}' failed to evaluate condition. "
-                f"Condition: {self.condition_template}. "
-                f"Error: {e}"
-            ) from e
+            yield self.yield_debug_error(
+                error_type="TemplateEvaluationError",
+                error_message=f"Failed to evaluate condition template: {str(e)}",
+                context={
+                    "condition": self.condition_template,
+                    "available_context_keys": list(render_ctx.keys()) if isinstance(render_ctx, dict) else [],
+                    "merge_strategy": self.merge_strategy
+                }
+            )
+            return
         except Exception as e:
             logger.error(
                 "NodeConditional (%s): Unexpected error during evaluation: %s",
                 self.node_id,
                 e,
             )
-            raise ValueError(
-                f"NodeConditional '{self.node_id}' encountered unexpected error. "
-                f"Condition: {self.condition_template}. "
-                f"Error: {e}"
-            ) from e
+            yield self.yield_debug_error(
+                error_type="UnexpectedError",
+                error_message=f"Unexpected error during condition evaluation: {str(e)}",
+                context={
+                    "condition": self.condition_template,
+                    "exception_type": type(e).__name__,
+                    "merge_strategy": self.merge_strategy
+                }
+            )
+            return
 
         if self.debug:
             logger.debug(
@@ -216,11 +263,17 @@ class NodeConditional(Node):
             )
 
         if not selected_handle:
-            raise ValueError(
-                f"NodeConditional '{self.node_id}' rendered empty handle. "
-                f"Condition: {self.condition_template}. "
-                f"The condition must return a non-empty string matching an output handle name."
+            yield self.yield_debug_error(
+                error_type="ValidationError",
+                error_message="Condition evaluated to empty handle. The condition must return a non-empty string matching an output handle name.",
+                context={
+                    "condition": self.condition_template,
+                    "rendered_result": repr(selected_handle),
+                    "context_keys": list(render_ctx.keys()) if isinstance(render_ctx, dict) else [],
+                    "merge_strategy": self.merge_strategy
+                }
             )
+            return
 
         # Record selected handle in outputs for downstream nodes.
         # Pass the merged context to the selected output

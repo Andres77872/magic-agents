@@ -32,10 +32,26 @@ class NodeInner(Node):
     async def process(self, chat_log):
         input_message = self.inputs.get(self.INPUT_HANDLE)
         if input_message is None:
-            raise ValueError(f"NodeInner '{self.node_id}' requires input '{self.INPUT_HANDLE}'")
+            yield self.yield_debug_error(
+                error_type="InputError",
+                error_message=f"NodeInner requires input '{self.INPUT_HANDLE}'",
+                context={
+                    "available_inputs": list(self.inputs.keys()),
+                    "required_input": self.INPUT_HANDLE
+                }
+            )
+            return
         
         if self.inner_graph is None:
-            raise ValueError(f"NodeInner '{self.node_id}' has no inner_graph set")
+            yield self.yield_debug_error(
+                error_type="ConfigurationError",
+                error_message="NodeInner has no inner_graph set. The inner graph was not built correctly.",
+                context={
+                    "has_magic_flow": self.magic_flow is not None,
+                    "magic_flow_keys": list(self.magic_flow.keys()) if isinstance(self.magic_flow, dict) else None
+                }
+            )
+            return
         
         # Update input nodes in the inner graph with the current message
         from magic_agents.models.factory.Nodes import ModelAgentFlowTypesModel
