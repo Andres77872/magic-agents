@@ -65,10 +65,10 @@ Outputs: `adult`, `minor` handles.
 ```
 If `status` resolves to `error`, execution continues via `error` handle; all other handles are bypassed.
 
-## Implementation Checklist
+## Implementation Status
 
-- [ ] Extend `Node` base; override `process`.
-- [ ] Accept `condition` in constructor / `data`.
-- [ ] Inject *jinja2* dependency in `requirements.txt` if not present.
-- [ ] Provide unit tests for branching + bypass propagation.
-- [ ] Update engine executor to honour `bypass` flag if not already supported.
+- ✅ Extends `Node` base; overrides `process`.
+- ✅ Accepts `condition` and `merge_strategy` in constructor / `data`.
+- ✅ *jinja2* dependency included in `requirements.txt`.
+- ✅ Unit tests provided in `test/test_conditional_flows.py` for branching + bypass propagation.
+- ✅ Engine executor honours `bypass` flag in `agt_flow.py` (execute_graph function).

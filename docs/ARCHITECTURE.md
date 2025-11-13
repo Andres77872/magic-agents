@@ -37,7 +37,7 @@ The runtime executes nodes **topologically**; each node yields 0-N `ChatCompleti
 
 | Node Type (`type`) | Python Class            | Purpose |
 |--------------------|-------------------------|---------|
-| `user_input`       | `NodeUserInput`         | Seeds the graph with the user’s message & images, assigns chat/thread IDs. |
+| `user_input`       | `NodeUserInput`         | Seeds the graph with the user's message & images, assigns chat/thread IDs. |
 | `text`             | `NodeText`              | Emits a static text string. |
 | `parser`           | `NodeParser`            | Renders a Jinja2 template based on upstream inputs. |
 | `fetch`            | `NodeFetch`             | Executes an HTTP request (sync/async) and returns parsed JSON / text. |
@@ -46,6 +46,7 @@ The runtime executes nodes **topologically**; each node yields 0-N `ChatCompleti
 | `chat`             | `NodeChat`              | Augments prompts with memory & conversation context. |
 | `send_message`     | `NodeSendMessage`       | Sends extra payloads (references, UI hints) via `ChatCompletionModel.extras`. |
 | `loop`             | `NodeLoop`              | Iterates over a list; children run once per item & aggregate results. |
+| `conditional`      | `NodeConditional`       | Branches execution based on a Jinja2 condition; bypasses non-selected paths. |
 | `inner`            | `NodeInner`             | Runs a *nested* agent flow (`magic_flow`) as a sub-graph. |
 | `end` / `void`     | `NodeEND`               | Terminator; swallows un-connected outputs. |
 

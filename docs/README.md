@@ -23,6 +23,7 @@ Welcome to the **magic_agents** documentation site.
 | `chat` | [NodeChat](nodes/NodeChat.md) |
 | `send_message` | [NodeSendMessage](nodes/NodeSendMessage.md) |
 | `loop` | [NodeLoop](nodes/NodeLoop.md) |
+| `conditional` | [NodeConditional](nodes/NodeConditional.md) |
 | `inner` | [NodeInner](nodes/NodeInner.md) |
 | `end` / `void` | [NodeEND](nodes/NodeEND.md) |
 

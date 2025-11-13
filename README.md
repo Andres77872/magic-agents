@@ -90,6 +90,7 @@ magic_agents provides a set of built-in node types for common steps:
 | `end`          | NodeEND              | Terminal node to finalize output or drop into void.           |
 | `void`         | NodeEND (internal)   | Internal drop node for unhandled outputs.                    |
 | `loop`         | NodeLoop             | Iterate over a list and aggregate per-item results.          |
+| `conditional`  | NodeConditional      | Branch execution based on Jinja2 condition; supports if/else and switch/case patterns. |
 | `inner`        | NodeInner            | Execute a nested agent flow graph (`magic_flow`) and stream its outputs. |
 
 ----
@@ -194,6 +195,48 @@ Iterates over a list (JSON string or Python list) via input handle `list`, emitt
 **What it does:**
 - Emits each list item as an independent content event (handle `item`).
 - Aggregates any inputs received on handle `loop` into a list and emits that at the end via handle `end`.
+
+#### `conditional` (`NodeConditional`)
+Implements branching logic (if/else and switch/case patterns) by evaluating a Jinja2 condition and routing execution to the selected output handle.
+
+**Example usage (if/else pattern):**
+```json
+{
+  "id": "age_check",
+  "type": "conditional",
+  "data": {
+    "condition": "{{ 'adult' if age >= 18 else 'minor' }}"
+  }
+}
+```
+
+**Example usage (switch pattern):**
+```json
+{
+  "id": "status_router",
+  "type": "conditional",
+  "data": {
+    "condition": "{{ status }}"
+  }
+}
+```
+
+**What it does:**
+- Evaluates a Jinja2 template with input context to determine which output handle to activate.
+- Bypasses all non-selected output paths automatically.
+- Supports multiple inputs with configurable merge strategies (`flat` or `namespaced`).
+- The condition must render to a valid output handle name (e.g., `"adult"`, `"minor"`, `"success"`, `"error"`).
+
+```python
+class NodeConditional(Node):
+    INPUT_HANDLE_CTX = "handle_input"
+    ...
+    async def process(self, chat_log):
+        # Merge inputs, evaluate condition template
+        selected_handle = str(self._template.render(**context)).strip()
+        # Emit to selected output handle, bypass others
+        yield {"type": selected_handle, "content": context}
+```
 
 #### `fetch` (`NodeFetch`)
 Sends an HTTP request (GET/POST/etc.) with optional Jinja2 templated body or JSON, returns parsed JSON.
@@ -799,7 +842,6 @@ Use parser nodes to handle errors gracefully:
 
 ## Limitations
 
-- **No conditional branches**: flows are strictly linear/topological.
 - **Minimal error handling**: HTTP and LLM errors bubble up.
 - **Basic templating**: only Jinja2 text rendering, no complex data transforms.
 - **Synchronous graph build**: building the flow is not async.
@@ -807,11 +849,11 @@ Use parser nodes to handle errors gracefully:
 
 ## Future Work
 
-- Add conditional/looping nodes for dynamic branching.
 - Rich memory store integrations (vector DBs, Redis).
 - Built‑in error retry and backoff strategies.
 - Tool invocation nodes (e.g., files, databases, shell).
 - Graph visualization CLI/UI.
+- Enhanced conditional node capabilities (multiple conditions, fallback paths).
 
 ## Known Issues & Caveats
 
