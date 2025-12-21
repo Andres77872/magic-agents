@@ -23,8 +23,8 @@ AGT_FLOW = {
         {"id": "e2", "source": "cond", "target": "send-msg", "sourceHandle": "empty", "targetHandle": "handle_send_extra"},
         {"id": "e3", "source": "cond", "target": "llm-node", "sourceHandle": "not_empty", "targetHandle": "handle_user_message"},
         {"id": "e4", "source": "client-node", "target": "llm-node", "sourceHandle": "handle-client-provider", "targetHandle": "handle-client-provider"},
-        {"id": "e5", "source": "send-msg", "target": "end-node", "sourceHandle": "handle_generated_end", "targetHandle": "handle-5"},
-        {"id": "e6", "source": "llm-node", "target": "end-node", "sourceHandle": "handle_generated_end", "targetHandle": "handle-6"}
+        {"id": "e5", "source": "send-msg", "target": "end-node", "sourceHandle": "handle_message_output", "targetHandle": "handle-5"},
+        {"id": "e6", "source": "llm-node", "target": "end-node", "sourceHandle": "handle_generated_content", "targetHandle": "handle-6"}
     ],
     "nodes": [
         {"id": "user-input", "type": "user_input"},
