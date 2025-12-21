@@ -15,7 +15,8 @@ class NodeClientLLM(Node):
     JSON is the source of truth for all handle names.
     """
     # Default output handle name - can be overridden by JSON data.handles
-    DEFAULT_OUTPUT_HANDLE = 'handle_client_provider'
+    # Uses hyphen to match JSON graph convention (handle-client-provider)
+    DEFAULT_OUTPUT_HANDLE = 'handle-client-provider'
 
     def __init__(self,
                  data: ClientNodeModel,

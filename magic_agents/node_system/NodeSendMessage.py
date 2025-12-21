@@ -13,11 +13,15 @@ class NodeSendMessage(Node):
     """
     SendMessage node - handle names are configurable via JSON data.handles.
     JSON is the source of truth for all handle names.
+    
+    Emits content directly to the user stream via OUTPUT_HANDLE_CONTENT.
     """
     # Default handle names - can be overridden by JSON data.handles
     DEFAULT_INPUT_SEND_EXTRA = 'handle_send_extra'
-    # Output handle
+    # Output handle for routing to downstream nodes
     DEFAULT_OUTPUT_HANDLE = 'handle_message_output'
+    # Streaming content handle - used by executor to forward to user
+    OUTPUT_HANDLE_CONTENT = 'content'
 
     def __init__(self,
                  data: SendMessageNodeModel,
@@ -46,11 +50,19 @@ class NodeSendMessage(Node):
         else:
             output = {}
         logger.info("NodeSendMessage:%s sending message with extras", self.node_id)
-        yield self.yield_static(ChatCompletionModel(id='',
-                                                    model='',
-                                                    choices=[ChoiceModel(delta=DeltaModel(content=self.json_extras))],
-                                                    extras=output),
-                                content_type=self.OUTPUT_HANDLE)
+        
+        message = ChatCompletionModel(
+            id='',
+            model='',
+            choices=[ChoiceModel(delta=DeltaModel(content=self.json_extras))],
+            extras=output
+        )
+        
+        # Yield for streaming to user (executor checks OUTPUT_HANDLE_CONTENT)
+        yield self.yield_static(message, content_type=self.OUTPUT_HANDLE_CONTENT)
+        
+        # Yield for routing to downstream nodes
+        yield self.yield_static(message, content_type=self.OUTPUT_HANDLE)
 
     def _capture_internal_state(self):
         """Capture SendMessage-specific internal state for debugging."""

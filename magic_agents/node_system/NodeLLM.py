@@ -68,27 +68,37 @@ class NodeLLM(Node):
         if not params.get(self.INPUT_HANDLER_SYSTEM_CONTEXT) and not params.get(self.INPUT_HANDLER_USER_MESSAGE):
             no_inputs = True
 
+        def extract_message(msg):
+            """Extract string message from various input types."""
+            if isinstance(msg, str):
+                return msg
+            if isinstance(msg, list):
+                return json.dumps(msg)
+            if isinstance(msg, dict):
+                # From conditional: try 'value' key first, then 'content', then serialize
+                if 'value' in msg:
+                    return extract_message(msg['value'])
+                if 'content' in msg:
+                    return extract_message(msg['content'])
+                return json.dumps(msg)
+            return str(msg) if msg is not None else ''
+
         client: MagicLLM = self.get_input(self.INPUT_HANDLER_CLIENT_PROVIDER, required=True)
         if c := params.get(self.INPUT_HANDLER_CHAT):
             chat = c
             if sys_prompt := self.get_input(self.INPUT_HANDLER_SYSTEM_CONTEXT):
-                chat.set_system(sys_prompt)
+                chat.set_system(extract_message(sys_prompt))
             if user_prompt := self.get_input(self.INPUT_HANDLER_USER_MESSAGE):
-                # Convert list to string for loop aggregation results
-                if isinstance(user_prompt, list):
-                    user_prompt = json.dumps(user_prompt)
-                chat.add_user_message(user_prompt)
+                chat.add_user_message(extract_message(user_prompt))
         else:
             if no_inputs:
                 logger.debug("NodeLLM:%s no inputs provided; yielding empty content", self.node_id)
                 yield self.yield_static('', content_type=self.OUTPUT_HANDLE_GENERATED)
                 return
-            chat = ModelChat(params.get(self.INPUT_HANDLER_SYSTEM_CONTEXT))
+            sys_context = params.get(self.INPUT_HANDLER_SYSTEM_CONTEXT)
+            chat = ModelChat(extract_message(sys_context) if sys_context else None)
             if k := params.get(self.INPUT_HANDLER_USER_MESSAGE):
-                # Convert list to string for loop aggregation results
-                if isinstance(k, list):
-                    k = json.dumps(k)
-                chat.add_user_message(k)
+                chat.add_user_message(extract_message(k))
             else:
                 logger.error("NodeLLM:%s missing required input '%s'", self.node_id, self.INPUT_HANDLER_USER_MESSAGE)
                 yield self.yield_debug_error(
