@@ -201,3 +201,88 @@ The debug system now provides complete, accurate information about graph executi
 - Identify performance bottlenecks
 - Debug complex graph behaviors
 - Analyze which paths were taken or bypassed
+
+---
+
+## New Debug Architecture (Phase 1 Complete)
+
+A comprehensive refactor of the debug system has been implemented, providing a modular **Capture-Transform-Emit** architecture.
+
+### New Module Structure
+
+```
+magic_agents/debug/
+├── __init__.py       # Public API exports
+├── events.py         # DebugEvent, DebugEventType, factory functions
+├── capture.py        # DefaultDebugCapture hook
+├── transform.py      # TransformPipeline, transformers
+├── emitter.py        # QueueEmitter, LogEmitter, etc.
+├── collector.py      # DebugCollector, summaries
+├── context.py        # DebugContext manager
+└── config.py         # DebugConfig presets
+```
+
+### Key Improvements
+
+| Feature | Before | After |
+|---------|--------|-------|
+| Event Structure | Ad-hoc dicts | Typed `DebugEvent` dataclass |
+| Event Types | Limited | 25+ typed events (NODE_*, GRAPH_*, LLM_*, etc.) |
+| Configuration | Boolean flag | `DebugConfig` with presets |
+| Transformations | None | Pipeline (filter, redact, truncate) |
+| Emission | Direct yield | Multiple emitters (queue, log, callback) |
+| Streaming | Summary only | Real-time event streaming |
+| Backward Compat | N/A | `to_legacy_format()` methods |
+
+### Using the New System
+
+```python
+from magic_agents.debug import (
+    DebugConfig,
+    DebugContext,
+    DebugEventType
+)
+
+# Use configuration presets
+config = DebugConfig.verbose()
+
+# Or create custom config
+config = DebugConfig(
+    enabled=True,
+    capture_inputs=True,
+    capture_outputs=True,
+    redact_patterns=["password", "api_key"]
+)
+
+# Use context manager
+async with DebugContext(config=config) as ctx:
+    ctx.emit_node_start("node-1", "LLM", {"prompt": "Hi"})
+    # ... execution ...
+    ctx.emit_node_end("node-1", "LLM", {"response": "Hello!"}, duration_ms=100.0)
+    
+    summary = ctx.get_summary()
+```
+
+### Test Coverage
+
+47 comprehensive tests covering all components:
+
+```bash
+pytest test/test_debug_system.py -v
+```
+
+### Migration Path
+
+The new system maintains backward compatibility:
+
+1. **Existing `debug: true` behavior**: Continues to work unchanged
+2. **Legacy format support**: `summary.to_legacy_format()` produces same structure
+3. **Programmatic access**: New APIs available alongside existing patterns
+
+### Next Steps (Phase 2-3)
+
+- **Phase 2**: Integration with `reactive_executor.py`
+- **Phase 3**: Migration of existing `Node.py` debug code
+- **Phase 4**: Performance optimization and streaming improvements
+
+See `docs/refactor/DEBUG_SYSTEM_REFACTOR_PLAN.md` for full details.

@@ -595,6 +595,252 @@ Execution terminated with exception: API rate limit exceeded
   llm-1: FAILED (245.30ms)
 ```
 
+---
+
+## Example 7: Using the New Debug System Programmatically
+
+The new debug architecture provides more control through the `magic_agents.debug` module.
+
+### Basic Usage with DebugContext
+
+```python
+import asyncio
+from magic_agents.debug import (
+    DebugContext,
+    DebugConfig,
+    DebugCollector,
+    QueueEmitter,
+    DebugEventType
+)
+
+async def run_with_programmatic_debug():
+    # Configure debug settings
+    config = DebugConfig(
+        enabled=True,
+        capture_inputs=True,
+        capture_outputs=True,
+        capture_internal_state=True,
+        max_string_length=500,
+        redact_patterns=["password", "api_key"]
+    )
+    
+    # Create debug context
+    async with DebugContext(config=config) as ctx:
+        # Emit events during execution
+        ctx.emit_graph_start(graph_id="my-graph", graph_type="chat")
+        
+        ctx.emit_node_start(
+            node_id="llm-1",
+            node_type="LLM",
+            inputs={"prompt": "Hello, world!"}
+        )
+        
+        # Simulate node execution...
+        await asyncio.sleep(0.1)
+        
+        ctx.emit_node_end(
+            node_id="llm-1",
+            node_type="LLM",
+            outputs={"response": "Hi there!"},
+            duration_ms=100.0
+        )
+        
+        ctx.emit_graph_end(duration_ms=150.0)
+        
+        # Get execution summary
+        summary = ctx.get_summary()
+        print(f"Total duration: {summary.total_duration_ms}ms")
+        print(f"Nodes executed: {summary.nodes_executed}")
+
+asyncio.run(run_with_programmatic_debug())
+```
+
+### Real-Time Event Streaming
+
+```python
+import asyncio
+from magic_agents.debug import (
+    DebugContext,
+    DebugConfig,
+    QueueEmitter
+)
+
+async def stream_events():
+    emitter = QueueEmitter()
+    config = DebugConfig.verbose()
+    
+    async with DebugContext(config=config, emitter=emitter) as ctx:
+        # Start event listener task
+        async def listen():
+            async for event in emitter.events():
+                print(f"[{event.timestamp}] {event.event_type.value}: "
+                      f"{event.node_id or 'graph'}")
+                if event.payload:
+                    print(f"  Payload: {event.payload}")
+        
+        listener = asyncio.create_task(listen())
+        
+        # Emit some events
+        ctx.emit_graph_start(graph_id="test", graph_type="chat")
+        ctx.emit_node_start("node-1", "TEXT", {"value": "Hello"})
+        await asyncio.sleep(0.01)
+        ctx.emit_node_end("node-1", "TEXT", {"result": "Hello!"}, duration_ms=10.0)
+        ctx.emit_graph_end(duration_ms=50.0)
+        
+        # Close emitter and wait for listener
+        await emitter.close()
+        await listener
+
+asyncio.run(stream_events())
+```
+
+### Using Transform Pipeline
+
+```python
+from magic_agents.debug import (
+    TransformPipeline,
+    RedactTransformer,
+    FilterTransformer,
+    TruncateTransformer,
+    DebugEventType,
+    node_start_event
+)
+
+# Create a pipeline
+pipeline = TransformPipeline([
+    # Only keep node events
+    FilterTransformer(include_types={
+        DebugEventType.NODE_START,
+        DebugEventType.NODE_END,
+        DebugEventType.NODE_ERROR
+    }),
+    # Redact sensitive data
+    RedactTransformer(
+        patterns=["password", "secret", "token", "api_key"],
+        replacement="***REDACTED***"
+    ),
+    # Truncate long strings
+    TruncateTransformer(max_length=100)
+])
+
+# Create an event
+event = node_start_event(
+    execution_id="exec-123",
+    node_id="auth-node",
+    node_type="AUTH",
+    inputs={"password": "super_secret_123", "username": "user@example.com"}
+)
+
+# Transform the event
+transformed = pipeline.transform(event)
+print(transformed.payload)
+# Output: {'inputs': {'password': '***REDACTED***', 'username': 'user@example.com'}}
+```
+
+### Custom Emitter
+
+```python
+from magic_agents.debug import Emitter, DebugEvent
+import json
+
+class FileEmitter(Emitter):
+    """Custom emitter that writes events to a file."""
+    
+    def __init__(self, filepath: str):
+        self.filepath = filepath
+        self.file = open(filepath, 'w')
+    
+    async def emit(self, event: DebugEvent) -> None:
+        line = json.dumps({
+            'event_type': event.event_type.value,
+            'timestamp': event.timestamp.isoformat(),
+            'node_id': event.node_id,
+            'payload': event.payload
+        })
+        self.file.write(line + '\n')
+        self.file.flush()
+    
+    async def close(self) -> None:
+        self.file.close()
+
+# Usage
+emitter = FileEmitter('debug_events.jsonl')
+# ... use with DebugContext ...
+```
+
+### Configuration Presets
+
+```python
+from magic_agents.debug import DebugConfig
+
+# Development: Full capture
+dev_config = DebugConfig.default()
+
+# Staging: Minimal overhead
+staging_config = DebugConfig.minimal()
+
+# Troubleshooting: Maximum detail
+debug_config = DebugConfig.verbose()
+
+# Production: Only capture errors
+prod_config = DebugConfig.errors_only()
+
+# Custom: Mix and match
+custom_config = DebugConfig(
+    enabled=True,
+    capture_inputs=True,
+    capture_outputs=True,
+    capture_internal_state=False,  # Skip internal vars
+    max_string_length=200,
+    redact_patterns=["password", "token", "secret"],
+    include_event_types=[
+        DebugEventType.NODE_START,
+        DebugEventType.NODE_END,
+        DebugEventType.NODE_ERROR,
+        DebugEventType.GRAPH_END
+    ]
+)
+```
+
+### Converting to Legacy Format
+
+```python
+from magic_agents.debug import DebugCollector, node_start_event, node_end_event
+
+# Collect events
+collector = DebugCollector(execution_id="exec-456")
+
+collector.add_event(node_start_event(
+    execution_id="exec-456",
+    node_id="text-1",
+    node_type="TEXT",
+    inputs={"value": "Hello"}
+))
+
+collector.add_event(node_end_event(
+    execution_id="exec-456",
+    node_id="text-1",
+    node_type="TEXT",
+    outputs={"result": "Hello, World!"},
+    duration_ms=5.0
+))
+
+# Get summary in new format
+summary = collector.get_summary()
+
+# Convert to legacy GraphDebugFeedback format
+legacy = summary.to_legacy_format()
+print(json.dumps(legacy, indent=2))
+```
+
+---
+
+## See Also
+
+- [Debug Mode Overview](./DEBUG_MODE_OVERVIEW.md)
+- [Debug Feedback Structure](./DEBUG_FEEDBACK_STRUCTURE.md)
+- [Node Debug Information](./NODE_DEBUG_INFORMATION.md)
+
 **Key Benefits:**
 - **Immediate error notification**: Debug info is yielded as soon as the error occurs
 - **Pre-exception debugging**: Get debug info before the exception is raised

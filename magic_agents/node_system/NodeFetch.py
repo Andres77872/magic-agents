@@ -1,5 +1,6 @@
 import json
 import logging
+from typing import Optional
 
 import aiohttp
 from jinja2 import Template
@@ -12,21 +13,29 @@ logger = logging.getLogger(__name__)
 
 
 class NodeFetch(Node):
+    """
+    Fetch node - output handle names are configurable via JSON data.handles.
+    JSON is the source of truth for all handle names.
+    """
+    # Default output handle name - can be overridden by JSON data.handles
+    DEFAULT_OUTPUT_HANDLE = 'handle_fetch_output'
+
     def __init__(self,
                  data: FetchNodeModel,
+                 handles: Optional[dict] = None,
                  **kwargs) -> None:
         super().__init__(**kwargs)
         self.method = data.method.upper().strip()
-        self.headers = data.headers or {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json'
-        }
+        self.headers = data.headers or {}
         self.url = data.url
         self.data = data.data or None
         # Add jsondata attribute if it exists in the model
         self.jsondata = getattr(data, 'json_data', None)
         if not self.jsondata:
             self.jsondata = None
+        # Allow JSON to override handle names
+        handles = handles or {}
+        self.OUTPUT_HANDLE = handles.get('output', handles.get('response', self.DEFAULT_OUTPUT_HANDLE))
 
     async def fetch(self, session, url, data=None, json_data=None):
         # Use the appropriate method (GET, POST, PUT, etc.)
@@ -75,7 +84,7 @@ class NodeFetch(Node):
         if not run:
             if self.debug:
                 logger.debug("NodeFetch:%s no inputs set; skipping request", self.node_id)
-            yield self.yield_static({})
+            yield self.yield_static({}, content_type=self.OUTPUT_HANDLE)
             return
         
         # Template the URL with Jinja2 to support dynamic query parameters and path segments
@@ -116,7 +125,7 @@ class NodeFetch(Node):
                     json_data=json_data_to_send
                 )
             logger.info("NodeFetch:%s request completed", self.node_id)
-            yield self.yield_static(response_json)
+            yield self.yield_static(response_json, content_type=self.OUTPUT_HANDLE)
         except aiohttp.ClientResponseError as e:
             logger.error("NodeFetch:%s HTTP error %s: %s", self.node_id, e.status, e.message)
             yield self.yield_debug_error(
@@ -151,3 +160,20 @@ class NodeFetch(Node):
                     "exception_type": type(e).__name__
                 }
             )
+
+    def _capture_internal_state(self):
+        """Capture Fetch-specific internal state for debugging."""
+        state = super()._capture_internal_state()
+        
+        # Add Fetch-specific variables as documented
+        state['url'] = self.url
+        state['method'] = self.method
+        state['headers'] = self._safe_copy_dict(self.headers) if isinstance(self.headers, dict) else self.headers
+        
+        # Capture body data if available
+        if self.data:
+            state['body'] = self.data
+        if self.jsondata:
+            state['json_data'] = self.jsondata
+        
+        return state

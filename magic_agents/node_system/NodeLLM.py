@@ -2,6 +2,7 @@ import json
 import re
 import uuid
 import logging
+from typing import Optional
 
 from magic_llm import MagicLLM
 from magic_llm.model import ModelChat
@@ -14,20 +15,38 @@ logger = logging.getLogger(__name__)
 
 
 class NodeLLM(Node):
-    INPUT_HANDLER_CLIENT_PROVIDER = 'handle-client-provider'
-    INPUT_HANDLER_CHAT = 'handle-chat'
-    INPUT_HANDLER_SYSTEM_CONTEXT = 'handle-system-context'
-    INPUT_HANDLER_USER_MESSAGE = 'handle_user_message'
+    """
+    LLM node - handle names are configurable via JSON data.handles.
+    JSON is the source of truth for all handle names.
+    """
+    # Default handle names - can be overridden by JSON data.handles
+    DEFAULT_INPUT_CLIENT_PROVIDER = 'handle-client-provider'
+    DEFAULT_INPUT_CHAT = 'handle-chat'
+    DEFAULT_INPUT_SYSTEM_CONTEXT = 'handle-system-context'
+    DEFAULT_INPUT_USER_MESSAGE = 'handle_user_message'
+    # Output handles
+    DEFAULT_OUTPUT_CONTENT = 'handle_streaming_content'
+    DEFAULT_OUTPUT_GENERATED = 'handle_generated_content'
 
     def __init__(self,
                  data: LlmNodeModel,
                  node_id: str,
                  debug: bool = False,
+                 handles: Optional[dict] = None,
                  **kwargs):
         super().__init__(
             debug=debug,
             node_id=node_id,
             **kwargs)
+        # Allow JSON to override handle names
+        handles = handles or {}
+        self.INPUT_HANDLER_CLIENT_PROVIDER = handles.get('client_provider', handles.get('client', self.DEFAULT_INPUT_CLIENT_PROVIDER))
+        self.INPUT_HANDLER_CHAT = handles.get('chat', self.DEFAULT_INPUT_CHAT)
+        self.INPUT_HANDLER_SYSTEM_CONTEXT = handles.get('system_context', handles.get('system', self.DEFAULT_INPUT_SYSTEM_CONTEXT))
+        self.INPUT_HANDLER_USER_MESSAGE = handles.get('user_message', handles.get('message', self.DEFAULT_INPUT_USER_MESSAGE))
+        # Output handles
+        self.OUTPUT_HANDLE_CONTENT = handles.get('output_content', handles.get('streaming', self.DEFAULT_OUTPUT_CONTENT))
+        self.OUTPUT_HANDLE_GENERATED = handles.get('output_generated', handles.get('generated', self.DEFAULT_OUTPUT_GENERATED))
         # allow re-execution inside Loop when requested
         self.iterate = getattr(data, 'iterate', False)
         self.stream = data.stream
@@ -38,6 +57,8 @@ class NodeLLM(Node):
             self.extra_data['temperature'] = data.temperature
         if 'top_p' not in self.extra_data and data.top_p is not None:
             self.extra_data['top_p'] = data.top_p
+        if 'max_tokens' not in self.extra_data and data.max_tokens is not None:
+            self.extra_data['max_tokens'] = data.max_tokens
 
     async def process(self, chat_log):
         params = self.inputs
@@ -60,7 +81,7 @@ class NodeLLM(Node):
         else:
             if no_inputs:
                 logger.debug("NodeLLM:%s no inputs provided; yielding empty content", self.node_id)
-                yield self.yield_static('')
+                yield self.yield_static('', content_type=self.OUTPUT_HANDLE_GENERATED)
                 return
             chat = ModelChat(params.get(self.INPUT_HANDLER_SYSTEM_CONTEXT))
             if k := params.get(self.INPUT_HANDLER_USER_MESSAGE):
@@ -90,12 +111,12 @@ class NodeLLM(Node):
                 model=client.llm.model,
                 choices=[ChoiceModel()],
                 usage=intention.usage),
-                content_type='content')
+                content_type=self.OUTPUT_HANDLE_CONTENT)
         else:
             logger.info("NodeLLM:%s streaming generation with model=%s", self.node_id, client.llm.model)
             async for i in client.llm.async_stream_generate(chat, **self.extra_data):
                 self.generated += i.choices[0].delta.content or ''
-                yield self.yield_static(i, content_type='content')
+                yield self.yield_static(i, content_type=self.OUTPUT_HANDLE_CONTENT)
         # if self.json_output:
         #     print(self.generated)
         #     self.generated = json.loads(self.generated)
@@ -151,7 +172,7 @@ class NodeLLM(Node):
                     }
                 )
                 return
-        yield self.yield_static(self.generated)
+        yield self.yield_static(self.generated, content_type=self.OUTPUT_HANDLE_GENERATED)
 
     def _capture_internal_state(self):
         """Capture LLM-specific internal state for debugging."""

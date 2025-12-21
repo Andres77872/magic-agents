@@ -7,7 +7,7 @@ Emits a **static text string** into the flow.
 | **Python class** | `magic_agents.node_system.NodeText` |
 | **Type key** | `text` |
 | **Input handles** | _none_ |
-| **Output handle** | `handle_void` (default) |
+| **Output** | Default output (`end`, aliased by `edge.sourceHandle`) containing the configured `text` |
 
 ## Data Fields (JSON spec)
 
@@ -34,5 +34,14 @@ async def process(self, chat_log):
     yield self.yield_static(self._text)
 ```
 
-- No inputs; always produces exactly one content chunk.
-- Commonly used for placeholder messages, system prompts, or fixed responses.
+- No inputs; always produces exactly one output event (`end`).
+- Commonly used to provide static data to downstream nodes (e.g., as an input into `NodeParser` or `NodeLLM`).
+
+## Debug Information
+
+When `debug=True`, the following internal state is captured:
+
+| Variable | Description |
+|----------|-------------|
+| `text` | The static text (truncated to 500 chars) |
+| `text_length` | Total length of the text |

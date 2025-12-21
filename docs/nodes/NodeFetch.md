@@ -6,8 +6,8 @@ Performs an **HTTP request** (GET/POST/etc.) and yields the parsed JSON/text res
 |----------|-------|
 | **Python class** | `magic_agents.node_system.NodeFetch` |
 | **Type key** | `fetch` |
-| **Input handle** | `handle_fetch_input` |
-| **Output handles** | `handle_response_json`, `handle_response_text` (impl-specific) |
+| **Input handles** | Any (all `inputs` are available for templating) |
+| **Output** | Default output (`end`, aliased by `edge.sourceHandle`) containing the parsed JSON response |
 
 ## Data Fields (JSON spec)
 
@@ -15,9 +15,19 @@ Performs an **HTTP request** (GET/POST/etc.) and yields the parsed JSON/text res
 |-------|------|-------------|
 | `url` | `str` | Endpoint to call (Jinja2-templated). |
 | `method` | `str` | `GET`, `POST`, etc. |
-| `headers` | `dict` | HTTP headers (templated). |
-| `json_data` / `body` | `dict` / `str` | Request payload (templated). |
-| `timeout` | `float` | Seconds before abort. |
+| `headers` | `dict \| str` | HTTP headers (dict or JSON string). |
+| `data` | `dict \| str` | Request payload sent as `data` (templated). |
+| `json_data` | `dict \| str` | Request payload sent as `json` (templated). |
+| `params` | `dict \| str` | URL query parameters. |
+| `body` | `dict \| str` | Request body (alternative to `data`). |
+
+## Field Aliases
+
+| Primary Field | Alias | Notes |
+|---------------|-------|-------|
+| `url` | `endpoint` | API endpoint URL |
+| `params` | `query` | URL query parameters |
+| `json_data` | `json_body` | JSON request body |
 
 ## Example
 
@@ -33,7 +43,7 @@ Performs an **HTTP request** (GET/POST/etc.) and yields the parsed JSON/text res
       "Content-Type": "application/json"
     },
     "json_data": {
-      "q": "{{ handle_fetch_input }}"
+      "q": "{{ query }}"
     }
   }
 }
@@ -43,12 +53,32 @@ Performs an **HTTP request** (GET/POST/etc.) and yields the parsed JSON/text res
 
 ```python
 async def process(self, chat_log):
-    url = jinja_render(self.url, **self.inputs)
-    headers = jinja_render_dict(self.headers, **self.inputs)
-    body = jinja_render_json(self.json_data, **self.inputs)
-    resp = await httpx_async_request(method, url, headers=headers, json=body)
-    yield self.yield_static(resp.json())
+    # URL is rendered with Jinja2 using current inputs
+    rendered_url = Template(self.url).render(self.inputs)
+    # `data` / `json_data` are also rendered via Jinja2 before sending
+    response_json = await aiohttp_request(rendered_url, ...)
+    yield self.yield_static(response_json)
 ```
 
-- Template rendering allows dynamic URLs/bodies.
-- Response is auto-parsed as JSON when possible.
+- The current implementation always calls `response.json()` (so endpoints should return JSON).
+- If **all inputs are empty**, the node skips the request and yields `{}`.
+
+## Debug Information
+
+When `debug=True`, the following internal state is captured:
+
+| Variable | Description |
+|----------|-------------|
+| `url` | Configured URL template |
+| `method` | HTTP method |
+| `headers` | Request headers |
+| `body` | Request body (if set) |
+| `json_data` | JSON body (if set) |
+
+## Error Handling
+
+The node yields debug errors for:
+- **TemplateError**: URL templating failed with Jinja2
+- **HTTPError**: HTTP request failed with status code
+- **NetworkError**: Network connection failed
+- **UnexpectedError**: Other unexpected errors

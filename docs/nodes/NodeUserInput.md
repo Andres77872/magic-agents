@@ -16,6 +16,30 @@ Seeds the agent flow with the **user’s initial message**, files, and images. I
 | `files` | `list[str]` | Optional file list attached to the message. |
 | `images` | `list[str]` | Optional images (URLs / base64). |
 
+## Configurable Handles
+
+Output handle names can be customized via the `handles` field in `data`:
+
+```json
+{
+  "id": "user_input",
+  "type": "user_input",
+  "data": {
+    "handles": {
+      "user_message": "my_message_output",
+      "user_files": "my_files_output",
+      "user_images": "my_images_output"
+    }
+  }
+}
+```
+
+| Handle Key | Aliases | Default Value | Description |
+|------------|---------|---------------|-------------|
+| `user_message` | `message` | `handle_user_message` | User text output |
+| `user_files` | `files` | `handle_user_files` | Files output |
+| `user_images` | `images` | `handle_user_images` | Images output |
+
 ## Example
 
 ```json
@@ -41,3 +65,13 @@ async def process(self, chat_log):
 
 - Ensures IDs exist.
 - Emits three separate events so downstream nodes can choose what to consume.
+
+## Debug Information
+
+When `debug=True`, the following internal state is captured:
+
+| Variable | Description |
+|----------|-------------|
+| `text` | User's text message |
+| `files` | List of attached files |
+| `images` | List of attached images |

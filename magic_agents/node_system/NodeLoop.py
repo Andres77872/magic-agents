@@ -1,5 +1,6 @@
 import json
 import logging
+from typing import Optional
 
 from magic_agents.node_system.Node import Node
 
@@ -9,27 +10,32 @@ logger = logging.getLogger(__name__)
 class NodeLoop(Node):
     """
     Loop node: iterates over a list of items, then aggregates results.
-
-    Inputs:
-      - 'handle_list': JSON string or Python list of items to iterate.
-      - 'handle_loop': Optional per-iteration result to aggregate.
-
-    Outputs (via content_type, not handle names):
-      - Items are emitted with content_type='content' (not 'handle_item')
-      - Aggregation is emitted with content_type='end' (not 'handle_end')
     
-    Edge Configuration:
-      - For iteration: sourceHandle="content" (receives each item)
-      - For aggregation: sourceHandle="default" or "end" (receives aggregated results)
-    
-    Note: OUTPUT_HANDLE_* constants are for reference/documentation only.
-    The implementation uses generic content_type values for backward compatibility.
+    Handle names are configurable via JSON data.handles - JSON is the source of truth.
+    Default handle names are used only if not specified in JSON.
+
+    Inputs (configurable via data.handles):
+      - 'handle_list' (default): JSON string or Python list of items to iterate.
+      - 'handle_loop' (default): Optional per-iteration result to aggregate.
+
+    Outputs (configurable via data.handles):
+      - 'handle_item' (default): Each item during iteration
+      - 'handle_end' (default): Aggregated results after iteration
     """
-    INPUT_HANDLE_LIST = 'handle_list'
-    INPUT_HANDLE_LOOP = 'handle_loop'
-    # NOTE: These output constants are for reference only - not used as actual content_type values
-    OUTPUT_HANDLE_ITEM = 'handle_item'  # Reference: actual content_type='content'
-    OUTPUT_HANDLE_END = 'handle_end'    # Reference: actual content_type='end' (default)
+    # Default handle names - can be overridden by JSON data.handles
+    DEFAULT_INPUT_HANDLE_LIST = 'handle_list'
+    DEFAULT_INPUT_HANDLE_LOOP = 'handle_loop'
+    DEFAULT_OUTPUT_HANDLE_ITEM = 'handle_item'
+    DEFAULT_OUTPUT_HANDLE_END = 'handle_end'
+
+    def __init__(self, handles: Optional[dict] = None, **kwargs):
+        super().__init__(**kwargs)
+        # Allow JSON to override handle names
+        handles = handles or {}
+        self.INPUT_HANDLE_LIST = handles.get('input_list', handles.get('list', self.DEFAULT_INPUT_HANDLE_LIST))
+        self.INPUT_HANDLE_LOOP = handles.get('input_loop', handles.get('loop', self.DEFAULT_INPUT_HANDLE_LOOP))
+        self.OUTPUT_HANDLE_ITEM = handles.get('output_item', handles.get('item', self.DEFAULT_OUTPUT_HANDLE_ITEM))
+        self.OUTPUT_HANDLE_END = handles.get('output_end', handles.get('end', self.DEFAULT_OUTPUT_HANDLE_END))
 
     async def process(self, chat_log):
         raw = self.get_input(self.INPUT_HANDLE_LIST, required=False)
@@ -76,11 +82,11 @@ class NodeLoop(Node):
             return
         
         logger.info("NodeLoop:%s iterating over %d items", self.node_id, len(items))
-        # yield each item for downstream processing
+        # yield each item for downstream processing - use configured output handle
         for idx, item in enumerate(items):
             if self.debug and idx < 5:
                 logger.debug("NodeLoop:%s yielding item index=%d", self.node_id, idx)
-            yield self.yield_static(item, content_type='content')
+            yield self.yield_static(item, content_type=self.OUTPUT_HANDLE_ITEM)
         # after iteration, aggregate any loop inputs collected
         agg = self.inputs.get(self.INPUT_HANDLE_LOOP, [])
         if self.debug:
@@ -89,4 +95,19 @@ class NodeLoop(Node):
             except Exception:
                 agg_len = 1 if agg else 0
             logger.debug("NodeLoop:%s yielding aggregation length=%d", self.node_id, agg_len)
-        yield self.yield_static(agg)
+        yield self.yield_static(agg, content_type=self.OUTPUT_HANDLE_END)
+
+    def _capture_internal_state(self):
+        """Capture Loop-specific internal state for debugging."""
+        state = super()._capture_internal_state()
+        
+        # Add Loop-specific variables as documented
+        state['iterate'] = True  # Loop nodes always iterate
+        
+        # Capture handle configuration
+        state['input_handle_list'] = self.INPUT_HANDLE_LIST
+        state['input_handle_loop'] = self.INPUT_HANDLE_LOOP
+        state['output_handle_item'] = self.OUTPUT_HANDLE_ITEM
+        state['output_handle_end'] = self.OUTPUT_HANDLE_END
+        
+        return state

@@ -118,6 +118,8 @@ All nodes capture these standard fields:
   },
   "internal_variables": {
     "_response": "Welcome to the system!",
+    "text": "Welcome to the system!",
+    "text_length": 22,
     "cost": 0.0
   }
 }
@@ -132,6 +134,7 @@ All nodes capture these standard fields:
 **Internal Variables**:
 - `text`: The user's input text
 - `images`: List of image URLs/paths (if provided)
+- `files`: List of file paths (if provided)
 
 **Input Handles**: None (receives from user)
 
@@ -154,7 +157,10 @@ All nodes capture these standard fields:
   },
   "internal_variables": {
     "_response": "What is the weather today?",
-    "cost": 0.0
+    "cost": 0.0,
+    "text": "What is the weather today?",
+    "images": [],
+    "files": []
   }
 }
 ```
@@ -166,15 +172,16 @@ All nodes capture these standard fields:
 **Purpose**: Evaluates a condition and routes to appropriate branch.
 
 **Internal Variables**:
-- `condition`: The condition expression being evaluated
+- `condition`: The Jinja2 condition template being evaluated
+- `merge_strategy`: How multiple inputs are merged ('flat' or 'namespaced')
+- `selected_handle`: The handle that was selected after evaluation
 - `context_data`: Data available for condition evaluation
 
 **Input Handles**:
 - Various (depends on condition requirements)
 
 **Output Handles**:
-- `handle_true`: Taken if condition evaluates to true
-- `handle_false`: Taken if condition evaluates to false
+- Dynamic handles specified in the condition result
 
 **Example Debug Output**:
 ```json
@@ -189,12 +196,15 @@ All nodes capture these standard fields:
   "outputs": {
     "handle_true": {
       "node": "NodeConditional",
-      "content": true
+      "content": {"input_value": 42}
     }
   },
   "internal_variables": {
-    "_response": true,
-    "condition": "input_value > 10",
+    "_response": {"selected": "handle_true", "merge_strategy": "flat", "input_count": 1},
+    "condition": "{% if input_value > 10 %}handle_true{% else %}handle_false{% endif %}",
+    "merge_strategy": "flat",
+    "selected_handle": "handle_true",
+    "context_data": {"input_value": 42},
     "cost": 0.0
   }
 }
@@ -208,14 +218,18 @@ All nodes capture these standard fields:
 
 **Internal Variables**:
 - `iterate`: Always true for loop nodes
+- `input_handle_list`: The configured input handle for the list
+- `input_handle_loop`: The configured input handle for loop feedback
+- `output_handle_item`: The configured output handle for items
+- `output_handle_end`: The configured output handle for end result
 
 **Input Handles**:
-- `handle_list`: List of items to iterate
-- `handle_loop`: Feedback from each iteration
+- `handle_list`: List of items to iterate (configurable)
+- `handle_loop`: Feedback from each iteration (configurable)
 
 **Output Handles**:
-- `handle_item`: Current item in iteration
-- `handle_end`: Aggregated results after all iterations
+- `handle_item`: Current item in iteration (configurable)
+- `handle_end`: Aggregated results after all iterations (configurable)
 
 **Example Debug Output**:
 ```json
@@ -235,7 +249,12 @@ All nodes capture these standard fields:
   },
   "internal_variables": {
     "_response": ["result1", "result2", "result3"],
-    "cost": 0.0
+    "cost": 0.0,
+    "iterate": true,
+    "input_handle_list": "handle_list",
+    "input_handle_loop": "handle_loop",
+    "output_handle_item": "handle_item",
+    "output_handle_end": "handle_end"
   }
 }
 ```
@@ -270,6 +289,12 @@ All nodes capture these standard fields:
       "node": "NodeParser",
       "content": {"name": "John", "age": 30}
     }
+  },
+  "internal_variables": {
+    "_response": {"name": "John", "age": 30},
+    "cost": 0.0,
+    "template": "Parse the following: {{input}}",
+    "template_length": 30
   }
 }
 ```
@@ -281,13 +306,14 @@ All nodes capture these standard fields:
 **Purpose**: Makes HTTP requests to external APIs.
 
 **Internal Variables**:
-- `url`: The URL being fetched
+- `url`: The URL template being fetched
 - `method`: HTTP method (GET, POST, etc.)
 - `headers`: Request headers
-- `body`: Request body (if applicable)
+- `body`: Request body data (if applicable)
+- `json_data`: Request JSON body (if applicable)
 
 **Input Handles**:
-- Various (depends on configuration)
+- Various (depends on configuration, used in URL/body templates)
 
 **Output Handles**:
 - `end`: Response data
@@ -309,8 +335,9 @@ All nodes capture these standard fields:
     }
   },
   "internal_variables": {
-    "url": "https://api.example.com/data",
+    "url": "https://api.example.com/{{url_param}}",
     "method": "GET",
+    "headers": {"Authorization": "Bearer ..."},
     "_response": {"status": "success", "data": [...]}
   }
 }
@@ -323,7 +350,9 @@ All nodes capture these standard fields:
 **Purpose**: Manages conversation history and chat context.
 
 **Internal Variables**:
-- Chat history and context
+- `messages_count`: Number of messages in chat history
+- `has_system_message`: Whether a system message is set
+- `memory`: Memory configuration (stm, ltm, max_input_tokens)
 
 **Input Handles**:
 - `handle_user_message`: User message to add to chat
@@ -346,6 +375,13 @@ All nodes capture these standard fields:
       "node": "NodeChat",
       "content": "<ModelChat>"
     }
+  },
+  "internal_variables": {
+    "_response": "<ModelChat>",
+    "cost": 0.0,
+    "messages_count": 2,
+    "has_system_message": true,
+    "memory": {"stm": 10, "ltm": 0}
   }
 }
 ```
@@ -357,8 +393,10 @@ All nodes capture these standard fields:
 **Purpose**: Executes a nested sub-graph.
 
 **Internal Variables**:
-- `magic_flow`: The inner graph definition
-- `inner_graph`: The built inner graph instance
+- `has_magic_flow`: Whether the inner graph definition exists
+- `has_inner_graph`: Whether the inner graph was built
+- `magic_flow`: Summary of inner graph (nodes_count, edges_count, type)
+- `inner_graph`: String representation of built graph
 
 **Input Handles**:
 - Various (depends on inner graph)
@@ -384,8 +422,11 @@ All nodes capture these standard fields:
   },
   "internal_variables": {
     "_response": "Inner graph result",
-    "magic_flow": {...},
-    "inner_graph": "<AgentFlowModel>"
+    "cost": 0.0,
+    "has_magic_flow": true,
+    "has_inner_graph": true,
+    "magic_flow": {"nodes_count": 5, "edges_count": 4, "type": "chat"},
+    "inner_graph": "<AgentFlowModel with 5 nodes>"
   }
 }
 ```
@@ -397,7 +438,7 @@ All nodes capture these standard fields:
 **Purpose**: Marks the end of execution flow.
 
 **Internal Variables**:
-- Standard variables only
+- `is_terminal_node`: Always true for END nodes
 
 **Input Handles**:
 - Various (any final input)
@@ -417,7 +458,91 @@ All nodes capture these standard fields:
   "outputs": {},
   "internal_variables": {
     "_response": null,
-    "cost": 0.0
+    "cost": 0.0,
+    "is_terminal_node": true
+  }
+}
+```
+
+---
+
+### NodeClientLLM (CLIENT)
+
+**Purpose**: Provides LLM client configuration.
+
+**Internal Variables**:
+- `engine`: The LLM engine being used
+- `model`: The model name
+- `client_initialized`: Whether the client was successfully initialized
+- `init_error`: Any initialization error (if failed)
+- `init_error_type`: Type of initialization error (if failed)
+
+**Input Handles**: None (configuration node)
+
+**Output Handles**:
+- `end`: The configured MagicLLM client
+
+**Example Debug Output**:
+```json
+{
+  "node_id": "client-1",
+  "node_type": "CLIENT",
+  "node_class": "NodeClientLLM",
+  "execution_duration_ms": 10.0,
+  "inputs": {},
+  "outputs": {
+    "end": {
+      "node": "NodeClientLLM",
+      "content": "<MagicLLM>"
+    }
+  },
+  "internal_variables": {
+    "_response": "<MagicLLM>",
+    "cost": 0.0,
+    "engine": "openai",
+    "model": "gpt-4",
+    "client_initialized": true
+  }
+}
+```
+
+---
+
+### NodeSendMessage (SEND_MESSAGE)
+
+**Purpose**: Sends a structured message with extras.
+
+**Internal Variables**:
+- `message`: The message content
+- `json_extras`: Extra JSON data to include
+
+**Input Handles**:
+- `handle_send_extra`: Additional output data
+
+**Output Handles**:
+- `content`: ChatCompletionModel with message and extras
+
+**Example Debug Output**:
+```json
+{
+  "node_id": "send-1",
+  "node_type": "SEND_MESSAGE",
+  "node_class": "NodeSendMessage",
+  "execution_duration_ms": 2.0,
+  "inputs": {
+    "handle_send_extra": {"key": "value"}
+  },
+  "outputs": {
+    "content": {
+      "node": "NodeSendMessage",
+      "content": "<ChatCompletionModel>"
+    }
+  },
+  "internal_variables": {
+    "_response": "<ChatCompletionModel>",
+    "cost": 0.0,
+    "message": "Response message",
+    "json_extras": {"type": "notification"}
   }
 }
 ```
@@ -472,3 +597,158 @@ When a node fails during execution:
   "error": "Connection timeout: failed to connect to server"
 }
 ```
+
+---
+
+## New Debug Event System
+
+The new debug architecture captures node information through typed events. Each node lifecycle emits specific events:
+
+### Node Event Flow
+
+```
+NODE_START → (execution) → NODE_END | NODE_ERROR | NODE_BYPASS
+```
+
+### Event Types for Nodes
+
+| Event Type | When Emitted | Payload Contains |
+|------------|--------------|------------------|
+| `NODE_START` | Node execution begins | `node_id`, `node_type`, `inputs` |
+| `NODE_END` | Node completes successfully | `node_id`, `node_type`, `outputs`, `internal_state`, `duration_ms` |
+| `NODE_ERROR` | Node execution fails | `node_id`, `node_type`, `error`, `inputs`, `partial_outputs` |
+| `NODE_BYPASS` | Node skipped (conditional) | `node_id`, `node_type`, `reason` |
+| `NODE_RETRY` | Node being retried | `node_id`, `node_type`, `attempt`, `error` |
+| `NODE_TIMEOUT` | Node execution timed out | `node_id`, `node_type`, `timeout_ms` |
+
+### DebugEvent Structure for Nodes
+
+```python
+from magic_agents.debug import DebugEvent, DebugEventType, DebugEventSeverity
+from datetime import datetime
+
+# NODE_START event
+start_event = DebugEvent(
+    event_id="evt-001",
+    event_type=DebugEventType.NODE_START,
+    timestamp=datetime.now(),
+    execution_id="exec-123",
+    node_id="llm-1",
+    node_type="LLM",
+    severity=DebugEventSeverity.INFO,
+    payload={
+        "inputs": {
+            "handle_user_message": "What is AI?",
+            "handle-client-provider": "<MagicLLM>"
+        }
+    }
+)
+
+# NODE_END event
+end_event = DebugEvent(
+    event_id="evt-002",
+    event_type=DebugEventType.NODE_END,
+    timestamp=datetime.now(),
+    execution_id="exec-123",
+    node_id="llm-1",
+    node_type="LLM",
+    severity=DebugEventSeverity.INFO,
+    payload={
+        "outputs": {
+            "end": {"node": "NodeLLM", "content": "AI stands for..."}
+        },
+        "internal_state": {
+            "stream": True,
+            "json_output": False,
+            "generated": "AI stands for..."
+        }
+    },
+    duration_ms=1520.0
+)
+
+# NODE_ERROR event
+error_event = DebugEvent(
+    event_id="evt-003",
+    event_type=DebugEventType.NODE_ERROR,
+    timestamp=datetime.now(),
+    execution_id="exec-123",
+    node_id="fetch-1",
+    node_type="FETCH",
+    severity=DebugEventSeverity.ERROR,
+    payload={
+        "error": "Connection timeout",
+        "error_type": "TimeoutError",
+        "inputs": {"url": "https://invalid-url"}
+    },
+    duration_ms=5000.0
+)
+```
+
+### Using Factory Functions
+
+```python
+from magic_agents.debug import (
+    node_start_event,
+    node_end_event,
+    node_error_event,
+    node_bypass_event
+)
+
+# Create events using factory functions
+start = node_start_event(
+    execution_id="exec-123",
+    node_id="llm-1",
+    node_type="LLM",
+    inputs={"prompt": "Hello"}
+)
+
+end = node_end_event(
+    execution_id="exec-123",
+    node_id="llm-1",
+    node_type="LLM",
+    outputs={"response": "Hi there!"},
+    internal_state={"tokens": 15},
+    duration_ms=150.0
+)
+
+error = node_error_event(
+    execution_id="exec-123",
+    node_id="fetch-1",
+    node_type="FETCH",
+    error="Connection failed",
+    inputs={"url": "https://example.com"}
+)
+
+bypass = node_bypass_event(
+    execution_id="exec-123",
+    node_id="conditional-branch",
+    node_type="LLM",
+    reason="Branch not taken"
+)
+```
+
+### Converting Events to Legacy NodeDebugInfo
+
+```python
+from magic_agents.debug import DebugCollector
+
+collector = DebugCollector(execution_id="exec-123")
+collector.add_event(start)
+collector.add_event(end)
+
+# Get summary with legacy format
+summary = collector.get_summary()
+legacy = summary.to_legacy_format()
+
+# legacy["nodes"] contains NodeDebugInfo-compatible dicts
+for node in legacy["nodes"]:
+    print(f"{node['node_id']}: {node['execution_duration_ms']}ms")
+```
+
+---
+
+## See Also
+
+- [Debug Mode Overview](./DEBUG_MODE_OVERVIEW.md)
+- [Debug Feedback Structure](./DEBUG_FEEDBACK_STRUCTURE.md)
+- [Debug Mode Examples](./DEBUG_MODE_EXAMPLES.md)

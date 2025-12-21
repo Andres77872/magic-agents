@@ -17,6 +17,94 @@ Set `"debug": true` in your graph definition:
 }
 ```
 
+### Debug Configuration from JSON
+
+You can customize debug behavior directly in the JSON using `debug_config`:
+
+```json
+{
+  "type": "chat",
+  "debug": true,
+  "debug_config": {
+    "preset": "verbose",
+    "redact_sensitive": true,
+    "max_payload_length": 2000,
+    "capture_inputs": true,
+    "capture_outputs": true
+  },
+  "nodes": [...],
+  "edges": [...]
+}
+```
+
+#### Available Presets
+
+Use the `preset` field to start from a predefined configuration:
+
+| Preset | Description |
+|--------|-------------|
+| `default` | Standard debugging with sensible defaults |
+| `minimal` | Errors and warnings only, no input/output data |
+| `verbose` | Captures everything including trace events |
+| `production` | Production-safe with sampling and redaction |
+| `errors_only` | Only error events |
+
+#### Configuration Options
+
+All options can be set in `debug_config`:
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `preset` | string | - | Base preset to start from |
+| `enabled` | bool | `true` | Master switch for debug |
+| `redact_sensitive` | bool | `true` | Redact API keys, passwords, etc. |
+| `max_payload_length` | int | `1000` | Max string length in debug output |
+| `max_list_items` | int | `20` | Max items in list output |
+| `capture_inputs` | bool | `true` | Capture node input data |
+| `capture_outputs` | bool | `true` | Capture node output data |
+| `capture_internal_state` | bool | `true` | Capture internal node state |
+| `emit_to_log` | bool | `false` | Also emit to logging |
+| `log_level` | string | `"DEBUG"` | Log level for emissions |
+| `sample_rate` | float | `1.0` | Fraction of events to include (1.0 = all) |
+| `include_nodes` | array | - | Only debug specific nodes |
+| `exclude_nodes` | array | - | Exclude specific nodes |
+
+#### Example Configurations
+
+**Minimal debugging for production:**
+```json
+{
+  "debug": true,
+  "debug_config": {
+    "preset": "minimal",
+    "redact_sensitive": true
+  }
+}
+```
+
+**Verbose debugging with logging:**
+```json
+{
+  "debug": true,
+  "debug_config": {
+    "preset": "verbose",
+    "emit_to_log": true,
+    "log_level": "INFO"
+  }
+}
+```
+
+**Debug only specific nodes:**
+```json
+{
+  "debug": true,
+  "debug_config": {
+    "include_nodes": ["llm-1", "parser-1"],
+    "capture_internal_state": false
+  }
+}
+```
+
 ## Handling Debug Output
 
 All messages from `run_agent()` are yielded as **dictionaries with a `type` field**.
@@ -269,3 +357,146 @@ elif result.get("type") == "debug":
 - [Debug Mode Overview](./DEBUG_MODE_OVERVIEW.md)
 - [Debug Feedback Structure](./DEBUG_FEEDBACK_STRUCTURE.md)
 - [Debug Mode Examples](./DEBUG_MODE_EXAMPLES.md)
+
+---
+
+## Programmatic Debug Configuration (New Architecture)
+
+The new debug system provides programmatic configuration through the `magic_agents.debug` module.
+
+### Using DebugConfig
+
+```python
+from magic_agents.debug import DebugConfig
+
+# Use a preset
+config = DebugConfig.default()       # Full capture
+config = DebugConfig.minimal()       # Low overhead
+config = DebugConfig.verbose()       # Maximum detail
+config = DebugConfig.errors_only()   # Production-safe
+
+# Custom configuration
+config = DebugConfig(
+    enabled=True,
+    capture_inputs=True,
+    capture_outputs=True,
+    capture_internal_state=False,  # Skip internal vars for performance
+    max_string_length=500,
+    redact_patterns=["password", "api_key", "secret"],
+    include_event_types=[
+        DebugEventType.NODE_START,
+        DebugEventType.NODE_END,
+        DebugEventType.NODE_ERROR
+    ]
+)
+```
+
+### Using DebugContext
+
+```python
+from magic_agents.debug import debug_context, DebugConfig
+
+async def run_with_debug():
+    config = DebugConfig.verbose()
+    
+    async with debug_context(config) as ctx:
+        # Emit events during execution
+        ctx.emit_node_start("node-1", "LLM", {"prompt": "Hello"})
+        
+        # ... perform node execution ...
+        
+        ctx.emit_node_end("node-1", "LLM", {"response": "Hi!"}, duration_ms=150.0)
+        
+        # Get summary at the end
+        summary = ctx.get_summary()
+        print(f"Executed {summary.nodes_executed} nodes")
+```
+
+### Real-time Event Streaming
+
+```python
+from magic_agents.debug import DebugContext, QueueEmitter
+
+async def stream_debug_events():
+    emitter = QueueEmitter()
+    ctx = DebugContext(
+        config=DebugConfig.default(),
+        emitter=emitter
+    )
+    
+    async with ctx:
+        # Start listening for events in a task
+        async def event_listener():
+            async for event in emitter.events():
+                print(f"[{event.event_type.value}] {event.node_id}: {event.payload}")
+        
+        listener_task = asyncio.create_task(event_listener())
+        
+        # ... run graph execution ...
+        
+        await emitter.close()
+        await listener_task
+```
+
+### Transform Pipeline
+
+Apply transformations to events before emission:
+
+```python
+from magic_agents.debug import (
+    TransformPipeline, 
+    RedactTransformer, 
+    TruncateTransformer,
+    FilterTransformer,
+    DebugEventType
+)
+
+# Build a transformation pipeline
+pipeline = TransformPipeline([
+    # Filter to only node events
+    FilterTransformer(
+        include_types={
+            DebugEventType.NODE_START,
+            DebugEventType.NODE_END,
+            DebugEventType.NODE_ERROR
+        }
+    ),
+    # Redact sensitive data
+    RedactTransformer(
+        patterns=["password", "api_key", "bearer"],
+        replacement="[REDACTED]"
+    ),
+    # Truncate long strings
+    TruncateTransformer(max_length=200)
+])
+
+# Apply to events
+transformed = pipeline.transform(event)
+```
+
+### Using DebugCollector for Summaries
+
+```python
+from magic_agents.debug import DebugCollector
+
+collector = DebugCollector(execution_id="exec-123")
+
+# Add events during execution
+collector.add_event(node_start_event)
+collector.add_event(node_end_event)
+
+# Get execution summary
+summary = collector.get_summary()
+print(f"Total duration: {summary.total_duration_ms}ms")
+print(f"Nodes executed: {summary.nodes_executed}")
+print(f"Nodes bypassed: {summary.nodes_bypassed}")
+print(f"Nodes failed: {summary.nodes_failed}")
+
+# Get per-node summaries
+for node_id, node_summary in summary.nodes.items():
+    print(f"  {node_id}: {node_summary.duration_ms}ms")
+
+# Convert to legacy format for backward compatibility
+legacy = summary.to_legacy_format()
+```
+

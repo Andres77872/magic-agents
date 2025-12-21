@@ -11,6 +11,42 @@ The Magic Agents framework includes a comprehensive debug mode that provides det
 - **Execution Flow**: Information about which nodes were executed, bypassed, or failed
 - **Edge Processing**: Details about data flow between nodes
 
+## Debug System Architecture
+
+The debug system is built on a modular **Capture-Transform-Emit** architecture:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Debug Event Abstraction Layer                   │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌──────────────┐    ┌─────────────────┐    ┌───────────────────┐  │
+│  │   CAPTURE    │───▶│   TRANSFORM     │───▶│      EMIT         │  │
+│  │   (Hooks)    │    │   (Pipeline)    │    │   (Dispatcher)    │  │
+│  └──────────────┘    └─────────────────┘    └───────────────────┘  │
+│         │                    │                       │              │
+│         ▼                    ▼                       ▼              │
+│  ┌──────────────┐    ┌─────────────────┐    ┌───────────────────┐  │
+│  │ NodeCapture  │    │ RedactPipeline  │    │ QueueEmitter      │  │
+│  │ EdgeCapture  │    │ FilterPipeline  │    │ LogEmitter        │  │
+│  │ StateCapture │    │ TruncatePipeline│    │ CallbackEmitter   │  │
+│  └──────────────┘    └─────────────────┘    └───────────────────┘  │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Components
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| `DebugEvent` | `events.py` | Unified event structure for all debug events |
+| `DefaultDebugCapture` | `capture.py` | Captures lifecycle events into DebugEvents |
+| `TransformPipeline` | `transform.py` | Chains transformers to filter/redact/truncate |
+| `QueueEmitter` | `emitter.py` | Emits events to async queues for streaming |
+| `DebugCollector` | `collector.py` | Aggregates events into summaries |
+| `DebugContext` | `context.py` | Manages debug lifecycle during execution |
+| `DebugConfig` | `config.py` | Configuration presets (default, minimal, verbose) |
+
 ## Enabling Debug Mode
 
 Debug mode is controlled by a flag in the graph JSON definition:
@@ -136,6 +172,85 @@ Debug mode adds overhead to graph execution:
 - **Network**: Immediate yielding increases number of messages transmitted
 
 **Recommendation**: Only enable debug mode during development, testing, or when actively troubleshooting issues. Disable it in production for optimal performance.
+
+## Debug Event Types (New Architecture)
+
+The new debug system uses typed events for fine-grained control:
+
+### Graph Events
+| Event Type | Description |
+|------------|-------------|
+| `GRAPH_START` | Graph execution begins |
+| `GRAPH_END` | Graph execution completes |
+| `GRAPH_ERROR` | Graph-level error occurred |
+
+### Node Events
+| Event Type | Description |
+|------------|-------------|
+| `NODE_START` | Node begins execution |
+| `NODE_END` | Node completes successfully |
+| `NODE_ERROR` | Node execution failed |
+| `NODE_BYPASS` | Node was skipped (conditional) |
+| `NODE_RETRY` | Node is being retried |
+| `NODE_TIMEOUT` | Node execution timed out |
+
+### Edge Events  
+| Event Type | Description |
+|------------|-------------|
+| `EDGE_TRANSFER_START` | Data transfer begins |
+| `EDGE_TRANSFER_END` | Data transfer completes |
+
+### LLM Events
+| Event Type | Description |
+|------------|-------------|
+| `LLM_REQUEST_START` | LLM API request begins |
+| `LLM_REQUEST_END` | LLM API response received |
+| `LLM_TOKEN_GENERATED` | Token streaming event |
+| `LLM_ERROR` | LLM API error |
+
+### Loop Events
+| Event Type | Description |
+|------------|-------------|
+| `LOOP_ITERATION_START` | Loop iteration begins |
+| `LOOP_ITERATION_END` | Loop iteration completes |
+| `LOOP_BREAK` | Loop break condition met |
+| `LOOP_CONTINUE` | Loop continue triggered |
+
+### Conditional Events
+| Event Type | Description |
+|------------|-------------|
+| `CONDITIONAL_EVALUATION` | Condition being evaluated |
+| `CONDITIONAL_BRANCH_TAKEN` | Branch selection made |
+
+## Configuration Presets
+
+The debug system provides built-in configuration presets:
+
+```python
+from magic_agents.debug import DebugConfig
+
+# Full debug information (development)
+config = DebugConfig.default()
+
+# Minimal overhead (staging)
+config = DebugConfig.minimal()
+
+# Complete event capture (troubleshooting)
+config = DebugConfig.verbose()
+
+# Errors only (production)
+config = DebugConfig.errors_only()
+
+# Custom configuration
+config = DebugConfig(
+    enabled=True,
+    capture_inputs=True,
+    capture_outputs=True,
+    capture_internal_state=False,  # Skip internal vars
+    max_string_length=500,
+    redact_patterns=["password", "api_key", "token"]
+)
+```
 
 ## See Also
 

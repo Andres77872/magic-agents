@@ -1,4 +1,4 @@
-from typing import Callable, TYPE_CHECKING
+from typing import Callable, Optional, TYPE_CHECKING
 import logging
 
 # from magic_agents.agt_flow import build, execute_graph
@@ -14,20 +14,24 @@ logger = logging.getLogger(__name__)
 class NodeInner(Node):
     """
     Node to execute a nested agent flow graph.
-
-    Takes a single input (via handle_user_message) and a magic_flow property
-    providing an AgentFlowModel spec. Streams all inner graph content events
-    to the outer flow.
+    Handle names are configurable via JSON data.handles.
+    JSON is the source of truth for all handle names.
     """
-    INPUT_HANDLE = 'handle_user_message'
-    HANDLER_EXECUTION_CONTENT = 'handle_execution_content'
-    HANDLER_EXECUTION_EXTRAS = 'handle_execution_extras'
+    # Default handle names - can be overridden by JSON data.handles
+    DEFAULT_INPUT_HANDLE = 'handle_user_message'
+    DEFAULT_OUTPUT_CONTENT = 'handle_execution_content'
+    DEFAULT_OUTPUT_EXTRAS = 'handle_execution_extras'
 
-    def __init__(self, data: InnerNodeModel, load_chat: Callable, **kwargs) -> None:
+    def __init__(self, data: InnerNodeModel, load_chat: Callable, handles: Optional[dict] = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.magic_flow = data.magic_flow
         self._load_chat = load_chat
         self.inner_graph: 'AgentFlowModel' = None  # Will be set by build()
+        # Allow JSON to override handle names
+        handles = handles or {}
+        self.INPUT_HANDLE = handles.get('input', handles.get('user_message', self.DEFAULT_INPUT_HANDLE))
+        self.HANDLER_EXECUTION_CONTENT = handles.get('output_content', handles.get('content', self.DEFAULT_OUTPUT_CONTENT))
+        self.HANDLER_EXECUTION_EXTRAS = handles.get('output_extras', handles.get('extras', self.DEFAULT_OUTPUT_EXTRAS))
 
     async def process(self, chat_log):
         input_message = self.inputs.get(self.INPUT_HANDLE)
@@ -93,3 +97,25 @@ class NodeInner(Node):
         yield self.yield_static(content, content_type=self.HANDLER_EXECUTION_CONTENT)
         if extras:
             yield self.yield_static(extras, content_type=self.HANDLER_EXECUTION_EXTRAS)
+
+    def _capture_internal_state(self):
+        """Capture Inner-specific internal state for debugging."""
+        state = super()._capture_internal_state()
+        
+        # Add Inner-specific variables as documented
+        state['has_magic_flow'] = self.magic_flow is not None
+        state['has_inner_graph'] = self.inner_graph is not None
+        
+        # Capture magic_flow summary if available
+        if isinstance(self.magic_flow, dict):
+            state['magic_flow'] = {
+                'nodes_count': len(self.magic_flow.get('nodes', [])),
+                'edges_count': len(self.magic_flow.get('edges', [])),
+                'type': self.magic_flow.get('type', 'unknown')
+            }
+        
+        # Capture inner graph info if available
+        if self.inner_graph:
+            state['inner_graph'] = f"<AgentFlowModel with {len(self.inner_graph.nodes)} nodes>"
+        
+        return state

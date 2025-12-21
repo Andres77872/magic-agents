@@ -188,3 +188,100 @@ All values in the debug feedback are serialized to be JSON-compatible:
 - **Long strings**: May be truncated (e.g., generated text limited to 500 chars)
 
 This ensures the debug feedback can be safely transmitted and stored.
+
+---
+
+## DebugEvent (New Architecture)
+
+The new debug system uses a unified `DebugEvent` structure for all debug events. This provides more granular control and supports streaming.
+
+### DebugEvent Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `event_id` | string | Unique identifier for this event (UUID) |
+| `event_type` | DebugEventType | Type of event (NODE_START, NODE_END, etc.) |
+| `timestamp` | datetime | When the event occurred |
+| `execution_id` | string | Links events to same graph execution |
+| `node_id` | string (optional) | Node this event relates to |
+| `node_type` | string (optional) | Type of node (LLM, TEXT, etc.) |
+| `severity` | DebugEventSeverity | DEBUG, INFO, WARNING, ERROR, CRITICAL |
+| `payload` | dict | Event-specific data |
+| `metadata` | dict (optional) | Additional context |
+| `parent_event_id` | string (optional) | For nested events |
+| `correlation_id` | string (optional) | Groups related events |
+| `duration_ms` | float (optional) | Duration for end events |
+
+### Example DebugEvent
+
+```python
+from magic_agents.debug import DebugEvent, DebugEventType, DebugEventSeverity
+
+event = DebugEvent(
+    event_id="evt-123",
+    event_type=DebugEventType.NODE_END,
+    timestamp=datetime.now(),
+    execution_id="exec-456",
+    node_id="llm-node-1",
+    node_type="LLM",
+    severity=DebugEventSeverity.INFO,
+    payload={
+        "inputs": {"handle_prompt": "Hello"},
+        "outputs": {"end": {"content": "Hi there!"}},
+        "internal_state": {"tokens": 15}
+    },
+    duration_ms=1234.5
+)
+```
+
+### Converting to Legacy Format
+
+For backward compatibility, DebugEvent can be converted to the legacy format:
+
+```python
+# Convert single event
+legacy_dict = event.to_legacy_format()
+
+# Or use collector for full summary
+from magic_agents.debug import DebugCollector
+
+collector = DebugCollector(execution_id="exec-456")
+collector.add_event(event)
+summary = collector.get_summary()
+legacy = summary.to_legacy_format()  # GraphDebugFeedback compatible
+```
+
+---
+
+## Event Severity Levels
+
+| Severity | Use Case |
+|----------|----------|
+| `DEBUG` | Detailed internal info (verbose mode only) |
+| `INFO` | Normal execution events |
+| `WARNING` | Unusual but non-fatal conditions |
+| `ERROR` | Node/operation failures |
+| `CRITICAL` | Graph-level failures |
+
+---
+
+## Streaming vs Summary
+
+The debug system supports two output modes:
+
+### Streaming Mode
+Events are emitted in real-time as they occur:
+```python
+async with debug_context(config) as ctx:
+    async for event in ctx.events():
+        print(f"[{event.event_type}] {event.node_id}")
+```
+
+### Summary Mode  
+Events are collected and aggregated into a summary:
+```python
+collector = DebugCollector(execution_id="exec-123")
+# ... events added during execution ...
+summary = collector.get_summary()  # GraphExecutionSummary
+```
+
