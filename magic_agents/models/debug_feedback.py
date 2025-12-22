@@ -3,7 +3,7 @@ Debug feedback models for tracking node execution information.
 """
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel, Field
-from datetime import datetime
+from datetime import datetime, UTC
 
 
 class NodeDebugInfo(BaseModel):
@@ -91,7 +91,7 @@ class GraphDebugFeedback(BaseModel):
     
     def finalize(self):
         """Finalize the debug feedback with end time and duration."""
-        self.end_time = datetime.utcnow().isoformat()
+        self.end_time = datetime.now(UTC).isoformat()
         if self.start_time and self.end_time:
             start = datetime.fromisoformat(self.start_time)
             end = datetime.fromisoformat(self.end_time)

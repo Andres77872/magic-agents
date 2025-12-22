@@ -3,7 +3,7 @@ from __future__ import annotations
 import abc
 import logging
 from typing import Any, Dict, Optional, AsyncGenerator
-from datetime import datetime
+from datetime import datetime, UTC
 
 from magic_agents.models.model_agent_run_log import ModelAgentRunLog
 from magic_agents.models.debug_feedback import NodeDebugInfo
@@ -123,7 +123,7 @@ class Node(abc.ABC):
             "node_class": self.__class__.__name__,
             "error_type": error_type,
             "error_message": error_message,
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.now(UTC).isoformat()
         }
         
         if context:
@@ -270,7 +270,7 @@ class Node(abc.ABC):
         if self._debug_info is None:
             self._init_debug_info()
         
-        self._execution_start = datetime.utcnow()
+        self._execution_start = datetime.now(UTC)
         self._debug_info.start_time = self._execution_start.isoformat()
         self._debug_info.inputs = self._safe_copy_dict(self.inputs)
         
@@ -282,7 +282,7 @@ class Node(abc.ABC):
         if not self.debug or self._debug_info is None:
             return
         
-        self._execution_end = datetime.utcnow()
+        self._execution_end = datetime.now(UTC)
         self._debug_info.end_time = self._execution_end.isoformat()
         
         # Calculate execution duration
