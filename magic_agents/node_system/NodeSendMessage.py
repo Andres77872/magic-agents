@@ -22,6 +22,8 @@ class NodeSendMessage(Node):
     DEFAULT_OUTPUT_HANDLE = 'handle_message_output'
     # Streaming content handle - used by executor to forward to user
     OUTPUT_HANDLE_CONTENT = 'content'
+    # Legacy output handle for backward compatibility with existing graphs
+    LEGACY_OUTPUT_HANDLE = 'handle_generated_end'
 
     def __init__(self,
                  data: SendMessageNodeModel,
@@ -63,6 +65,10 @@ class NodeSendMessage(Node):
         
         # Yield for routing to downstream nodes
         yield self.yield_static(message, content_type=self.OUTPUT_HANDLE)
+        
+        # Also yield on legacy handle for backward compatibility with existing graphs
+        if self.OUTPUT_HANDLE != self.LEGACY_OUTPUT_HANDLE:
+            yield self.yield_static(message, content_type=self.LEGACY_OUTPUT_HANDLE)
 
     def _capture_internal_state(self):
         """Capture SendMessage-specific internal state for debugging."""

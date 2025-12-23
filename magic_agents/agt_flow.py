@@ -340,7 +340,8 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None) -> A
             agt_data['edges'].append({
                 "id": uuid.uuid4().hex,
                 "source": node['id'],
-                "target": void_id
+                "target": void_id,
+                "sourceHandle": "handle_end_output"  # Match NodeEND.DEFAULT_OUTPUT_HANDLE
             })
     
     nodes: Dict[str, Any] = {

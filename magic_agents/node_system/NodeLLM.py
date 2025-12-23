@@ -27,6 +27,8 @@ class NodeLLM(Node):
     # Output handles
     DEFAULT_OUTPUT_CONTENT = 'handle_streaming_content'
     DEFAULT_OUTPUT_GENERATED = 'handle_generated_content'
+    # Legacy output handle for backward compatibility with existing graphs
+    LEGACY_OUTPUT_GENERATED = 'handle_generated_end'
 
     def __init__(self,
                  data: LlmNodeModel,
@@ -94,6 +96,9 @@ class NodeLLM(Node):
             if no_inputs:
                 logger.debug("NodeLLM:%s no inputs provided; yielding empty content", self.node_id)
                 yield self.yield_static('', content_type=self.OUTPUT_HANDLE_GENERATED)
+                # Also yield on legacy handle for backward compatibility
+                if self.OUTPUT_HANDLE_GENERATED != self.LEGACY_OUTPUT_GENERATED:
+                    yield self.yield_static('', content_type=self.LEGACY_OUTPUT_GENERATED)
                 return
             sys_context = params.get(self.INPUT_HANDLER_SYSTEM_CONTEXT)
             chat = ModelChat(extract_message(sys_context) if sys_context else None)
@@ -182,7 +187,12 @@ class NodeLLM(Node):
                     }
                 )
                 return
+        # Yield on the configured output handle
         yield self.yield_static(self.generated, content_type=self.OUTPUT_HANDLE_GENERATED)
+        # Also yield on legacy handle for backward compatibility with existing graphs
+        # This ensures graphs using 'handle_generated_end' still work
+        if self.OUTPUT_HANDLE_GENERATED != self.LEGACY_OUTPUT_GENERATED:
+            yield self.yield_static(self.generated, content_type=self.LEGACY_OUTPUT_GENERATED)
 
     def _capture_internal_state(self):
         """Capture LLM-specific internal state for debugging."""
