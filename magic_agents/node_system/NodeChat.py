@@ -99,8 +99,12 @@ class NodeChat(Node):
         
         # Add Chat-specific variables
         if hasattr(self, 'chat') and self.chat:
-            state['messages_count'] = len(self.chat.messages) if hasattr(self.chat, 'messages') else 0
-            state['has_system_message'] = hasattr(self.chat, 'system') and self.chat.system is not None
+            messages = getattr(self.chat, 'messages', [])
+            state['messages_count'] = len(messages)
+            # Check if system message exists in messages list
+            state['has_system_message'] = any(
+                msg.get('role') == 'system' for msg in messages if isinstance(msg, dict)
+            )
         
         # Capture memory configuration
         state['memory'] = self._memory
