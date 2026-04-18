@@ -3,6 +3,7 @@ import logging
 
 # from magic_agents.agt_flow import build, execute_graph
 from magic_agents.models.factory.Nodes import InnerNodeModel
+from magic_agents.models.factory.Nodes.ConditionalNodeModel import ConditionalSignalTypes
 from magic_agents.node_system.Node import Node
 
 if TYPE_CHECKING:
@@ -44,6 +45,7 @@ class NodeInner(Node):
                     "required_input": self.INPUT_HANDLE
                 }
             )
+            yield {"type": ConditionalSignalTypes.BYPASS_ALL, "content": None}
             return
         
         if self.inner_graph is None:
@@ -55,6 +57,7 @@ class NodeInner(Node):
                     "magic_flow_keys": list(self.magic_flow.keys()) if isinstance(self.magic_flow, dict) else None
                 }
             )
+            yield {"type": ConditionalSignalTypes.BYPASS_ALL, "content": None}
             return
         
         # Update input nodes in the inner graph with the current message
@@ -69,14 +72,24 @@ class NodeInner(Node):
         
         # Execute the inner graph
         from magic_agents.agt_flow import execute_graph
+        from magic_agents.util.const import SYSTEM_EVENT_DEBUG
         content = ''
         extras = []
+        inner_had_error = False
         async for evt in execute_graph(
                 self.inner_graph,
                 id_chat=chat_log.id_chat,
                 id_thread=chat_log.id_thread,
                 id_user=chat_log.id_user
         ):
+            # Propagate debug/error events from inner graph to outer graph
+            if evt.get('type') == SYSTEM_EVENT_DEBUG:
+                yield evt
+                evt_content = evt.get('content', {})
+                if evt_content.get('error_type'):
+                    inner_had_error = True
+                continue
+
             event = evt['content']
             # Check if event is a ChatCompletionModel
             if hasattr(event, 'choices') and event.choices:
@@ -93,7 +106,21 @@ class NodeInner(Node):
                 # For now, we'll skip non-ChatCompletionModel outputs
                 # In a full implementation, you might want to handle these differently
                 pass
-        
+
+        # If inner graph had errors, signal bypass so downstream nodes don't hang
+        if inner_had_error:
+            logger.warning(
+                "NodeInner:%s inner graph had errors — signaling BYPASS_ALL",
+                self.node_id
+            )
+            yield {"type": ConditionalSignalTypes.BYPASS_ALL, "content": None}
+            # Still yield whatever content was collected (may be partial)
+            if content:
+                yield self.yield_static(content, content_type=self.HANDLER_EXECUTION_CONTENT)
+            if extras:
+                yield self.yield_static(extras, content_type=self.HANDLER_EXECUTION_EXTRAS)
+            return
+
         yield self.yield_static(content, content_type=self.HANDLER_EXECUTION_CONTENT)
         if extras:
             yield self.yield_static(extras, content_type=self.HANDLER_EXECUTION_EXTRAS)

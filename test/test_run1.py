@@ -9,7 +9,23 @@ import pytest
 from magic_agents import run_agent
 from magic_agents.agt_flow import build
 
-var_env = json.load(open('/home/andres/Documents/agents_key.json'))
+# Load API keys from environment or configured file path
+_api_keys_file = os.environ.get("MAGIC_AGENTS_API_KEY_FILE", "")
+_api_keys_env = os.environ.get("OPENAI_API_KEY", "")
+_api_keys_serper = os.environ.get("SERPER_API_KEY", "")
+
+if _api_keys_file and os.path.exists(_api_keys_file):
+    var_env = json.load(open(_api_keys_file))
+elif _api_keys_env:
+    var_env = {"openai_key": _api_keys_env, "serper_key": _api_keys_serper}
+else:
+    var_env = {}
+
+# Skip entire module if no API keys available (all tests need real API calls)
+pytestmark = pytest.mark.skipif(
+    'openai_key' not in var_env or 'serper_key' not in var_env,
+    reason="OpenAI and Serper API keys required"
+)
 
 template_str = """
 You are a query rewrite assistant for a search engine. Your task is to analyze user queries and determine if they require browsing for information. If so, you will rewrite the query to optimize it for search. If not, you will return an empty query.
@@ -171,7 +187,7 @@ agt = {
             "data": {
                 "engine": "openai",
                 "api_info": {
-                    "api_key": var_env['openai_key'],
+                    "api_key": var_env.get('openai_key', ''),
                     "base_url": "https://api.openai.com/v1"
                 },
                 "model": "gpt-4.1-mini-2025-04-14"
@@ -203,7 +219,7 @@ agt = {
                 "method": "POST",
                 "headers": {
                     "Content-Type": "application/json",
-                    "X-API-KEY": var_env['serper_key'],
+                    "X-API-KEY": var_env.get('serper_key', ''),
                 },
                 "json_data": {
                     "q": '{{handle_fetch_input}}'
@@ -268,7 +284,9 @@ async def test_run_agent():
             graph=graph,
     ):
         # print(i)
-        print(i['content'].choices[0].delta.content, end='')
+        content = i.get('content')
+        if hasattr(content, 'choices') and content.choices:
+            print(content.choices[0].delta.content, end='')
         # print(i['content'].extras)
         # print(i, end='')
         # print(i)
@@ -388,7 +406,7 @@ agt_2 = {
                 "model": "gpt-4.1-2025-04-14",
                 "engine": "openai",
                 "api_info": {
-                    "api_key": var_env['openai_key'],
+                    "api_key": var_env.get('openai_key', ''),
                     "base_url": "https://api.openai.com/v1"
                 }
             },
@@ -493,7 +511,9 @@ async def test_run_agent_loop():
             graph=graph,
     ):
         # print(i)
-        print(i['content'].choices[0].delta.content, end='')
+        content = i.get('content')
+        if hasattr(content, 'choices') and content.choices:
+            print(content.choices[0].delta.content, end='')
         # print(i['content'].extras)
         # print(i, end='')
         # print(i)

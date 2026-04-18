@@ -15,7 +15,8 @@ ModelAgentFlowType = Literal[
     'void',
     'loop',
     'inner',
-    'conditional'
+    'conditional',
+    'python_exec'
 ]
 
 
@@ -33,6 +34,7 @@ class ModelAgentFlowTypesModel:
     LOOP = 'loop'
     INNER = 'inner'
     CONDITIONAL = 'conditional'
+    PYTHON_EXEC = 'python_exec'
 
 
 class BaseNodeModel(BaseModel):

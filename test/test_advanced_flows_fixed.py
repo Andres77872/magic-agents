@@ -10,8 +10,23 @@ import asyncio
 from magic_agents import run_agent
 from magic_agents.agt_flow import build
 
-# Load API keys from the specified JSON file
-var_env = json.load(open('/home/andres/Documents/agents_key.json'))
+# Load API keys from environment or configured file path
+_api_keys_file = os.environ.get("MAGIC_AGENTS_API_KEY_FILE", "")
+_api_keys_env = os.environ.get("OPENAI_API_KEY", "")
+_api_keys_serper = os.environ.get("SERPER_API_KEY", "")
+
+if _api_keys_file and os.path.exists(_api_keys_file):
+    var_env = json.load(open(_api_keys_file))
+elif _api_keys_env:
+    var_env = {"openai_key": _api_keys_env, "serper_key": _api_keys_serper}
+else:
+    var_env = {}
+
+# All tests in this module need API keys
+pytestmark = pytest.mark.skipif(
+    'openai_key' not in var_env,
+    reason="OpenAI API key required (set OPENAI_API_KEY or MAGIC_AGENTS_API_KEY_FILE)"
+)
 
 
 class TestAdvancedFlowsFixed:
@@ -363,13 +378,15 @@ Reversed: {{ handle_parser_input | reverse }}"""
         async for i in run_agent(graph=graph):
             if isinstance(i, dict) and 'content' in i:
                 content = i['content']
-                node_name = i.get('node', 'Unknown')
+                # Node class is in extras.meta.node_class
+                extras = content.extras if hasattr(content, 'extras') else {}
+                meta = extras.get('meta', {}) if isinstance(extras, dict) else {}
+                node_name = meta.get('node_class', 'Unknown')
                 if hasattr(content, 'choices') and content.choices and content.choices[0].delta.content:
                     response += content.choices[0].delta.content
-                # Only capture extras from SendMessage nodes, not END nodes
-                if node_name == 'NodeSendMessage' and hasattr(content, 'extras') and content.extras:
-                    # Skip if it's just metadata
-                    if not (isinstance(content.extras, dict) and list(content.extras.keys()) == ['meta']):
+                # Capture non-meta extras (actual output data, not just metadata)
+                if hasattr(content, 'extras') and content.extras:
+                    if isinstance(content.extras, dict) and 'text' in content.extras:
                         extras_content = str(content.extras)
         
         print(f"\nParser to SendMessage Response: {response}")
@@ -386,6 +403,14 @@ Reversed: {{ handle_parser_input | reverse }}"""
             "type": "chat",
             "debug": True,
             "edges": [
+                # User input (required by graph validation; not used by this test)
+                {
+                    "id": "ui-to-void",
+                    "source": "user-input",
+                    "target": "end-node",
+                    "sourceHandle": "handle_user_message",
+                    "targetHandle": "handle-5"
+                },
                 {
                     "id": "items-to-loop",
                     "source": "items-text",
@@ -430,6 +455,10 @@ Reversed: {{ handle_parser_input | reverse }}"""
                 }
             ],
             "nodes": [
+                {
+                    "id": "user-input",
+                    "type": "user_input"
+                },
                 {
                     "id": "items-text",
                     "type": "text",
@@ -481,13 +510,15 @@ Total items: {{ handle_parser_input | length }}
         async for i in run_agent(graph=graph):
             if isinstance(i, dict) and 'content' in i:
                 content = i['content']
-                node_name = i.get('node', 'Unknown')
+                # Node class is in extras.meta.node_class
+                extras = content.extras if hasattr(content, 'extras') else {}
+                meta = extras.get('meta', {}) if isinstance(extras, dict) else {}
+                node_name = meta.get('node_class', 'Unknown')
                 if hasattr(content, 'choices') and content.choices and content.choices[0].delta.content:
                     response += content.choices[0].delta.content
-                # Only capture extras from SendMessage nodes, not END nodes
-                if node_name == 'NodeSendMessage' and hasattr(content, 'extras') and content.extras:
-                    # Skip if it's just metadata
-                    if not (isinstance(content.extras, dict) and list(content.extras.keys()) == ['meta']):
+                # Capture non-meta extras (actual output data, not just metadata)
+                if hasattr(content, 'extras') and content.extras:
+                    if isinstance(content.extras, dict) and 'text' in content.extras:
                         extras_content = str(content.extras)
         
         print(f"\nLoop with SendMessage Response: {response}")

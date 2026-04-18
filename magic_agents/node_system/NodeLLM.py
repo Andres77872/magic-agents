@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 import uuid
@@ -27,8 +28,13 @@ class NodeLLM(Node):
     # Output handles
     DEFAULT_OUTPUT_CONTENT = 'handle_streaming_content'
     DEFAULT_OUTPUT_GENERATED = 'handle_generated_content'
+    DEFAULT_OUTPUT_TOOL_CALLS = 'handle-tool-calls'
     # Legacy output handle for backward compatibility with existing graphs
     LEGACY_OUTPUT_GENERATED = 'handle_generated_end'
+    # Tool input handle prefix — dynamic collection from tool-prefixed handles
+    DEFAULT_INPUT_TOOL_PREFIX = 'handle-tool-'
+    # Engines known to NOT support tools via kwargs
+    _UNSUPPORTED_ENGINES = {'google', 'cohere', 'cloudflare'}
 
     def __init__(self,
                  data: LlmNodeModel,
@@ -49,6 +55,9 @@ class NodeLLM(Node):
         # Output handles
         self.OUTPUT_HANDLE_CONTENT = handles.get('output_content', handles.get('streaming', self.DEFAULT_OUTPUT_CONTENT))
         self.OUTPUT_HANDLE_GENERATED = handles.get('output_generated', handles.get('generated', self.DEFAULT_OUTPUT_GENERATED))
+        self.OUTPUT_HANDLE_TOOL_CALLS = handles.get('output_tool_calls', self.DEFAULT_OUTPUT_TOOL_CALLS)
+        # Tool input handle prefix (configurable via JSON data.handles.tool_prefix)
+        self.INPUT_TOOL_PREFIX = handles.get('tool_prefix', self.DEFAULT_INPUT_TOOL_PREFIX)
         # allow re-execution inside Loop when requested
         self.iterate = getattr(data, 'iterate', False)
         self.stream = data.stream
@@ -61,6 +70,61 @@ class NodeLLM(Node):
             self.extra_data['top_p'] = data.top_p
         if 'max_tokens' not in self.extra_data and data.max_tokens is not None:
             self.extra_data['max_tokens'] = data.max_tokens
+
+    def _collect_tools(self) -> tuple[list, dict]:
+        """Collect all tool definitions from tool-prefixed input handles.
+
+        Scans self.inputs for keys starting with the tool prefix.
+        Returns a tuple of (tools_schemas, tool_functions):
+          - tools_schemas: list of OpenAI-compatible tool definition dicts
+          - tool_functions: dict mapping tool name -> callable executor
+
+        For objects conforming to the ToolProvider protocol, extracts
+        both tool_schema and tool_callable. For plain callables, uses
+        normalize_openai_tools for schema extraction. For plain dicts,
+        uses them as-is (schema-only, no executor).
+        """
+        tools_schemas = []
+        tool_functions = {}
+
+        for handle_name, value in sorted(self.inputs.items()):
+            if not handle_name.startswith(self.INPUT_TOOL_PREFIX):
+                continue
+            if value is None:
+                continue
+
+            if hasattr(value, 'tool_schema') and hasattr(value, 'tool_callable'):
+                # ToolProvider protocol: explicit schema + optional callable
+                tools_schemas.append(value.tool_schema)
+                if value.tool_callable is not None:
+                    name = getattr(value.tool_callable, '__name__', None)
+                    if name:
+                        tool_functions[name] = value.tool_callable
+            elif callable(value) and not isinstance(value, dict):
+                # Plain callable: schema auto-extracted by magic-llm
+                tools_schemas.append(value)
+                name = getattr(value, '__name__', None)
+                if name:
+                    tool_functions[name] = value
+            elif isinstance(value, dict):
+                # Schema-only dict (no executor)
+                tools_schemas.append(value)
+
+        return tools_schemas, tool_functions
+
+    def _warn_unsupported_engine(self, client) -> None:
+        """Log a warning if the configured engine does not support tools."""
+        engine = getattr(client.llm, 'engine_name', '') or getattr(client, 'engine', '')
+        engine_lower = (engine or '').lower()
+        for unsupported in self._UNSUPPORTED_ENGINES:
+            if unsupported in engine_lower:
+                logger.warning(
+                    "NodeLLM:%s engine '%s' does not support tools — "
+                    "tools will be passed but may be ignored by the provider. "
+                    "This is a known limitation (WIP).",
+                    self.node_id, engine
+                )
+                break
 
     async def process(self, chat_log):
         params = self.inputs
@@ -117,10 +181,71 @@ class NodeLLM(Node):
                 )
                 return
 
+        # Collect tools from tool-prefixed input handles
+        tools_schemas, tool_functions = self._collect_tools()
+
+        # Track tool calls for the handle-tool-calls output
+        final_tool_calls: list = []
+
         if not self.stream:
             logger.info("NodeLLM:%s generating (non-stream) with model=%s", self.node_id, client.llm.model)
-            intention = await client.llm.async_generate(chat, **self.extra_data)
-            self.generated = intention.content
+
+            if tool_functions:
+                # Tool-enabled path: delegate to magic-llm's canonical agent loop
+                self._warn_unsupported_engine(client)
+
+                user_msg = extract_message(self.get_input(self.INPUT_HANDLER_USER_MESSAGE, ''))
+                sys_msg = None
+                if sys_ctx := self.get_input(self.INPUT_HANDLER_SYSTEM_CONTEXT):
+                    sys_msg = extract_message(sys_ctx)
+
+                if not hasattr(client, 'run_agent_async'):
+                    # Fallback: wrap sync run_agent via asyncio.to_thread
+                    logger.warning(
+                        "NodeLLM:%s async agent loop not available in installed magic-llm version — "
+                        "falling back to sync run_agent() via asyncio.to_thread(). "
+                        "Upgrade magic-llm for native async support.",
+                        self.node_id
+                    )
+                    if not hasattr(client, 'run_agent'):
+                        raise RuntimeError(
+                            f"NodeLLM:{self.node_id} has callable tools but magic-llm does not "
+                            f"provide client.run_agent_async() or client.run_agent(). Upgrade magic-llm."
+                        )
+                    intention = await asyncio.to_thread(
+                        client.run_agent,
+                        user_input=user_msg,
+                        system_prompt=sys_msg,
+                        tools=tools_schemas,
+                        tool_functions=tool_functions,
+                        **self.extra_data
+                    )
+                else:
+                    intention = await client.run_agent_async(
+                        user_input=user_msg,
+                        system_prompt=sys_msg,
+                        tools=tools_schemas,
+                        tool_functions=tool_functions,
+                        **self.extra_data
+                    )
+                self.generated = intention.content
+                final_tool_calls = getattr(intention, 'tool_calls', []) or []
+
+            elif tools_schemas:
+                # Schema-only tools: single generate call (LLM can reference tools but no executor)
+                self._warn_unsupported_engine(client)
+                intention = await client.llm.async_generate(
+                    chat, tools=tools_schemas, **self.extra_data
+                )
+                self.generated = intention.content
+                final_tool_calls = getattr(intention, 'tool_calls', []) or []
+
+            else:
+                # Existing path: no tools, single generation call
+                intention = await client.llm.async_generate(chat, **self.extra_data)
+                self.generated = intention.content
+                final_tool_calls = getattr(intention, 'tool_calls', []) or []
+
             yield self.yield_static(ChatCompletionModel(
                 id=uuid.uuid4().hex,
                 model=client.llm.model,
@@ -129,9 +254,78 @@ class NodeLLM(Node):
                 content_type=self.OUTPUT_HANDLE_CONTENT)
         else:
             logger.info("NodeLLM:%s streaming generation with model=%s", self.node_id, client.llm.model)
-            async for i in client.llm.async_stream_generate(chat, **self.extra_data):
-                self.generated += i.choices[0].delta.content or ''
-                yield self.yield_static(i, content_type=self.OUTPUT_HANDLE_CONTENT)
+
+            if tool_functions:
+                # Streaming tool-enabled path
+                self._warn_unsupported_engine(client)
+
+                user_msg = extract_message(self.get_input(self.INPUT_HANDLER_USER_MESSAGE, ''))
+                sys_msg = None
+                if sys_ctx := self.get_input(self.INPUT_HANDLER_SYSTEM_CONTEXT):
+                    sys_msg = extract_message(sys_ctx)
+
+                if not hasattr(client, 'run_agent_stream_async'):
+                    # Fallback: wrap sync run_agent_stream via asyncio.to_thread
+                    logger.warning(
+                        "NodeLLM:%s async streaming agent loop not available in installed magic-llm version — "
+                        "falling back to sync run_agent_stream() via asyncio.to_thread(). "
+                        "Upgrade magic-llm for native async support.",
+                        self.node_id
+                    )
+                    if not hasattr(client, 'run_agent_stream'):
+                        raise RuntimeError(
+                            f"NodeLLM:{self.node_id} has callable tools with streaming but magic-llm does not "
+                            f"provide client.run_agent_stream_async() or client.run_agent_stream(). Upgrade magic-llm."
+                        )
+
+                    last_chunk = None
+                    for chunk in await asyncio.to_thread(
+                        client.run_agent_stream,
+                        user_input=user_msg,
+                        system_prompt=sys_msg,
+                        tools=tools_schemas,
+                        tool_functions=tool_functions,
+                        **self.extra_data
+                    ):
+                        self.generated += chunk.choices[0].delta.content or ''
+                        last_chunk = chunk
+                        yield self.yield_static(chunk, content_type=self.OUTPUT_HANDLE_CONTENT)
+                    if last_chunk:
+                        final_tool_calls = getattr(last_chunk.choices[0].delta, 'tool_calls', []) or []
+                else:
+                    last_chunk = None
+                    async for chunk in client.run_agent_stream_async(
+                        user_input=user_msg,
+                        system_prompt=sys_msg,
+                        tools=tools_schemas,
+                        tool_functions=tool_functions,
+                        **self.extra_data
+                    ):
+                        self.generated += chunk.choices[0].delta.content or ''
+                        last_chunk = chunk
+                        yield self.yield_static(chunk, content_type=self.OUTPUT_HANDLE_CONTENT)
+                    # Capture tool_calls from the last chunk
+                    if last_chunk:
+                        final_tool_calls = getattr(last_chunk.choices[0].delta, 'tool_calls', []) or []
+            elif tools_schemas:
+                # Schema-only tools with streaming
+                self._warn_unsupported_engine(client)
+                last_chunk = None
+                async for i in client.llm.async_stream_generate(chat, tools=tools_schemas, **self.extra_data):
+                    self.generated += i.choices[0].delta.content or ''
+                    last_chunk = i
+                    yield self.yield_static(i, content_type=self.OUTPUT_HANDLE_CONTENT)
+                if last_chunk:
+                    final_tool_calls = getattr(last_chunk.choices[0].delta, 'tool_calls', []) or []
+            else:
+                # Existing streaming path: no tools
+                last_chunk = None
+                async for i in client.llm.async_stream_generate(chat, **self.extra_data):
+                    self.generated += i.choices[0].delta.content or ''
+                    last_chunk = i
+                    yield self.yield_static(i, content_type=self.OUTPUT_HANDLE_CONTENT)
+                if last_chunk:
+                    final_tool_calls = getattr(last_chunk.choices[0].delta, 'tool_calls', []) or []
         # if self.json_output:
         #     print(self.generated)
         #     self.generated = json.loads(self.generated)
@@ -187,6 +381,9 @@ class NodeLLM(Node):
                     }
                 )
                 return
+        # Yield tool calls on dedicated handle ONLY when tools are present (zero-regression for no-tool graphs)
+        if tools_schemas or tool_functions:
+            yield self.yield_static(final_tool_calls, content_type=self.OUTPUT_HANDLE_TOOL_CALLS)
         # Yield on the configured output handle
         yield self.yield_static(self.generated, content_type=self.OUTPUT_HANDLE_GENERATED)
         # Also yield on legacy handle for backward compatibility with existing graphs

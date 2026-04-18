@@ -23,6 +23,7 @@ DEFAULT_TOTAL_TIMEOUT_MS = 300000
 from magic_llm.model.ModelChatStream import ChatCompletionModel
 
 from magic_agents.execution.event_dispatcher import GraphEventDispatcher, NodeState
+from magic_agents.execution.conditional_routing import ConditionalRouting
 from magic_agents.models.factory.AgentFlowModel import AgentFlowModel
 from magic_agents.models.model_agent_run_log import ModelAgentRunLog
 from magic_agents.models.debug_feedback import GraphDebugFeedback
@@ -98,7 +99,8 @@ def find_iteration_subgraph(
 def topological_sort_iteration(
     iteration_nodes: Set[str],
     item_edges: List[Any],
-    loop_back_edges: List[Any]
+    loop_back_edges: List[Any],
+    all_edges: List[Any] = None,
 ) -> List[str]:
     """
     Sort iteration nodes in execution order using Kahn's algorithm.
@@ -107,6 +109,8 @@ def topological_sort_iteration(
         iteration_nodes: Set of node IDs in the iteration subgraph
         item_edges: Edges from loop handle_item to downstream nodes
         loop_back_edges: Edges that feed back to loop handle_loop
+        all_edges: All graph edges (optional) — used to discover internal
+            edges between iteration nodes (e.g. conditional branches).
         
     Returns:
         List of node IDs in topological execution order
@@ -120,6 +124,15 @@ def topological_sort_iteration(
         if edge.source in iteration_nodes and edge.target in iteration_nodes:
             adjacency[edge.source].append(edge.target)
             in_degree[edge.target] += 1
+    
+    # Also include edges between iteration nodes from the full edge list
+    # (e.g. conditional → branch edges that aren't item_edges or loop_back_edges)
+    if all_edges is not None:
+        for edge in all_edges:
+            if (edge.source in iteration_nodes and edge.target in iteration_nodes
+                    and edge not in relevant_edges):
+                adjacency[edge.source].append(edge.target)
+                in_degree[edge.target] += 1
     
     # Also consider edges where source is NOT in iteration_nodes but target is
     # (these are the entry points from handle_item)
@@ -258,8 +271,17 @@ async def execute_graph_reactive(
     Yields:
         Streaming content and final outputs from nodes
     """
-    # Check for validation errors
+    # Check for validation errors — fail fast on blocking errors before starting execution
     if hasattr(graph, '_validation_errors') and graph._validation_errors:
+        # Only block on structural graph errors that make execution impossible.
+        # Conditional routing errors (MissingConditionalEdge, etc.) are handled
+        # at runtime via bypass propagation and should NOT block execution.
+        blocking_types = {'GraphValidationError'}
+        blocking_errors = [
+            e for e in graph._validation_errors
+            if e.get('error_type') in blocking_types
+            or e.get('type') in blocking_types
+        ]
         for error in graph._validation_errors:
             yield {
                 "type": SYSTEM_EVENT_DEBUG,
@@ -268,6 +290,9 @@ async def execute_graph_reactive(
                     "timestamp": datetime.now(UTC).isoformat()
                 }
             }
+        if blocking_errors:
+            logger.error("Aborting execution: %d blocking validation error(s)", len(blocking_errors))
+            return
     
     # Detect loop nodes - delegate to loop handler
     from magic_agents.node_system import NodeLoop
@@ -317,9 +342,6 @@ async def execute_graph_reactive(
     
     # Output queue for collecting results from parallel tasks
     output_queue: asyncio.Queue = asyncio.Queue()
-    
-    # Import NodeConditional for type checking
-    from magic_agents.node_system import NodeConditional
     
     async def execute_single_node(node_id: str):
         """Execute a single node when ready."""
@@ -379,13 +401,15 @@ async def execute_graph_reactive(
                     # Queue debug info
                     await output_queue.put(item)
                 elif ConditionalSignalTypes.is_system_signal(item_type):
-                    # Other system signals - log and continue
+                    # Track BYPASS_ALL for post-loop handling
+                    if item_type == ConditionalSignalTypes.BYPASS_ALL:
+                        bypass_all_signaled = True
                     logger.debug("Node %s emitted system signal: %s", node_id, item_type)
                 else:
                     # Handle-specific output (conditional routing, etc.)
                     node.outputs[item_type] = item["content"]
                     # Track conditional selection (only non-system signals)
-                    if isinstance(node, NodeConditional) and conditional_selected_handle is None:
+                    if isinstance(node, ConditionalRouting) and conditional_selected_handle is None:
                         if item_type not in (SYSTEM_EVENT_DEBUG, SYSTEM_EVENT_DEBUG_SUMMARY):
                             conditional_selected_handle = item_type
             
@@ -405,8 +429,11 @@ async def execute_graph_reactive(
             # Propagate outputs to downstream nodes
             await dispatcher.propagate_outputs(node_id, node.outputs)
             
+            # Handle BYPASS_ALL from any node (conditional or non-conditional)
+            if bypass_all_signaled:
+                await dispatcher.handle_bypass_all_signal(node_id)
             # Handle conditional bypass propagation (skip if BYPASS_ALL was already handled)
-            if isinstance(node, NodeConditional) and not bypass_all_signaled:
+            elif isinstance(node, ConditionalRouting):
                 selected_handle = conditional_selected_handle or getattr(node, 'selected_handle', None)
                 if selected_handle:
                     # Verify edge exists for selected handle
@@ -414,28 +441,29 @@ async def execute_graph_reactive(
                     has_matching_edge = any(e.sourceHandle == selected_handle for e in outgoing)
                     
                     if not has_matching_edge:
-                        # No matching edge - check for default_handle fallback
-                        default_handle = getattr(node, 'default_handle', None)
-                        if default_handle and any(e.sourceHandle == default_handle for e in outgoing):
-                            logger.warning(
-                                "Using default_handle '%s' after routing error for node %s",
-                                default_handle, node_id
-                            )
-                            selected_handle = default_handle
-                            await dispatcher.propagate_conditional_bypass(node_id, selected_handle)
-                        else:
-                            # No matching edge and no valid default - yield error and bypass all
-                            await output_queue.put(node.yield_debug_error(
-                                error_type="GraphRoutingError",
-                                error_message=f"Conditional selected handle '{selected_handle}', but no outgoing edge matches.",
-                                context={
-                                    "selected_handle": selected_handle,
-                                    "outgoing_handles": [e.sourceHandle for e in outgoing],
-                                    "node_id": node_id,
-                                    "suggestion": "Add output_handles to conditional data for build-time validation"
-                                }
-                            ))
-                            await dispatcher.handle_bypass_all_signal(node_id)
+                        # Selected handle has no matching edge — this is a routing error.
+                        # The conditional emitted output on a handle that no downstream node
+                        # is listening to. All downstream nodes must be bypassed to prevent
+                        # them from hanging forever waiting for data that will never arrive.
+                        #
+                        # NOTE: We do NOT fall back to default_handle here. The default_handle
+                        # is designed for when the condition evaluates to EMPTY (handled in
+                        # NodeConditional.process()), not for when it evaluates to a
+                        # non-existent handle. Falling back to default_handle would leave
+                        # nodes on the default path in selected_targets (not bypassed) but
+                        # without data, causing an indefinite hang.
+                        await output_queue.put(node.yield_debug_error(
+                            error_type="GraphRoutingError",
+                            error_message=f"Conditional selected handle '{selected_handle}', but no outgoing edge matches.",
+                            context={
+                                "selected_handle": selected_handle,
+                                "outgoing_handles": [e.sourceHandle for e in outgoing],
+                                "node_id": node_id,
+                                "default_handle": getattr(node, 'default_handle', None),
+                                "suggestion": "Ensure the condition template evaluates to a handle name that has a corresponding outgoing edge."
+                            }
+                        ))
+                        await dispatcher.handle_bypass_all_signal(node_id)
                     else:
                         await dispatcher.propagate_conditional_bypass(node_id, selected_handle)
         
@@ -547,8 +575,17 @@ async def execute_graph_loop_reactive(
     import json
     from magic_agents.node_system import NodeLoop
     
-    # Check for validation errors
+    # Check for validation errors — fail fast on blocking errors before starting execution
     if hasattr(graph, '_validation_errors') and graph._validation_errors:
+        # Only block on structural graph errors that make execution impossible.
+        # Conditional routing errors (MissingConditionalEdge, etc.) are handled
+        # at runtime via bypass propagation and should NOT block execution.
+        blocking_types = {'GraphValidationError'}
+        blocking_errors = [
+            e for e in graph._validation_errors
+            if e.get('error_type') in blocking_types
+            or e.get('type') in blocking_types
+        ]
         for error in graph._validation_errors:
             yield {
                 "type": SYSTEM_EVENT_DEBUG,
@@ -557,6 +594,9 @@ async def execute_graph_loop_reactive(
                     "timestamp": datetime.now(UTC).isoformat()
                 }
             }
+        if blocking_errors:
+            logger.error("Aborting loop execution: %d blocking validation error(s)", len(blocking_errors))
+            return
     
     nodes = graph.nodes
     chat_log = ModelAgentRunLog(
@@ -649,9 +689,6 @@ async def execute_graph_loop_reactive(
                         "type": SYSTEM_EVENT_DEBUG,
                         "content": node_debug_info.model_dump()
                     }
-    
-    # Import NodeConditional for type checking in static phase
-    from magic_agents.node_system import NodeConditional
     
     # Track bypassed nodes during static phase
     bypassed_nodes: Set[str] = set()
@@ -748,7 +785,7 @@ async def execute_graph_loop_reactive(
         if node_id in bypassed_nodes:
             logger.debug("Skipping bypassed node %s", node_id)
             continue
-        
+
         # Apply inputs from completed static nodes
         for edge in static_edges:
             if edge.target == node_id:
@@ -757,14 +794,33 @@ async def execute_graph_loop_reactive(
                 if source_node and target_node and source_node.outputs:
                     if edge.sourceHandle in source_node.outputs:
                         target_node.add_parent(source_node.outputs, edge.sourceHandle, edge.targetHandle)
-        
+
+        # Skip conditional nodes that have no inputs — their inputs come from
+        # the loop's iteration output (handle_item) which isn't available yet.
+        # They will be executed during the iteration phase instead.
+        # Use hasattr for pre-execution detection (selected_handle not set yet).
+        node_obj = nodes.get(node_id)
+        if hasattr(node_obj, 'condition_template'):
+            cond_node = node_obj
+            has_inputs = any(
+                cond_node.inputs.get(h) is not None
+                for h in cond_node.inputs.keys()
+            )
+            if not has_inputs:
+                logger.debug(
+                    "Skipping conditional %s in static phase — no inputs yet "
+                    "(depends on loop iteration output)",
+                    node_id,
+                )
+                continue
+
         # Execute the node
         async for out in execute_node_inline(node_id, static_edges):
             yield out
         
         # Handle conditional bypass propagation
         node = nodes.get(node_id)
-        if isinstance(node, NodeConditional):
+        if isinstance(node, ConditionalRouting):
             selected_handle = getattr(node, 'selected_handle', None)
             if selected_handle:
                 handle_conditional_bypass_static(node_id, selected_handle)
@@ -852,7 +908,7 @@ async def execute_graph_loop_reactive(
         logger.info("Loop iterating over %d items", len(items))
         
         # Get topological order for iteration execution
-        execution_order = topological_sort_iteration(iteration_subgraph, item_edges, loop_back_edges)
+        execution_order = topological_sort_iteration(iteration_subgraph, item_edges, loop_back_edges, all_edges)
         logger.debug("Iteration execution order: %s", execution_order)
         
         # Find the feedback-producing node (the one that feeds back to handle_loop)
@@ -902,6 +958,39 @@ async def execute_graph_loop_reactive(
             # Reset ALL nodes in the iteration subgraph (not just immediate downstream)
             reset_iteration_nodes(nodes, iteration_subgraph)
             
+            # Track bypassed nodes WITHIN this iteration (reset each iteration).
+            # When a conditional selects one branch, all other branches and their
+            # downstream nodes must be skipped.
+            iteration_bypassed: Set[str] = set()
+            
+            def propagate_bypass_iteration(from_node_id: str):
+                """Mark downstream nodes as bypassed within the iteration subgraph.
+                
+                Transitively marks all nodes reachable from from_node_id via
+                edges within the iteration subgraph as bypassed.
+                """
+                if from_node_id in iteration_bypassed:
+                    return
+                iteration_bypassed.add(from_node_id)
+                node = nodes.get(from_node_id)
+                if node and hasattr(node, 'mark_bypassed'):
+                    node.mark_bypassed()
+                logger.debug("Iteration %d: bypassing node %s", idx, from_node_id)
+                # Propagate to downstream nodes within iteration subgraph
+                for edge in all_edges:
+                    if edge.source == from_node_id and edge.target in iteration_subgraph:
+                        propagate_bypass_iteration(edge.target)
+            
+            def bypass_non_selected_conditional_branches(cond_node_id: str, selected_handle: str):
+                """After a conditional executes, bypass all non-selected branches."""
+                for edge in all_edges:
+                    if edge.source == cond_node_id and edge.sourceHandle != selected_handle:
+                        logger.debug(
+                            "Iteration %d: conditional %s selected '%s', bypassing '%s' -> %s",
+                            idx, cond_node_id, selected_handle, edge.sourceHandle, edge.target
+                        )
+                        propagate_bypass_iteration(edge.target)
+            
             # Set current item as loop output - PRESERVING TYPE (Issue #4 fix)
             loop_node.outputs[loop_node.OUTPUT_HANDLE_ITEM] = prepare_item_output(item, idx)
             
@@ -918,25 +1007,50 @@ async def execute_graph_loop_reactive(
                 if not node:
                     continue
                 
+                # Skip nodes bypassed by conditional branch selection in this iteration
+                if node_id in iteration_bypassed:
+                    logger.debug("Skipping bypassed iteration node %s", node_id)
+                    continue
+                
                 # Apply inputs from any edges where source has completed
-                for edge in item_edges + loop_back_edges:
+                # Use all_edges to capture conditional branch edges too
+                for edge in all_edges:
                     if edge.target == node_id:
                         source_node = nodes.get(edge.source)
                         # Source could be loop node or another iteration node
+                        # Don't apply inputs from bypassed sources
+                        if edge.source in iteration_bypassed:
+                            continue
                         if edge.source == loop_id:
                             node.add_parent(loop_node.outputs, edge.sourceHandle, edge.targetHandle)
                         elif source_node and source_node.outputs:
                             node.add_parent(source_node.outputs, edge.sourceHandle, edge.targetHandle)
                 
                 # Execute the node and WAIT for completion
-                async for out in execute_node_inline(node_id, item_edges + loop_back_edges):
+                async for out in execute_node_inline(node_id, all_edges):
                     yield out
                 
+                # After execution, handle conditional bypass propagation
+                if isinstance(node, ConditionalRouting):
+                    selected_handle = getattr(node, 'selected_handle', None)
+                    if selected_handle:
+                        bypass_non_selected_conditional_branches(node_id, selected_handle)
+                        logger.debug(
+                            "Iteration %d: conditional %s selected '%s', bypassed: %s",
+                            idx, node_id, selected_handle, iteration_bypassed
+                        )
+                
                 # After execution, propagate outputs to downstream nodes in subgraph
-                for edge in item_edges + loop_back_edges:
+                # Use all_edges to capture conditional branch edges too.
+                # Also propagate to loop node via loop-back edges (loop is NOT in iteration_subgraph
+                # but needs to receive feedback).
+                for edge in all_edges:
                     if edge.source == node_id:
+                        # Only propagate to nodes in the iteration subgraph or the loop node itself
+                        if edge.target not in iteration_subgraph and edge.target != loop_id:
+                            continue
                         target = nodes.get(edge.target)
-                        if target and node.outputs:
+                        if target and node.outputs and edge.target not in iteration_bypassed:
                             target.add_parent(node.outputs, edge.sourceHandle, edge.targetHandle)
             
             # NOW collect the feedback AFTER all processing is complete (Issue #1 fix)

@@ -4,6 +4,7 @@ from typing import Optional
 
 from magic_agents.models.factory.Nodes import ClientNodeModel
 from magic_agents.node_system.Node import Node
+from magic_agents.util.env_resolver import resolve_env_placeholders, resolve_env_string
 from magic_llm import MagicLLM
 
 logger = logging.getLogger(__name__)
@@ -46,15 +47,17 @@ class NodeClientLLM(Node):
             if raw_api_info is None or raw_api_info == "":
                 api_info = {}
             elif isinstance(raw_api_info, dict):
-                api_info = raw_api_info
+                api_info = resolve_env_placeholders(raw_api_info)
             else:
-                api_info = json.loads(raw_api_info)
+                api_info = json.loads(resolve_env_string(raw_api_info))
+
+            extra_data = resolve_env_placeholders(data.extra_data)
 
             args = {
                 'engine': data.engine,
                 'model': data.model,
                 **api_info,
-                **data.extra_data
+                **extra_data
             }
 
             # MagicLLM uses `private_key` but many configs provide `api_key`

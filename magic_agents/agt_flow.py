@@ -28,6 +28,7 @@ from magic_agents.models.factory.Nodes import (
     BaseNodeModel,
     InnerNodeModel,
     ConditionalNodeModel,
+    PythonExecNodeModel,
 )
 from magic_agents.models.model_agent_run_log import ModelAgentRunLog
 from magic_agents.node_system import (
@@ -43,6 +44,7 @@ from magic_agents.node_system import (
     NodeLoop,
     NodeInner,
     NodeConditional,
+    NodePythonExec,
     sort_nodes,
 )
 from magic_agents.execution import (
@@ -50,9 +52,68 @@ from magic_agents.execution import (
     execute_graph_loop_reactive,
 )
 from magic_agents.util.const import HANDLE_VOID
+from magic_agents.util.env_resolver import resolve_env_placeholders
 from magic_agents.util.graph_validator import ConditionalEdgeValidator
 
 logger = logging.getLogger(__name__)
+
+# Node types that can provide tools to LLM nodes
+_TOOL_CAPABLE_TYPES = {ModelAgentFlowTypesModel.FETCH, 'python_exec'}
+
+
+def _assign_tool_handles(nodes: list[dict], edges: list[dict]) -> None:
+    """Auto-generate unique targetHandle values for tool->LLM edges.
+
+    For each edge where the source node is tool-capable (fetch with tool_mode=true,
+    python_exec) and the target node is an LLM node, assigns a deterministic unique
+    targetHandle: handle-tool-definition-0, handle-tool-definition-1, etc.
+
+    Also sets sourceHandle to the source node's resolved output handle so that
+    propagate_outputs() can correctly route tool outputs to LLM inputs.
+
+    The counter is per-LLM-node, so each LLM node gets its own sequence.
+    targetHandle is only auto-assigned when not already explicit.
+    sourceHandle is always backfilled for tool-capable edges (preserving existing values).
+    """
+    node_map = {n['id']: n for n in nodes}
+    tool_counters: dict[str, int] = {}  # LLM node ID -> counter
+
+    for edge in edges:
+        target_node = node_map.get(edge.get('target'))
+        source_node = node_map.get(edge.get('source'))
+        if not (target_node and target_node.get('type') == ModelAgentFlowTypesModel.LLM):
+            continue
+        if not source_node:
+            continue
+
+        source_type = source_node.get('type')
+        if source_type not in _TOOL_CAPABLE_TYPES:
+            continue
+
+        source_data = source_node.get('data', {})
+
+        # For fetch nodes, only assign tool handles when tool_mode is true
+        if source_type == ModelAgentFlowTypesModel.FETCH:
+            if not source_data.get('tool_mode', False):
+                continue
+
+        # Resolve the source node's output handle and backfill sourceHandle
+        # (always done for tool-capable edges, preserving existing values)
+        handles = source_data.get('handles', {})
+        if source_type == ModelAgentFlowTypesModel.FETCH:
+            # Fetch: output → response → default
+            resolved_handle = handles.get('output', handles.get('response', 'handle_fetch_output'))
+        else:
+            # python_exec: output → default
+            resolved_handle = handles.get('output', 'handle-tool-definition')
+        edge.setdefault('sourceHandle', resolved_handle)
+
+        # Only auto-assign targetHandle when not already explicit
+        if not edge.get('targetHandle'):
+            llm_id = edge['target']
+            idx = tool_counters.get(llm_id, 0)
+            edge['targetHandle'] = f'handle-tool-definition-{idx}'
+            tool_counters[llm_id] = idx + 1
 
 
 def create_node(node: dict, load_chat: Callable, debug: bool = False) -> Any:
@@ -97,6 +158,7 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False) -> Any:
         ModelAgentFlowTypesModel.CONDITIONAL: (NodeConditional, ConditionalNodeModel),
         ModelAgentFlowTypesModel.INNER: (NodeInner, InnerNodeModel),
         ModelAgentFlowTypesModel.VOID: (NodeEND, None),
+        'python_exec': (NodePythonExec, PythonExecNodeModel),
     }
     
     if node_type not in node_map:
@@ -264,6 +326,34 @@ def validate_graph(nodes: list[dict], edges: list[dict]) -> dict:
     else:
         logger.info("Validation passed: No duplicate edges found (total edges: %d)", len(edges))
     
+    # Validation 3: Edge connectivity — source and target nodes must exist
+    node_ids = {node['id'] for node in nodes}
+    for edge in edges:
+        source = edge.get('source')
+        target = edge.get('target')
+        edge_id = edge.get('id', 'unknown')
+        
+        if source not in node_ids:
+            errors.append({
+                "error_type": "InvalidEdgeSource",
+                "error_message": f"Edge '{edge_id}' references non-existent source node: '{source}'",
+                "context": {"edge_id": edge_id, "source": source, "target": target}
+            })
+        
+        if target not in node_ids:
+            errors.append({
+                "error_type": "InvalidEdgeTarget",
+                "error_message": f"Edge '{edge_id}' references non-existent target node: '{target}'",
+                "context": {"edge_id": edge_id, "source": source, "target": target}
+            })
+        
+        if source == target:
+            errors.append({
+                "error_type": "SelfLoopEdge",
+                "error_message": f"Edge '{edge_id}' creates a self-loop on node: '{source}'",
+                "context": {"edge_id": edge_id, "node_id": source}
+            })
+    
     # Note: Multiple END nodes are allowed (no validation needed)
     end_nodes = [node for node in nodes if node['type'] == ModelAgentFlowTypesModel.END]
     logger.info("Graph contains %d END node(s) (multiple END nodes are allowed)", len(end_nodes))
@@ -306,6 +396,8 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None) -> A
                 graph_data[key] = agt_data[key]
         agt_data = graph_data
     
+    agt_data = resolve_env_placeholders(agt_data)
+
     # Validate the graph structure before building
     validation_result = validate_graph(agt_data['nodes'], agt_data['edges'])
     
@@ -316,6 +408,22 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None) -> A
         logger.error("Graph validation failed with %d error(s)", len(validation_errors))
         for err in validation_errors:
             logger.error("  - %s: %s", err['error_type'], err['error_message'])
+    
+    # Filter out edges with invalid source/target or self-loops before sort_nodes to prevent crashes
+    node_ids = {node['id'] for node in agt_data['nodes']}
+    valid_edges = [
+        e for e in agt_data['edges']
+        if e.get('source') in node_ids
+        and e.get('target') in node_ids
+        and e.get('source') != e.get('target')  # Reject self-loops
+    ]
+    if len(valid_edges) != len(agt_data['edges']):
+        dropped = len(agt_data['edges']) - len(valid_edges)
+        logger.warning("Dropped %d edge(s) with invalid references (missing source/target or self-loop)", dropped)
+        agt_data['edges'] = valid_edges
+    
+    # Auto-generate unique targetHandle values for tool->LLM edges
+    _assign_tool_handles(agt_data['nodes'], agt_data['edges'])
     
     nodes, edges = sort_nodes(agt_data['nodes'], agt_data['edges'])
     agt_data['nodes'] = nodes
@@ -351,6 +459,14 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None) -> A
     # Build inner graphs for NodeInner nodes
     for node_id, node_instance in nodes.items():
         if isinstance(node_instance, NodeInner):
+            # Skip if magic_flow is missing or empty
+            if not node_instance.magic_flow:
+                logger.warning(
+                    "NodeInner '%s' has no magic_flow — inner graph will not be built. "
+                    "Execution will yield a ConfigurationError.",
+                    node_id,
+                )
+                continue
             # Build the inner graph from the magic_flow dict
             inner_graph = build(
                 node_instance.magic_flow,

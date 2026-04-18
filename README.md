@@ -9,8 +9,9 @@ and execute them in order, streaming results back as they arrive.
 
 ## Documentation
 
-Full architecture diagrams, node reference, and details on the compile/execute pipeline live in the
-[`docs/`](docs/) folder. Start with [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for a guided tour.
+Full architecture diagrams, node reference, and execution details live in the
+[`docs/`](docs/) folder. Start with the [wiki home](docs/wiki/README.md) or the
+[architecture and execution model guide](docs/wiki/ARCHITECTURE_AND_EXECUTION_MODEL.md).
 
 
 ## Features

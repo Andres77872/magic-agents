@@ -10,6 +10,8 @@ from jinja2 import UndefinedError, TemplateSyntaxError, TemplateError
 
 from magic_agents.node_system.Node import Node
 from magic_agents.models.factory.Nodes.ConditionalNodeModel import ConditionalSignalTypes
+from magic_agents.execution.condition_evaluator import ConditionEvaluator
+from magic_agents.execution.condition_evaluator_jinja2 import Jinja2Evaluator
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +61,7 @@ class NodeConditional(Node):
         handles: Optional[dict] = None,
         output_handles: Optional[List[str]] = None,
         default_handle: Optional[str] = None,
+        evaluator: Optional[ConditionEvaluator] = None,
         **kwargs
     ):
         self.condition_template = condition
@@ -66,6 +69,9 @@ class NodeConditional(Node):
         self.output_handles = output_handles
         self.default_handle = default_handle
         self.init_error = None
+        
+        # Set up the condition evaluator (default: Jinja2Evaluator)
+        self._evaluator: ConditionEvaluator = evaluator or Jinja2Evaluator()
         
         # Track key sources for collision detection
         self._key_sources: Dict[str, str] = {}
@@ -83,6 +89,7 @@ class NodeConditional(Node):
         super().__init__(**kwargs)
 
         # Pre-compile template for efficiency (only if condition is valid)
+        # This is kept for backward compatibility — the evaluator handles actual evaluation.
         if self.condition_template:
             env = jinja2.Environment()
             self._template = env.from_string(self.condition_template)
@@ -239,10 +246,10 @@ class NodeConditional(Node):
             yield {"type": ConditionalSignalTypes.BYPASS_ALL, "content": None}
             return
 
-        # Evaluate the condition template
+        # Evaluate the condition template using the configured evaluator
         try:
-            selected_handle = str(self._template.render(**render_ctx)).strip()
-        except jinja2.UndefinedError as e:
+            selected_handle = self._evaluator.evaluate(self.condition_template, render_ctx)
+        except UndefinedError as e:
             logger.error(
                 "NodeConditional (%s): Undefined variable in template: %s",
                 self.node_id,
@@ -261,7 +268,7 @@ class NodeConditional(Node):
             )
             yield {"type": ConditionalSignalTypes.BYPASS_ALL, "content": None}
             return
-        except jinja2.TemplateSyntaxError as e:
+        except TemplateSyntaxError as e:
             logger.error(
                 "NodeConditional (%s): Invalid Jinja2 syntax: %s",
                 self.node_id,
@@ -278,7 +285,7 @@ class NodeConditional(Node):
             )
             yield {"type": ConditionalSignalTypes.BYPASS_ALL, "content": None}
             return
-        except jinja2.TemplateError as e:
+        except TemplateError as e:
             logger.error(
                 "NodeConditional (%s): Template evaluation failed: %s",
                 self.node_id,

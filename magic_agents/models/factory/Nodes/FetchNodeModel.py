@@ -21,6 +21,11 @@ class FetchNodeModel(BaseNodeModel):
     json_data: Optional[dict[str, Any] | str] = None
     json_body: Optional[dict[str, Any] | str] = None  # alias for json_data
 
+    # Tool mode fields
+    tool_mode: bool = False
+    tool_name: Optional[str] = None
+    tool_parameters: Optional[dict[str, Any]] = None
+
     @model_validator(mode='after')
     def resolve_aliases(self):
         """Resolve fields from alternative names (JSON-first approach)."""
@@ -28,6 +33,8 @@ class FetchNodeModel(BaseNodeModel):
             self.url = self.endpoint
         if self.params is None and self.query is not None:
             self.params = self.query
+        if self.data is None and self.body is not None:
+            self.data = self.body
         if self.json_data is None and self.json_body is not None:
             self.json_data = self.json_body
         return self

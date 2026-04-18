@@ -10,4 +10,4 @@ class LoopNodeModel(BaseNodeModel):
       - iteration outputs via handle 'item'.
       - final aggregation via handle 'end'.
     """
-    pass
+    pass 

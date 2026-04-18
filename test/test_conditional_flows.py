@@ -10,8 +10,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from magic_agents import run_agent
 from magic_agents.agt_flow import build
 
-# Load API keys if needed for downstream nodes
-var_env = json.load(open('/home/andres/Documents/agents_key.json')) if os.path.exists('/home/andres/Documents/agents_key.json') else {}
+# Load API keys from environment or configured file path
+_api_keys_file = os.environ.get("MAGIC_AGENTS_API_KEY_FILE", "")
+_api_keys_env = os.environ.get("OPENAI_API_KEY", "")
+_api_keys_serper = os.environ.get("SERPER_API_KEY", "")
+
+if _api_keys_file and os.path.exists(_api_keys_file):
+    var_env = json.load(open(_api_keys_file))
+elif _api_keys_env:
+    var_env = {"openai_key": _api_keys_env, "serper_key": _api_keys_serper}
+else:
+    var_env = {}
 
 
 # Shared agent definition for all tests

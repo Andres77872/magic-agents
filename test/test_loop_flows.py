@@ -9,8 +9,23 @@ import pytest
 from magic_agents import run_agent
 from magic_agents.agt_flow import build
 
-# Load API keys from the specified JSON file
-var_env = json.load(open('/home/andres/Documents/agents_key.json'))
+# Load API keys from environment or configured file path
+_api_keys_file = os.environ.get("MAGIC_AGENTS_API_KEY_FILE", "")
+_api_keys_env = os.environ.get("OPENAI_API_KEY", "")
+_api_keys_serper = os.environ.get("SERPER_API_KEY", "")
+
+if _api_keys_file and os.path.exists(_api_keys_file):
+    var_env = json.load(open(_api_keys_file))
+elif _api_keys_env:
+    var_env = {"openai_key": _api_keys_env, "serper_key": _api_keys_serper}
+else:
+    var_env = {}
+
+# Most tests in this module need API keys
+pytestmark = pytest.mark.skipif(
+    'openai_key' not in var_env,
+    reason="OpenAI API key required (set OPENAI_API_KEY or MAGIC_AGENTS_API_KEY_FILE)"
+)
 
 
 class TestLoopFlows:
@@ -612,6 +627,14 @@ class TestLoopFlows:
             "type": "chat",
             "debug": True,
             "edges": [
+                # User input (required by graph validation; not used by this test)
+                {
+                    "id": "ui-to-void",
+                    "source": "user-input",
+                    "target": "end-node",
+                    "sourceHandle": "handle_user_message",
+                    "targetHandle": "handle-5"
+                },
                 # Text list to loop
                 {
                     "id": "text-to-loop",
@@ -662,6 +685,10 @@ class TestLoopFlows:
                 }
             ],
             "nodes": [
+                {
+                    "id": "user-input",
+                    "type": "user_input"
+                },
                 {
                     "id": "data-text",
                     "type": "text",
@@ -725,6 +752,14 @@ Total colors processed: {{ handle_parser_input | length }}
             "type": "chat",
             "debug": True,
             "edges": [
+                # User input (required by graph validation; not used by this test)
+                {
+                    "id": "ui-to-void",
+                    "source": "user-input",
+                    "target": "end-node",
+                    "sourceHandle": "handle_user_message",
+                    "targetHandle": "handle-5"
+                },
                 # Text list to loop
                 {
                     "id": "mixed-to-loop",
@@ -767,6 +802,10 @@ Total colors processed: {{ handle_parser_input | length }}
                 }
             ],
             "nodes": [
+                {
+                    "id": "user-input",
+                    "type": "user_input"
+                },
                 {
                     "id": "mixed-data",
                     "type": "text",
@@ -819,6 +858,14 @@ Total colors processed: {{ handle_parser_input | length }}
             "type": "chat",
             "debug": True,
             "edges": [
+                # User input (required by graph validation; not used by this test)
+                {
+                    "id": "ui-to-void",
+                    "source": "user-input",
+                    "target": "end-node",
+                    "sourceHandle": "handle_user_message",
+                    "targetHandle": "handle-5"
+                },
                 # Empty list to loop
                 {
                     "id": "empty-to-loop",
@@ -861,6 +908,10 @@ Total colors processed: {{ handle_parser_input | length }}
                 }
             ],
             "nodes": [
+                {
+                    "id": "user-input",
+                    "type": "user_input"
+                },
                 {
                     "id": "empty-list",
                     "type": "text",
