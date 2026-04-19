@@ -17,17 +17,20 @@ class NodeUserInput(Node):
     DEFAULT_OUTPUT_USER_MESSAGE = 'handle_user_message'
     DEFAULT_OUTPUT_USER_FILES = 'handle_user_files'
     DEFAULT_OUTPUT_USER_IMAGES = 'handle_user_images'
+    DEFAULT_OUTPUT_CLIENT_EXTRAS = 'handle_client_extras'  # Client extras output handle
 
     def __init__(self, data: UserInputNodeModel, handles: Optional[dict] = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self._text = data.text
         self.files = data.files
         self.images = data.images
+        self._extras = data.extras  # Client-provided extras
         # Allow JSON to override handle names
         handles = handles or {}
         self.HANDLER_USER_MESSAGE = handles.get('user_message', handles.get('message', self.DEFAULT_OUTPUT_USER_MESSAGE))
         self.HANDLER_USER_FILES = handles.get('user_files', handles.get('files', self.DEFAULT_OUTPUT_USER_FILES))
         self.HANDLER_USER_IMAGES = handles.get('user_images', handles.get('images', self.DEFAULT_OUTPUT_USER_IMAGES))
+        self.HANDLER_CLIENT_EXTRAS = handles.get('client_extras', self.DEFAULT_OUTPUT_CLIENT_EXTRAS)
 
     async def process(self, chat_log):
         if not chat_log.id_chat:
@@ -43,6 +46,9 @@ class NodeUserInput(Node):
         yield self.yield_static(self._text, content_type=self.HANDLER_USER_MESSAGE)
         yield self.yield_static(self.files, content_type=self.HANDLER_USER_FILES)
         yield self.yield_static(self.images, content_type=self.HANDLER_USER_IMAGES)
+        # Yield client extras only if present (backward compatible)
+        if self._extras is not None:
+            yield self.yield_static(self._extras, content_type=self.HANDLER_CLIENT_EXTRAS)
 
     def _capture_internal_state(self):
         """Capture UserInput-specific internal state for debugging."""
@@ -52,5 +58,6 @@ class NodeUserInput(Node):
         state['text'] = self._text
         state['images'] = self.images if self.images else []
         state['files'] = self.files if self.files else []
+        state['extras'] = self._extras  # Client extras for debugging visibility
         
         return state

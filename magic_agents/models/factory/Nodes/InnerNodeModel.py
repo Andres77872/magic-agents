@@ -16,6 +16,7 @@ class InnerNodeModel(BaseNodeModel):
     flow: Optional[dict[str, Any]] = None  # alias for magic_flow
     graph: Optional[dict[str, Any]] = None  # alias for magic_flow
     subgraph: Optional[dict[str, Any]] = None  # alias for magic_flow
+    parent_state_mapping: Optional[dict[str, str]] = None  # Static key-path mapping from parent state to child extras
 
     @model_validator(mode='after')
     def resolve_aliases(self):

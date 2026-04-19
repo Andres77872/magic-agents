@@ -255,6 +255,8 @@ async def execute_graph_reactive(
     id_chat: Optional[Union[int, str]] = None,
     id_thread: Optional[Union[int, str]] = None,
     id_user: Optional[Union[int, str]] = None,
+    extras: Optional[dict[str, Any]] = None,
+    flow_state: Optional[dict[str, Any]] = None,
 ) -> AsyncGenerator[ChatCompletionModel, None]:
     """
     Execute graph using reactive event-based model.
@@ -267,6 +269,8 @@ async def execute_graph_reactive(
         id_chat: Optional chat ID
         id_thread: Optional thread ID
         id_user: Optional user ID
+        extras: Optional client-provided contextual data (for consistency with entry points)
+        flow_state: Optional per-flow volatile state (runtime-only, never persisted)
         
     Yields:
         Streaming content and final outputs from nodes
@@ -300,7 +304,8 @@ async def execute_graph_reactive(
     if loop_nodes:
         logger.info("Detected loop nodes: %s. Delegating to loop executor.", loop_nodes)
         async for msg in execute_graph_loop_reactive(
-            graph, id_chat=id_chat, id_thread=id_thread, id_user=id_user
+            graph, id_chat=id_chat, id_thread=id_thread, id_user=id_user,
+            extras=extras, flow_state=flow_state
         ):
             yield msg
         return
@@ -308,8 +313,20 @@ async def execute_graph_reactive(
     nodes = graph.nodes
     chat_log = ModelAgentRunLog(
         id_chat=id_chat, id_thread=id_thread, id_user=id_user,
-        id_app=getattr(graph, 'app_id', None) or getattr(graph, 'id_app', None)
+        id_app=getattr(graph, 'app_id', None) or getattr(graph, 'id_app', None),
+        flow_state=flow_state or {}  # Initialize per-flow volatile state (isolated per flow)
     )
+    
+    # Inject extras into UserInput nodes if provided (for run_agent(graph, extras=...) path)
+    # This handles the case where a graph was built without extras but run_agent passes extras
+    from magic_agents.node_system import NodeUserInput
+    if extras is not None:
+        for node_id, node in nodes.items():
+            if isinstance(node, NodeUserInput):
+                # Update UserInput node's extras if it wasn't set during build
+                if node._extras is None:
+                    node._extras = extras
+                    logger.debug("Injected extras into UserInput node '%s'", node_id)
     
     logger.info(
         "Starting reactive execution: nodes=%d edges=%d",
@@ -565,12 +582,25 @@ async def execute_graph_loop_reactive(
     id_chat: Optional[Union[int, str]] = None,
     id_thread: Optional[Union[int, str]] = None,
     id_user: Optional[Union[int, str]] = None,
+    extras: Optional[dict[str, Any]] = None,
+    flow_state: Optional[dict[str, Any]] = None,
 ) -> AsyncGenerator[ChatCompletionModel, None]:
     """
     Execute an agent flow graph containing a Loop node using reactive model.
     
     This handles the special iteration semantics of loop nodes while still
     enabling parallel execution within each iteration.
+    
+    Args:
+        graph: The agent flow graph to execute
+        id_chat: Optional chat ID
+        id_thread: Optional thread ID
+        id_user: Optional user ID
+        extras: Optional client-provided contextual data
+        flow_state: Optional per-flow volatile state (runtime-only)
+        
+    Yields:
+        Streaming content and final outputs from nodes
     """
     import json
     from magic_agents.node_system import NodeLoop
@@ -601,7 +631,8 @@ async def execute_graph_loop_reactive(
     nodes = graph.nodes
     chat_log = ModelAgentRunLog(
         id_chat=id_chat, id_thread=id_thread, id_user=id_user,
-        id_app=getattr(graph, 'app_id', None) or getattr(graph, 'id_app', None)
+        id_app=getattr(graph, 'app_id', None) or getattr(graph, 'id_app', None),
+        flow_state=flow_state or {}  # Initialize per-flow volatile state (isolated per flow)
     )
     
     logger.info(

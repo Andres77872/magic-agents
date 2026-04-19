@@ -16,6 +16,7 @@ class UserInputNodeModel(BaseNodeModel):
     message: Optional[str] = None
     files: Optional[list[Any] | Any] = None
     images: Optional[list[Any] | Any] = None
+    extras: Optional[dict[str, Any]] = None  # Client-provided contextual data
 
     @model_validator(mode='after')
     def resolve_text_content(self):

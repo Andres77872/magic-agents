@@ -211,7 +211,9 @@ async def execute_graph(
     graph: AgentFlowModel,
     id_chat: Optional[Union[int, str]] = None,
     id_thread: Optional[Union[int, str]] = None,
-    id_user: Optional[Union[int, str]] = None
+    id_user: Optional[Union[int, str]] = None,
+    extras: Optional[dict[str, Any]] = None,
+    flow_state: Optional[dict[str, Any]] = None
 ) -> AsyncGenerator[ChatCompletionModel, None]:
     """
     Execute the agent flow graph asynchronously using reactive event-based model.
@@ -224,6 +226,8 @@ async def execute_graph(
         id_chat (Optional[Union[int, str]]): Chat ID. Defaults to None.
         id_thread (Optional[Union[int, str]]): Thread ID. Defaults to None.
         id_user (Optional[Union[int, str]]): User ID. Defaults to None.
+        extras (Optional[dict[str, Any]]): Client-provided contextual data. Defaults to None.
+        flow_state (Optional[dict[str, Any]]): Per-flow volatile state (runtime-only). Defaults to None.
 
     Yields:
         AsyncGenerator[ChatCompletionModel, None]: ChatCompletionModel results.
@@ -232,7 +236,9 @@ async def execute_graph(
         graph=graph,
         id_chat=id_chat,
         id_thread=id_thread,
-        id_user=id_user
+        id_user=id_user,
+        extras=extras,
+        flow_state=flow_state
     ):
         yield result
 
@@ -242,17 +248,32 @@ async def execute_graph_loop(
     id_chat: Optional[Union[int, str]] = None,
     id_thread: Optional[Union[int, str]] = None,
     id_user: Optional[Union[int, str]] = None,
+    extras: Optional[dict[str, Any]] = None,
+    flow_state: Optional[dict[str, Any]] = None,
 ) -> AsyncGenerator[ChatCompletionModel, None]:
     """
     Execute an agent flow graph that contains a Loop node using reactive model.
     
     This is now a thin wrapper around the reactive loop executor.
+
+    Args:
+        graph (AgentFlowModel): Agent flow graph.
+        id_chat (Optional[Union[int, str]]): Chat ID. Defaults to None.
+        id_thread (Optional[Union[int, str]]): Thread ID. Defaults to None.
+        id_user (Optional[Union[int, str]]): User ID. Defaults to None.
+        extras (Optional[dict[str, Any]]): Client-provided contextual data. Defaults to None.
+        flow_state (Optional[dict[str, Any]]): Per-flow volatile state. Defaults to None.
+
+    Yields:
+        AsyncGenerator[ChatCompletionModel, None]: ChatCompletionModel results.
     """
     async for result in execute_graph_loop_reactive(
         graph=graph,
         id_chat=id_chat,
         id_thread=id_thread,
-        id_user=id_user
+        id_user=id_user,
+        extras=extras,
+        flow_state=flow_state
     ):
         yield result
 
@@ -364,7 +385,7 @@ def validate_graph(nodes: list[dict], edges: list[dict]) -> dict:
     }
 
 
-def build(agt_data, message: str, images: list[str] = None, load_chat=None) -> AgentFlowModel:
+def build(agt_data, message: str, images: list[str] = None, load_chat=None, extras: Optional[dict[str, Any]] = None) -> AgentFlowModel:
     """
     Prepare and build the agent flow graph from input data and message.
 
@@ -375,6 +396,8 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None) -> A
         message (str): Message.
         images (list[str]): Images. Defaults to None.
         load_chat: Load chat function. Defaults to None.
+        extras (Optional[dict[str, Any]]): Client-provided contextual data that flows 
+            through UserInput node to downstream nodes. Defaults to None.
 
     Returns:
         AgentFlowModel: Agent flow graph. If validation fails, the graph will contain error information.
@@ -444,6 +467,9 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None) -> A
             node['data']['text' if node['type'] == ModelAgentFlowTypesModel.USER_INPUT else 'message'] = message
             if node['type'] == ModelAgentFlowTypesModel.USER_INPUT:
                 node['data']['images'] = images
+                # Pass extras to UserInput node if provided
+                if extras is not None:
+                    node['data']['extras'] = extras
         elif node['type'] == ModelAgentFlowTypesModel.END:
             agt_data['edges'].append({
                 "id": uuid.uuid4().hex,
@@ -467,12 +493,34 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None) -> A
                     node_id,
                 )
                 continue
+            
+            # Validate magic_flow has required keys before building
+            if not isinstance(node_instance.magic_flow, dict):
+                logger.warning(
+                    "NodeInner '%s' magic_flow is not a dict (type=%s) — inner graph will not be built.",
+                    node_id,
+                    type(node_instance.magic_flow).__name__,
+                )
+                continue
+            
+            required_keys = {'nodes', 'edges'}
+            missing_keys = required_keys - set(node_instance.magic_flow.keys())
+            if missing_keys:
+                logger.warning(
+                    "NodeInner '%s' magic_flow is malformed — missing required keys: %s. "
+                    "Execution will yield a ConfigurationError.",
+                    node_id,
+                    sorted(missing_keys),
+                )
+                continue
+            
             # Build the inner graph from the magic_flow dict
             inner_graph = build(
                 node_instance.magic_flow,
                 message="",  # Will be overridden by the input at runtime
                 images=None,
-                load_chat=load_chat
+                load_chat=load_chat,
+                extras=None  # Child flow starts with isolated extras (will be set at runtime)
             )
             # Set the built graph on the NodeInner instance
             node_instance.inner_graph = inner_graph
@@ -508,7 +556,8 @@ async def run_agent(
     graph: AgentFlowModel,
     id_chat: Optional[Union[int, str]] = None,
     id_thread: Optional[Union[int, str]] = None,
-    id_user: Optional[Union[int, str]] = None
+    id_user: Optional[Union[int, str]] = None,
+    extras: Optional[dict[str, Any]] = None
 ) -> AsyncGenerator[ChatCompletionModel, None]:
     """
     Run the agent flow and yield ChatCompletionModel results as they are generated.
@@ -518,6 +567,7 @@ async def run_agent(
         id_chat (Optional[Union[int, str]]): Chat ID. Defaults to None.
         id_thread (Optional[Union[int, str]]): Thread ID. Defaults to None.
         id_user (Optional[Union[int, str]]): User ID. Defaults to None.
+        extras (Optional[dict[str, Any]]): Client-provided contextual data. Defaults to None.
 
     Yields:
         AsyncGenerator[ChatCompletionModel, None]: ChatCompletionModel results.
@@ -526,6 +576,7 @@ async def run_agent(
         graph=graph,
         id_chat=id_chat,
         id_thread=id_thread,
-        id_user=id_user
+        id_user=id_user,
+        extras=extras
     ):
         yield result
