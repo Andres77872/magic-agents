@@ -13,3 +13,7 @@ from magic_agents.models.factory.Nodes.ConditionalNodeModel import (
     ConditionalNodeModel,
     ConditionalSignalTypes,
 )
+from magic_agents.models.factory.Nodes.McpNodeModel import (
+    McpNodeModel,
+    MCPServerConfig,
+)

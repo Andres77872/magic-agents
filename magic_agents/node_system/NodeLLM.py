@@ -3,7 +3,7 @@ import json
 import re
 import uuid
 import logging
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from magic_llm import MagicLLM
 from magic_llm.model import ModelChat
@@ -12,7 +12,36 @@ from magic_llm.model.ModelChatStream import ChatCompletionModel, ChoiceModel
 from magic_agents.models.factory.Nodes import LlmNodeModel
 from magic_agents.node_system.Node import Node
 
+if TYPE_CHECKING:
+    from magic_llm.agent import TaskManifest
+
 logger = logging.getLogger(__name__)
+
+
+def _to_task_manifest(subagent_manifest) -> 'TaskManifest':
+    """Convert SubagentManifest to TaskManifest for magic-llm registration.
+    
+    Excludes YAML-specific fields (apiVersion, kind, version, source_file, etc.)
+    Keeps runtime policy fields: id, name, description, input_schema,
+    timeout_seconds, max_concurrency, max_depth.
+    
+    Args:
+        subagent_manifest: SubagentManifest from magic_agents
+        
+    Returns:
+        TaskManifest for MagicLLM.register_task()
+    """
+    from magic_llm.agent import TaskManifest
+    
+    return TaskManifest(
+        id=subagent_manifest.id,
+        name=subagent_manifest.name,
+        description=subagent_manifest.description,
+        input_schema=subagent_manifest.input_schema,
+        timeout_seconds=subagent_manifest.timeout_seconds,
+        max_concurrency=subagent_manifest.max_concurrency,
+        max_depth=subagent_manifest.max_depth,
+    )
 
 
 class NodeLLM(Node):
@@ -71,7 +100,7 @@ class NodeLLM(Node):
         if 'max_tokens' not in self.extra_data and data.max_tokens is not None:
             self.extra_data['max_tokens'] = data.max_tokens
 
-    def _collect_tools(self) -> tuple[list, dict]:
+    async def _collect_tools(self) -> tuple[list, dict]:
         """Collect all tool definitions from tool-prefixed input handles.
 
         Scans self.inputs for keys starting with the tool prefix.
@@ -83,7 +112,21 @@ class NodeLLM(Node):
         both tool_schema and tool_callable. For plain callables, uses
         normalize_openai_tools for schema extraction. For plain dicts,
         uses them as-is (schema-only, no executor).
+
+        Extended to support MCPToolBundle (multi-tool) inputs from MCP nodes:
+          - MCPToolBundle.tool_schemas[] -> extend schema list
+          - MCPToolBundle.tool_functions{} -> merge into functions dict
+          - Collision detection raises MCPToolNameCollisionError
+
+        Extended to support TaskToolBundle from subagent registry:
+          - TaskToolBundle.tool_schemas[] -> extend schema list
+          - TaskToolBundle.tool_functions{} -> merge into functions dict
+          - Feature flag: is_task_subagents_enabled() controls injection
+        
+        See `magic_agents.subagents.__init__` for subagent registration details.
         """
+        from magic_agents.mcp.errors import MCPToolNameCollisionError
+        
         tools_schemas = []
         tool_functions = {}
 
@@ -93,22 +136,118 @@ class NodeLLM(Node):
             if value is None:
                 continue
 
-            if hasattr(value, 'tool_schema') and hasattr(value, 'tool_callable'):
-                # ToolProvider protocol: explicit schema + optional callable
+            # Bundle path: MCPToolBundle with multiple tools
+            if hasattr(value, 'tool_schemas') and hasattr(value, 'tool_functions'):
+                # MCPToolBundle (or similar multi-tool container)
+                bundle_node_id = getattr(value, 'node_id', 'unknown')
+                bundle_prefix = getattr(value, 'prefix', '')
+                bundle_count = len(value.tool_schemas)
+                
+                # Collision detection: check for duplicates before merging
+                for tool_name in value.tool_functions.keys():
+                    if tool_name in tool_functions:
+                        # Collision detected - find source nodes
+                        existing_source = getattr(tool_functions[tool_name], '_mcp_node_id', None) or 'existing_tool'
+                        raise MCPToolNameCollisionError(
+                            tool_name=tool_name,
+                            source_nodes=[existing_source, bundle_node_id]
+                        )
+                
+                # Extend schemas and merge functions
+                tools_schemas.extend(value.tool_schemas)
+                
+                # Tag functions with their source node_id for collision tracking
+                for tool_name, func in value.tool_functions.items():
+                    # Add source metadata for collision detection
+                    if not hasattr(func, '_mcp_node_id'):
+                        func._mcp_node_id = bundle_node_id
+                    tool_functions[tool_name] = func
+                
+                logger.debug(
+                    "NodeLLM:%s flattened MCP bundle from node '%s': %d tools (prefix='%s')",
+                    self.node_id,
+                    bundle_node_id,
+                    bundle_count,
+                    bundle_prefix
+                )
+            
+            # Single-tool path: existing ToolProvider (FetchToolCallable, PythonExecutor)
+            elif hasattr(value, 'tool_schema') and hasattr(value, 'tool_callable'):
                 tools_schemas.append(value.tool_schema)
                 if value.tool_callable is not None:
                     name = getattr(value.tool_callable, '__name__', None)
                     if name:
+                        # Collision detection for single tools too
+                        if name in tool_functions:
+                            raise MCPToolNameCollisionError(
+                                tool_name=name,
+                                source_nodes=['existing_tool', self.node_id]
+                            )
                         tool_functions[name] = value.tool_callable
+            
+            # Plain callable: schema auto-extracted by magic-llm
             elif callable(value) and not isinstance(value, dict):
-                # Plain callable: schema auto-extracted by magic-llm
                 tools_schemas.append(value)
                 name = getattr(value, '__name__', None)
                 if name:
+                    if name in tool_functions:
+                        raise MCPToolNameCollisionError(
+                            tool_name=name,
+                            source_nodes=['existing_tool', self.node_id]
+                        )
                     tool_functions[name] = value
+            
+            # Schema-only dict (no executor)
             elif isinstance(value, dict):
-                # Schema-only dict (no executor)
                 tools_schemas.append(value)
+
+        # NEW: Inject registered task subagents from registry (if feature enabled)
+        # Feature flag: check if subagents module is initialized and enabled
+        # Store task_bundle for later registration in process() where client is available
+        self._pending_task_bundle = None
+        try:
+            from magic_agents.subagents import get_registry, TaskToolBundle
+            from magic_agents.subagents.config import is_task_subagents_enabled
+            
+            if is_task_subagents_enabled():
+                registry = get_registry()
+                if registry.is_initialized() and registry.get_registered_ids():
+                    # Build TaskToolBundle from registered subagents
+                    task_bundle = await TaskToolBundle.from_registry(registry)
+                    
+                    if task_bundle.registered_count > 0:
+                        # Collision detection: check for duplicates before merging
+                        for tool_name in task_bundle.tool_functions.keys():
+                            if tool_name in tool_functions:
+                                raise MCPToolNameCollisionError(
+                                    tool_name=tool_name,
+                                    source_nodes=['existing_tool', 'subagent_registry']
+                                )
+                        
+                        # Store bundle for registration in process()
+                        self._pending_task_bundle = task_bundle
+                        
+                        # Extend schemas (schemas are needed for LLM tool selection)
+                        tools_schemas.extend(task_bundle.tool_schemas)
+                        
+                        # NOTE: tool_functions NOT merged here - registration via
+                        # MagicLLM.register_task() handles execution safeguards.
+                        # The callables are passed through for backward compatibility,
+                        # but TaskExecutor routes via _task_registry for task-specific
+                        # handling (depth, timeout, semaphore).
+                        tool_functions.update(task_bundle.tool_functions)
+                        
+                        logger.debug(
+                            "NodeLLM:%s collected %d task subagents (registration pending)",
+                            self.node_id,
+                            task_bundle.registered_count
+                        )
+        except ImportError:
+            # Subagents module not available - skip injection
+            pass
+        except RuntimeError:
+            # Registry not initialized - skip injection
+            pass
 
         return tools_schemas, tool_functions
 
@@ -125,6 +264,66 @@ class NodeLLM(Node):
                     self.node_id, engine
                 )
                 break
+    
+    def _register_task_subagents(self, client: MagicLLM) -> None:
+        """Register task subagents with MagicLLM before agent loop execution.
+        
+        THIN WRAPPER ARCHITECTURE:
+        - magic-agents collects manifests and callables
+        - MagicLLM.register_task() wraps with safeguards (depth, timeout, semaphore)
+        - TaskExecutor handles execution routing
+        
+        This method is called in process() after _collect_tools() collects
+        the pending task bundle, and before run_agent_async() starts the loop.
+        
+        Args:
+            client: MagicLLM instance with register_task() method
+        """
+        if not self._pending_task_bundle:
+            return
+        
+        # Check if client has register_task() (requires updated magic-llm)
+        if not hasattr(client, 'register_task'):
+            logger.warning(
+                "NodeLLM:%s task subagents collected but magic-llm lacks register_task() "
+                "— falling back to legacy tool_functions path. "
+                "Upgrade magic-llm to version with TaskExecutor support.",
+                self.node_id
+            )
+            return
+        
+        bundle = self._pending_task_bundle
+        
+        for manifest in bundle.manifests:
+            callable = bundle.tool_callables.get(manifest.id)
+            if callable is None:
+                logger.warning(
+                    "NodeLLM:%s callable missing for manifest '%s' — skipping",
+                    self.node_id,
+                    manifest.id
+                )
+                continue
+            
+            # Convert SubagentManifest → TaskManifest
+            task_manifest = _to_task_manifest(manifest)
+            
+            # Register with magic-llm (creates semaphore, wraps callable)
+            client.register_task(task_manifest, callable)
+            
+            logger.debug(
+                "NodeLLM:%s registered task '%s' with magic-llm TaskExecutor",
+                self.node_id,
+                manifest.id
+            )
+        
+        logger.info(
+            "NodeLLM:%s registered %d task subagents via MagicLLM.register_task()",
+            self.node_id,
+            len(bundle.manifests)
+        )
+        
+        # Clear pending bundle after registration
+        self._pending_task_bundle = None
 
     async def process(self, chat_log):
         params = self.inputs
@@ -182,7 +381,12 @@ class NodeLLM(Node):
                 return
 
         # Collect tools from tool-prefixed input handles
-        tools_schemas, tool_functions = self._collect_tools()
+        tools_schemas, tool_functions = await self._collect_tools()
+        
+        # Register task subagents with MagicLLM (if collected)
+        # This happens BEFORE agent loop execution, ensuring TaskExecutor
+        # wraps callables with depth/timeout/semaphore safeguards
+        self._register_task_subagents(client)
 
         # Track tool calls for the handle-tool-calls output
         final_tool_calls: list = []

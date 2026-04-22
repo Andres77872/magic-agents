@@ -15,6 +15,7 @@ from magic_agents.node_system.NodeSendMessage import NodeSendMessage
 from magic_agents.node_system.NodeText import NodeText
 from magic_agents.node_system.NodeUserInput import NodeUserInput
 from magic_agents.node_system.NodePythonExec import NodePythonExec
+from magic_agents.node_system.NodeMcp import NodeMcp
 
 
 def build_graph(edges: List[Dict]) -> nx.DiGraph:
@@ -105,6 +106,7 @@ __all__ = [
     "NodeInner",
     "NodeConditional",
     "NodePythonExec",
+    "NodeMcp",
     "build_graph",
     "detect_cycles",
     "perform_topological_sort",

@@ -29,6 +29,7 @@ from magic_agents.models.factory.Nodes import (
     InnerNodeModel,
     ConditionalNodeModel,
     PythonExecNodeModel,
+    McpNodeModel,
 )
 from magic_agents.models.model_agent_run_log import ModelAgentRunLog
 from magic_agents.node_system import (
@@ -45,6 +46,7 @@ from magic_agents.node_system import (
     NodeInner,
     NodeConditional,
     NodePythonExec,
+    NodeMcp,
     sort_nodes,
 )
 from magic_agents.execution import (
@@ -58,14 +60,97 @@ from magic_agents.util.graph_validator import ConditionalEdgeValidator
 logger = logging.getLogger(__name__)
 
 # Node types that can provide tools to LLM nodes
-_TOOL_CAPABLE_TYPES = {ModelAgentFlowTypesModel.FETCH, 'python_exec'}
+_TOOL_CAPABLE_TYPES = {ModelAgentFlowTypesModel.FETCH, 'python_exec', ModelAgentFlowTypesModel.MCP}
+
+
+def _initialize_subagent_registry() -> None:
+    """Initialize subagent registry at graph build startup.
+    
+    This function:
+    1. Checks if task subagents feature is enabled
+    2. Loads YAML manifests from subagents/ directory
+    3. Joins decorated callables from code registry
+    4. Makes registry available for NodeLLM tool injection
+    
+    The registry is initialized once at first build call.
+    Subsequent calls are skipped if registry is already initialized.
+    
+    This is called at the start of build() to ensure subagents
+    are registered before any NodeLLM instances are created.
+    """
+    try:
+        from magic_agents.subagents import init_registry, get_code_registry, reset_depths
+        from magic_agents.subagents.config import ENABLE_TASK_SUBAGENTS
+        from pathlib import Path
+        
+        if not ENABLE_TASK_SUBAGENTS:
+            logger.debug("Task subagents feature disabled — skipping registry initialization")
+            return
+        
+        # Reset depth counters for new graph execution
+        reset_depths()
+        
+        # Initialize registry with manifests from subagents/ directory
+        manifest_dir = Path("subagents")
+        
+        # Import the module to register decorators
+        # This ensures @task_subagent decorated functions are in code registry
+        if manifest_dir.exists():
+            # Import example subagent module to register its decorated functions
+            try:
+                # Import the research.web example if it exists
+                import subagents.research.web as _research_web_module
+            except ImportError:
+                # Example module not present — this is fine
+                pass
+            
+            # Initialize registry with manifests
+            import asyncio
+            try:
+                # Try running in existing loop
+                loop = asyncio.get_running_loop()
+                # Already in async context — create a task
+                # Since build() is sync, we need to run this synchronously
+                # Use asyncio.run if no loop, otherwise schedule
+                logger.warning(
+                    "Subagent registry initialization called from async context "
+                    "— registry will be initialized lazily"
+                )
+            except RuntimeError:
+                # No running loop — can use asyncio.run
+                asyncio.run(_async_init_registry(manifest_dir))
+        
+        logger.debug("Subagent registry initialization complete")
+        
+    except ImportError:
+        # Subagents module not installed — skip
+        logger.debug("Subagents module not available — skipping registry initialization")
+    except Exception as e:
+        # Initialization failed — log and continue
+        logger.warning("Subagent registry initialization failed: %s", e)
+
+
+async def _async_init_registry(manifest_dir) -> None:
+    """Async helper for registry initialization."""
+    from magic_agents.subagents import init_registry, get_registry
+    from magic_agents.subagents.decorator import get_code_registry
+    
+    # Load manifests
+    await init_registry(manifest_dir)
+    
+    # Join decorated callables
+    registry = get_registry()
+    code_registry = get_code_registry()
+    
+    for agent_id, callable in code_registry.items():
+        registry.register_callable(agent_id, callable)
 
 
 def _assign_tool_handles(nodes: list[dict], edges: list[dict]) -> None:
     """Auto-generate unique targetHandle values for tool->LLM edges.
 
     For each edge where the source node is tool-capable (fetch with tool_mode=true,
-    python_exec) and the target node is an LLM node, assigns a deterministic unique
+    python_exec, mcp) and the target node is an LLM node, assigns a deterministic unique
     targetHandle: handle-tool-definition-0, handle-tool-definition-1, etc.
 
     Also sets sourceHandle to the source node's resolved output handle so that
@@ -103,6 +188,9 @@ def _assign_tool_handles(nodes: list[dict], edges: list[dict]) -> None:
         if source_type == ModelAgentFlowTypesModel.FETCH:
             # Fetch: output → response → default
             resolved_handle = handles.get('output', handles.get('response', 'handle_fetch_output'))
+        elif source_type == ModelAgentFlowTypesModel.MCP:
+            # MCP: output → default (handle-tool-definition)
+            resolved_handle = handles.get('output', 'handle-tool-definition')
         else:
             # python_exec: output → default
             resolved_handle = handles.get('output', 'handle-tool-definition')
@@ -159,6 +247,7 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False) -> Any:
         ModelAgentFlowTypesModel.INNER: (NodeInner, InnerNodeModel),
         ModelAgentFlowTypesModel.VOID: (NodeEND, None),
         'python_exec': (NodePythonExec, PythonExecNodeModel),
+        ModelAgentFlowTypesModel.MCP: (NodeMcp, McpNodeModel),
     }
     
     if node_type not in node_map:
@@ -402,6 +491,11 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
     Returns:
         AgentFlowModel: Agent flow graph. If validation fails, the graph will contain error information.
     """
+    # NEW: Initialize subagent registry at graph build startup
+    # This loads YAML manifests and joins with decorated callables
+    # Feature flag: only initialize if subagents config allows it
+    _initialize_subagent_registry()
+    
     # Normalize data structure - handle nested 'content' wrapper
     if 'content' in agt_data and isinstance(agt_data['content'], dict):
         # Nested structure: extract nodes/edges from content
