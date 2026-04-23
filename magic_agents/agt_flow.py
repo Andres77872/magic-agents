@@ -63,87 +63,58 @@ logger = logging.getLogger(__name__)
 _TOOL_CAPABLE_TYPES = {ModelAgentFlowTypesModel.FETCH, 'python_exec', ModelAgentFlowTypesModel.MCP}
 
 
-def _initialize_subagent_registry() -> None:
-    """Initialize subagent registry at graph build startup.
+# ─── Task Subagents Integration ─────────────────────────────────────────────
+#
+# ARCHITECTURE CHANGE (Option 1 stricter boundary):
+# - magic-llm owns ALL subagent architecture (definitions, loader, registry,
+#   binder, bundle, decorator, config, runtime safeguards)
+# - magic-agents is PURE usage layer — no local subagents package
+# - Subagent loading happens in NodeLLM where MagicLLM client is available
+#
+# Feature flag for application-level control:
+# - ENABLE_TASK_SUBAGENTS (application-level, not repo-level)
+# - Repo-level defaults are in magic_llm/agent/config.py
+#
+# Migration guide:
+# - Import from magic_llm.agent: SubagentManifest, ManifestLoader, etc.
+# - Use @subagent decorator from magic_llm.agent.decorator
+# - Pass code_registry dict to client.load_subagents()
+# - NO reset_depths import — handled by magic-llm internally
+#
+
+# Feature flag (application-level control)
+ENABLE_TASK_SUBAGENTS: bool = False
+
+def enable_task_subagents() -> None:
+    """Enable task subagents feature at application level."""
+    global ENABLE_TASK_SUBAGENTS
+    ENABLE_TASK_SUBAGENTS = True
+    logger.debug("Task subagents feature enabled")
+
+def disable_task_subagents() -> None:
+    """Disable task subagents feature at application level."""
+    global ENABLE_TASK_SUBAGENTS
+    ENABLE_TASK_SUBAGENTS = False
+    logger.debug("Task subagents feature disabled")
+
+def is_task_subagents_enabled() -> bool:
+    """Check if task subagents feature is enabled at application level."""
+    return ENABLE_TASK_SUBAGENTS
+
+# Application-level code registry for @subagent decorator population
+# NO global mutable state in magic-llm — this dict is passed explicitly
+_code_registry: dict = {}
+
+def get_code_registry() -> dict:
+    """Get the application-level code registry for decorator population.
     
-    This function:
-    1. Checks if task subagents feature is enabled
-    2. Loads YAML manifests from subagents/ directory
-    3. Joins decorated callables from code registry
-    4. Makes registry available for NodeLLM tool injection
+    This dict is populated by @subagent decorators and passed to
+    MagicLLM.load_subagents() at execution time.
     
-    The registry is initialized once at first build call.
-    Subsequent calls are skipped if registry is already initialized.
-    
-    This is called at the start of build() to ensure subagents
-    are registered before any NodeLLM instances are created.
+    NOTE: This is application-level state, NOT repo-level.
+    magic-llm uses instance-scoped registry (no global state).
     """
-    try:
-        from magic_agents.subagents import init_registry, get_code_registry, reset_depths
-        from magic_agents.subagents.config import ENABLE_TASK_SUBAGENTS
-        from pathlib import Path
-        
-        if not ENABLE_TASK_SUBAGENTS:
-            logger.debug("Task subagents feature disabled — skipping registry initialization")
-            return
-        
-        # Reset depth counters for new graph execution
-        reset_depths()
-        
-        # Initialize registry with manifests from subagents/ directory
-        manifest_dir = Path("subagents")
-        
-        # Import the module to register decorators
-        # This ensures @task_subagent decorated functions are in code registry
-        if manifest_dir.exists():
-            # Import example subagent module to register its decorated functions
-            try:
-                # Import the research.web example if it exists
-                import subagents.research.web as _research_web_module
-            except ImportError:
-                # Example module not present — this is fine
-                pass
-            
-            # Initialize registry with manifests
-            import asyncio
-            try:
-                # Try running in existing loop
-                loop = asyncio.get_running_loop()
-                # Already in async context — create a task
-                # Since build() is sync, we need to run this synchronously
-                # Use asyncio.run if no loop, otherwise schedule
-                logger.warning(
-                    "Subagent registry initialization called from async context "
-                    "— registry will be initialized lazily"
-                )
-            except RuntimeError:
-                # No running loop — can use asyncio.run
-                asyncio.run(_async_init_registry(manifest_dir))
-        
-        logger.debug("Subagent registry initialization complete")
-        
-    except ImportError:
-        # Subagents module not installed — skip
-        logger.debug("Subagents module not available — skipping registry initialization")
-    except Exception as e:
-        # Initialization failed — log and continue
-        logger.warning("Subagent registry initialization failed: %s", e)
-
-
-async def _async_init_registry(manifest_dir) -> None:
-    """Async helper for registry initialization."""
-    from magic_agents.subagents import init_registry, get_registry
-    from magic_agents.subagents.decorator import get_code_registry
-    
-    # Load manifests
-    await init_registry(manifest_dir)
-    
-    # Join decorated callables
-    registry = get_registry()
-    code_registry = get_code_registry()
-    
-    for agent_id, callable in code_registry.items():
-        registry.register_callable(agent_id, callable)
+    return _code_registry
 
 
 def _assign_tool_handles(nodes: list[dict], edges: list[dict]) -> None:
@@ -491,10 +462,9 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
     Returns:
         AgentFlowModel: Agent flow graph. If validation fails, the graph will contain error information.
     """
-    # NEW: Initialize subagent registry at graph build startup
-    # This loads YAML manifests and joins with decorated callables
-    # Feature flag: only initialize if subagents config allows it
-    _initialize_subagent_registry()
+    # NOTE: Subagent loading moved to NodeLLM.process() where MagicLLM client
+    # is available. magic-llm's load_subagents() is async and requires a client.
+    # Feature flag checked at execution time via is_task_subagents_enabled().
     
     # Normalize data structure - handle nested 'content' wrapper
     if 'content' in agt_data and isinstance(agt_data['content'], dict):

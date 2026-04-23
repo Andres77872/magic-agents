@@ -13,35 +13,9 @@ from magic_agents.models.factory.Nodes import LlmNodeModel
 from magic_agents.node_system.Node import Node
 
 if TYPE_CHECKING:
-    from magic_llm.agent import TaskManifest
+    from magic_llm.agent import TaskManifest, SubagentBundle
 
 logger = logging.getLogger(__name__)
-
-
-def _to_task_manifest(subagent_manifest) -> 'TaskManifest':
-    """Convert SubagentManifest to TaskManifest for magic-llm registration.
-    
-    Excludes YAML-specific fields (apiVersion, kind, version, source_file, etc.)
-    Keeps runtime policy fields: id, name, description, input_schema,
-    timeout_seconds, max_concurrency, max_depth.
-    
-    Args:
-        subagent_manifest: SubagentManifest from magic_agents
-        
-    Returns:
-        TaskManifest for MagicLLM.register_task()
-    """
-    from magic_llm.agent import TaskManifest
-    
-    return TaskManifest(
-        id=subagent_manifest.id,
-        name=subagent_manifest.name,
-        description=subagent_manifest.description,
-        input_schema=subagent_manifest.input_schema,
-        timeout_seconds=subagent_manifest.timeout_seconds,
-        max_concurrency=subagent_manifest.max_concurrency,
-        max_depth=subagent_manifest.max_depth,
-    )
 
 
 class NodeLLM(Node):
@@ -117,13 +91,9 @@ class NodeLLM(Node):
           - MCPToolBundle.tool_schemas[] -> extend schema list
           - MCPToolBundle.tool_functions{} -> merge into functions dict
           - Collision detection raises MCPToolNameCollisionError
-
-        Extended to support TaskToolBundle from subagent registry:
-          - TaskToolBundle.tool_schemas[] -> extend schema list
-          - TaskToolBundle.tool_functions{} -> merge into functions dict
-          - Feature flag: is_task_subagents_enabled() controls injection
         
-        See `magic_agents.subagents.__init__` for subagent registration details.
+        Task subagents are loaded via MagicLLM.load_subagents() in process(),
+        not collected here. magic-llm owns all subagent architecture.
         """
         from magic_agents.mcp.errors import MCPToolNameCollisionError
         
@@ -201,53 +171,9 @@ class NodeLLM(Node):
             elif isinstance(value, dict):
                 tools_schemas.append(value)
 
-        # NEW: Inject registered task subagents from registry (if feature enabled)
-        # Feature flag: check if subagents module is initialized and enabled
-        # Store task_bundle for later registration in process() where client is available
-        self._pending_task_bundle = None
-        try:
-            from magic_agents.subagents import get_registry, TaskToolBundle
-            from magic_agents.subagents.config import is_task_subagents_enabled
-            
-            if is_task_subagents_enabled():
-                registry = get_registry()
-                if registry.is_initialized() and registry.get_registered_ids():
-                    # Build TaskToolBundle from registered subagents
-                    task_bundle = await TaskToolBundle.from_registry(registry)
-                    
-                    if task_bundle.registered_count > 0:
-                        # Collision detection: check for duplicates before merging
-                        for tool_name in task_bundle.tool_functions.keys():
-                            if tool_name in tool_functions:
-                                raise MCPToolNameCollisionError(
-                                    tool_name=tool_name,
-                                    source_nodes=['existing_tool', 'subagent_registry']
-                                )
-                        
-                        # Store bundle for registration in process()
-                        self._pending_task_bundle = task_bundle
-                        
-                        # Extend schemas (schemas are needed for LLM tool selection)
-                        tools_schemas.extend(task_bundle.tool_schemas)
-                        
-                        # NOTE: tool_functions NOT merged here - registration via
-                        # MagicLLM.register_task() handles execution safeguards.
-                        # The callables are passed through for backward compatibility,
-                        # but TaskExecutor routes via _task_registry for task-specific
-                        # handling (depth, timeout, semaphore).
-                        tool_functions.update(task_bundle.tool_functions)
-                        
-                        logger.debug(
-                            "NodeLLM:%s collected %d task subagents (registration pending)",
-                            self.node_id,
-                            task_bundle.registered_count
-                        )
-        except ImportError:
-            # Subagents module not available - skip injection
-            pass
-        except RuntimeError:
-            # Registry not initialized - skip injection
-            pass
+        # NOTE: Task subagents are loaded via MagicLLM.load_subagents() 
+        # in process() where the client is available.
+        # magic-llm owns ALL subagent architecture — no local registry.
 
         return tools_schemas, tool_functions
 
@@ -265,65 +191,59 @@ class NodeLLM(Node):
                 )
                 break
     
-    def _register_task_subagents(self, client: MagicLLM) -> None:
-        """Register task subagents with MagicLLM before agent loop execution.
+    async def _load_subagents_if_enabled(self, client: MagicLLM) -> "SubagentBundle":
+        """Load task subagents via magic-llm unified API if feature enabled.
         
-        THIN WRAPPER ARCHITECTURE:
-        - magic-agents collects manifests and callables
-        - MagicLLM.register_task() wraps with safeguards (depth, timeout, semaphore)
-        - TaskExecutor handles execution routing
-        
-        This method is called in process() after _collect_tools() collects
-        the pending task bundle, and before run_agent_async() starts the loop.
+        ARCHITECTURE (Option 1 stricter boundary):
+        - magic-llm owns ALL subagent architecture
+        - magic-agents passes manifest_dir and code_registry
+        - load_subagents() handles discovery → registration internally
         
         Args:
-            client: MagicLLM instance with register_task() method
+            client: MagicLLM instance with load_subagents() method
+            
+        Returns:
+            SubagentBundle with tool schemas for agent loop injection
         """
-        if not self._pending_task_bundle:
-            return
+        from magic_llm.agent.bundle import SubagentBundle
+        from magic_agents.agt_flow import is_task_subagents_enabled, get_code_registry
+        from pathlib import Path
         
-        # Check if client has register_task() (requires updated magic-llm)
-        if not hasattr(client, 'register_task'):
+        # Check application-level feature flag
+        if not is_task_subagents_enabled():
+            logger.debug("NodeLLM:%s task subagents feature disabled", self.node_id)
+            return SubagentBundle()
+        
+        # Check if client has load_subagents() (requires magic-llm 0.1.28+)
+        if not hasattr(client, 'load_subagents'):
             logger.warning(
-                "NodeLLM:%s task subagents collected but magic-llm lacks register_task() "
-                "— falling back to legacy tool_functions path. "
-                "Upgrade magic-llm to version with TaskExecutor support.",
+                "NodeLLM:%s task subagents enabled but magic-llm lacks load_subagents() "
+                "— upgrade magic-llm to version 0.1.28 or higher.",
                 self.node_id
             )
-            return
+            return SubagentBundle()
         
-        bundle = self._pending_task_bundle
+        # Default manifest directory (can be overridden in future)
+        manifest_dir = Path("subagents")
         
-        for manifest in bundle.manifests:
-            callable = bundle.tool_callables.get(manifest.id)
-            if callable is None:
-                logger.warning(
-                    "NodeLLM:%s callable missing for manifest '%s' — skipping",
-                    self.node_id,
-                    manifest.id
-                )
-                continue
-            
-            # Convert SubagentManifest → TaskManifest
-            task_manifest = _to_task_manifest(manifest)
-            
-            # Register with magic-llm (creates semaphore, wraps callable)
-            client.register_task(task_manifest, callable)
-            
-            logger.debug(
-                "NodeLLM:%s registered task '%s' with magic-llm TaskExecutor",
+        # Get application-level code registry
+        code_registry = get_code_registry()
+        
+        # Reset depth counters for new execution (magic-llm handles internally)
+        if hasattr(client, 'reset_depths'):
+            client.reset_depths()
+        
+        # Call magic-llm unified API
+        bundle = await client.load_subagents(manifest_dir, code_registry)
+        
+        if bundle.registered_count > 0:
+            logger.info(
+                "NodeLLM:%s loaded %d task subagents via MagicLLM.load_subagents()",
                 self.node_id,
-                manifest.id
+                bundle.registered_count
             )
         
-        logger.info(
-            "NodeLLM:%s registered %d task subagents via MagicLLM.register_task()",
-            self.node_id,
-            len(bundle.manifests)
-        )
-        
-        # Clear pending bundle after registration
-        self._pending_task_bundle = None
+        return bundle
 
     async def process(self, chat_log):
         params = self.inputs
@@ -383,10 +303,15 @@ class NodeLLM(Node):
         # Collect tools from tool-prefixed input handles
         tools_schemas, tool_functions = await self._collect_tools()
         
-        # Register task subagents with MagicLLM (if collected)
-        # This happens BEFORE agent loop execution, ensuring TaskExecutor
-        # wraps callables with depth/timeout/semaphore safeguards
-        self._register_task_subagents(client)
+        # Load task subagents via magic-llm unified API (if feature enabled)
+        # magic-llm handles discovery → registration → tool schema injection
+        subagent_bundle = await self._load_subagents_if_enabled(client)
+        
+        # Extend schemas with subagent tool schemas if any registered
+        if subagent_bundle.registered_count > 0:
+            tools_schemas.extend(subagent_bundle.tool_schemas)
+            # NOTE: tool_functions NOT merged — magic-llm routes via TaskExecutor
+            # which wraps callables with safeguards (depth, timeout, semaphore)
 
         # Track tool calls for the handle-tool-calls output
         final_tool_calls: list = []
