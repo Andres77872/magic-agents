@@ -32,8 +32,6 @@ class NodeLLM(Node):
     DEFAULT_OUTPUT_CONTENT = 'handle_streaming_content'
     DEFAULT_OUTPUT_GENERATED = 'handle_generated_content'
     DEFAULT_OUTPUT_TOOL_CALLS = 'handle-tool-calls'
-    # Legacy output handle for backward compatibility with existing graphs
-    LEGACY_OUTPUT_GENERATED = 'handle_generated_end'
     # Tool input handle prefix — dynamic collection from tool-prefixed handles
     DEFAULT_INPUT_TOOL_PREFIX = 'handle-tool-'
     # Engines known to NOT support tools via kwargs
@@ -279,9 +277,6 @@ class NodeLLM(Node):
             if no_inputs:
                 logger.debug("NodeLLM:%s no inputs provided; yielding empty content", self.node_id)
                 yield self.yield_static('', content_type=self.OUTPUT_HANDLE_GENERATED)
-                # Also yield on legacy handle for backward compatibility
-                if self.OUTPUT_HANDLE_GENERATED != self.LEGACY_OUTPUT_GENERATED:
-                    yield self.yield_static('', content_type=self.LEGACY_OUTPUT_GENERATED)
                 return
             sys_context = params.get(self.INPUT_HANDLER_SYSTEM_CONTEXT)
             chat = ModelChat(extract_message(sys_context) if sys_context else None)
@@ -515,10 +510,6 @@ class NodeLLM(Node):
             yield self.yield_static(final_tool_calls, content_type=self.OUTPUT_HANDLE_TOOL_CALLS)
         # Yield on the configured output handle
         yield self.yield_static(self.generated, content_type=self.OUTPUT_HANDLE_GENERATED)
-        # Also yield on legacy handle for backward compatibility with existing graphs
-        # This ensures graphs using 'handle_generated_end' still work
-        if self.OUTPUT_HANDLE_GENERATED != self.LEGACY_OUTPUT_GENERATED:
-            yield self.yield_static(self.generated, content_type=self.LEGACY_OUTPUT_GENERATED)
 
     def _capture_internal_state(self):
         """Capture LLM-specific internal state for debugging."""

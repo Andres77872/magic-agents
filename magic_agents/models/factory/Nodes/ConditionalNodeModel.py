@@ -33,7 +33,7 @@ class ConditionalNodeModel(BaseModel):
             }
         }
     """
-    model_config = ConfigDict(extra='allow')  # Allow extra fields from JSON
+    model_config = ConfigDict(extra='forbid')  # Reject unknown fields - strict validation
     
     condition: str = Field(
         ...,

@@ -16,8 +16,6 @@ class NodeParser(Node):
     """
     # Default output handle name - can be overridden by JSON data.handles
     DEFAULT_OUTPUT_HANDLE = 'handle_parser_output'
-    # Legacy output handle for backward compatibility with existing graphs
-    LEGACY_OUTPUT_HANDLE = 'handle_generated_end'
 
     def __init__(self, data: ParserNodeModel, handles: Optional[dict] = None, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -43,10 +41,6 @@ class NodeParser(Node):
         output = template_parse(template=self.text, params=rp_inputs)
         logger.info("NodeParser:%s template parsed successfully (output_len=%d)", self.node_id, len(str(output)))
         yield self.yield_static(output, content_type=self.OUTPUT_HANDLE)
-        
-        # Also yield on legacy handle for backward compatibility with existing graphs
-        if self.OUTPUT_HANDLE != self.LEGACY_OUTPUT_HANDLE:
-            yield self.yield_static(output, content_type=self.LEGACY_OUTPUT_HANDLE)
 
     def _capture_internal_state(self):
         """Capture Parser-specific internal state for debugging."""

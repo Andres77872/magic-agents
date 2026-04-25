@@ -11,10 +11,11 @@ from magic_agents.models.factory.Nodes.BaseNodeModel import BaseNodeModel
 
 class MCPServerConfig(BaseModel):
     """Configuration for one MCP server connection.
-    
+
     Supports stdio and Streamable HTTP transports.
+    Backend-authoritative validation: rejects unknown fields.
     """
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra='forbid')  # Reject unknown fields - strict validation
     
     # Transport selection
     transport: Literal["stdio", "http"] = "stdio"

@@ -55,12 +55,12 @@ from magic_agents.execution import (
 )
 from magic_agents.util.const import HANDLE_VOID
 from magic_agents.util.env_resolver import resolve_env_placeholders
-from magic_agents.util.graph_validator import ConditionalEdgeValidator
+from magic_agents.util.graph_validator import ConditionalEdgeValidator, validate_edge_handles
 
 logger = logging.getLogger(__name__)
 
 # Node types that can provide tools to LLM nodes
-_TOOL_CAPABLE_TYPES = {ModelAgentFlowTypesModel.FETCH, 'python_exec', ModelAgentFlowTypesModel.MCP}
+_TOOL_CAPABLE_TYPES = {ModelAgentFlowTypesModel.FETCH, ModelAgentFlowTypesModel.PYTHON_EXEC, ModelAgentFlowTypesModel.MCP}
 
 
 # ─── Task Subagents Integration ─────────────────────────────────────────────
@@ -217,7 +217,7 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False) -> Any:
         ModelAgentFlowTypesModel.CONDITIONAL: (NodeConditional, ConditionalNodeModel),
         ModelAgentFlowTypesModel.INNER: (NodeInner, InnerNodeModel),
         ModelAgentFlowTypesModel.VOID: (NodeEND, None),
-        'python_exec': (NodePythonExec, PythonExecNodeModel),
+        ModelAgentFlowTypesModel.PYTHON_EXEC: (NodePythonExec, PythonExecNodeModel),
         ModelAgentFlowTypesModel.MCP: (NodeMcp, McpNodeModel),
     }
     
@@ -260,9 +260,36 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False) -> Any:
         # Loop node uses handles for routing configuration
         return constructor(**extra, **node_data)
     elif node_type == ModelAgentFlowTypesModel.INNER:
-        return constructor(load_chat=load_chat, **extra, data=InnerNodeModel(**extra, **node_data))
+        # Validate inner config using Pydantic model
+        try:
+            validated = InnerNodeModel(**node_data)
+            return constructor(load_chat=load_chat, **extra, data=validated)
+        except Exception as e:
+            logger.error("Invalid inner node config: %s", e)
+            stub = NodeEND(**extra)
+            stub._error_info = {
+                "error_type": "InnerNodeValidationError",
+                "error_message": str(e),
+                "node_id": node['id'],
+                "node_data": node_data
+            }
+            return stub
     elif model_cls:
-        return constructor(**extra, data=model_cls(**extra, **node_data))
+        # Validate node config using Pydantic model (strict validation)
+        try:
+            validated = model_cls(**node_data)
+            return constructor(**extra, data=validated)
+        except Exception as e:
+            logger.error("Invalid node config for %s: %s", node_type, e)
+            stub = NodeEND(**extra)
+            stub._error_info = {
+                "error_type": "NodeValidationError",
+                "error_message": str(e),
+                "node_id": node['id'],
+                "node_type": node_type,
+                "node_data": node_data
+            }
+            return stub
     else:
         return constructor(**extra)
 
@@ -605,6 +632,20 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
                 logger.warning("Conditional validation warning: %s", err['error_message'])
             else:
                 logger.error("Conditional validation error: %s", err['error_message'])
+    
+    # Run edge handle validation (clean-break: reject legacy handles)
+    handle_errors = validate_edge_handles(nodes, edge_models)
+    if handle_errors:
+        if validation_errors is None:
+            validation_errors = []
+        validation_errors.extend(handle_errors)
+        
+        # Log handle validation errors
+        for err in handle_errors:
+            if err.get('severity') == 'warning':
+                logger.warning("Handle validation warning: %s", err['error_message'])
+            else:
+                logger.error("Handle validation error: %s", err['error_message'])
     
     agt_data['nodes'] = nodes
     agt = AgentFlowModel(**agt_data)

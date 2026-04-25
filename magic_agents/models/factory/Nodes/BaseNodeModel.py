@@ -42,10 +42,10 @@ class ModelAgentFlowTypesModel:
 class BaseNodeModel(BaseModel):
     """
     Base model for all node types.
-    Configured to accept extra fields from JSON without raising errors.
-    The JSON definition is the source of truth.
+    Backend-authoritative validation: rejects unknown fields to enforce strict JSON contract.
+    Frontend must sync TypeScript interfaces to Pydantic models.
     """
-    model_config = ConfigDict(extra='allow')  # Allow any extra fields from JSON
+    model_config = ConfigDict(extra='forbid')  # Reject unknown fields - backend authoritative
     
     position: Optional[dict[str, int]] = {'x': 0, 'y': 0}
     extra_data: Optional[dict[str, Any]] = Field(default_factory=dict)

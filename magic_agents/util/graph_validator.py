@@ -3,6 +3,9 @@ Graph Validator - Build-time validation for agent flow graphs.
 
 This module provides validation functions to ensure graph integrity,
 particularly for conditional nodes and their edge connections.
+
+Handle validation enforces the clean-break policy: legacy handles like
+handle_generated_end are rejected at build time.
 """
 
 from __future__ import annotations
@@ -13,6 +16,13 @@ from typing import Any, Dict, List, TYPE_CHECKING
 if TYPE_CHECKING:
     from magic_agents.models.factory.AgentFlowModel import AgentFlowModel
     from magic_agents.models.factory.EdgeNodeModel import EdgeNodeModel
+
+from magic_agents.util.handle_registry import (
+    is_valid_source_handle,
+    is_legacy_rejected_handle,
+    get_node_output_handles_from_instance,
+    LEGACY_REJECTED_HANDLES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -219,6 +229,107 @@ def validate_edge_connectivity(
     return errors
 
 
+def validate_edge_handles(
+    nodes: Dict[str, Any],
+    edges: List['EdgeNodeModel']
+) -> List[Dict[str, Any]]:
+    """
+    Validate edge sourceHandle values against node output handle contracts.
+    
+    Enforces clean-break policy: legacy handles (handle_generated_end) are rejected.
+    
+    Checks:
+    1. sourceHandle must be valid for the source node's output contract
+    2. Legacy rejected handles fail validation with clear error
+    3. Dynamic handles (handle-tool-definition-*, handle_parser_input_*) pass
+    4. Nodes with custom handles (data.handles) validated against instance
+    
+    Args:
+        nodes: Dictionary of node_id -> Node instance
+        edges: List of EdgeNodeModel
+        
+    Returns:
+        List of validation errors
+    """
+    errors = []
+    
+    for edge in edges:
+        source_handle = edge.sourceHandle
+        
+        # Skip edges without sourceHandle (implicit default routing)
+        if not source_handle:
+            continue
+        
+        # Get source node
+        source_node = nodes.get(edge.source)
+        if not source_node:
+            # Already handled by validate_edge_connectivity
+            continue
+        
+        # Get source node type
+        source_node_type = getattr(source_node, 'node_type', None)
+        if not source_node_type:
+            # Node might be stub or error node - skip handle validation
+            continue
+        
+        # Check for legacy rejected handles first (explicit rejection)
+        if is_legacy_rejected_handle(source_handle):
+            errors.append({
+                "type": "LegacyHandleRejected",
+                "severity": "error",
+                "edge_id": getattr(edge, 'id', 'unknown'),
+                "source": edge.source,
+                "target": edge.target,
+                "sourceHandle": source_handle,
+                "targetHandle": edge.targetHandle,
+                "error_message": (
+                    f"Edge uses legacy handle '{source_handle}' which is no longer emitted "
+                    f"by node '{edge.source}' (type: {source_node_type}). "
+                    f"Use canonical handles instead."
+                ),
+                "legacy_handle": source_handle,
+                "node_type": source_node_type,
+                "suggestion": (
+                    f"Reconnect edge using canonical handle for {source_node_type}. "
+                    f"See docs/JSON_CONTRACT.md for valid handles."
+                )
+            })
+            continue
+        
+        # Get output handles from the node instance
+        instance_handles = get_node_output_handles_from_instance(source_node)
+        
+        # Validate the source handle
+        is_valid, reason = is_valid_source_handle(
+            source_handle,
+            source_node_type,
+            instance_handles
+        )
+        
+        if not is_valid:
+            errors.append({
+                "type": "InvalidSourceHandle",
+                "severity": "error",
+                "edge_id": getattr(edge, 'id', 'unknown'),
+                "source": edge.source,
+                "target": edge.target,
+                "sourceHandle": source_handle,
+                "targetHandle": edge.targetHandle,
+                "error_message": (
+                    f"Edge sourceHandle '{source_handle}' is not valid for "
+                    f"node '{edge.source}' (type: {source_node_type}). {reason}"
+                ),
+                "node_type": source_node_type,
+                "reason": reason,
+                "suggestion": (
+                    f"Check node's output handles or use canonical handles for {source_node_type}. "
+                    f"See docs/JSON_CONTRACT.md for valid handles."
+                )
+            })
+    
+    return errors
+
+
 def run_all_validations(graph: 'AgentFlowModel') -> List[Dict[str, Any]]:
     """
     Run all graph validations.
@@ -233,6 +344,9 @@ def run_all_validations(graph: 'AgentFlowModel') -> List[Dict[str, Any]]:
     
     # Basic edge connectivity
     errors.extend(validate_edge_connectivity(graph.nodes, graph.edges))
+    
+    # Edge handle validation (clean-break: reject legacy handles)
+    errors.extend(validate_edge_handles(graph.nodes, graph.edges))
     
     # Conditional-specific validation
     errors.extend(validate_graph_conditionals(graph))
