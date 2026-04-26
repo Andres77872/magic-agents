@@ -113,14 +113,20 @@ class GraphEventDispatcher:
             self._outgoing.setdefault(edge.source, []).append(edge)
     
     def _build_trackers(self):
-        """Create input trackers for each node based on incoming edges."""
+        """
+        Create input trackers for each node based on incoming edges.
+        
+        CRITICAL FIX: Passes edge.id to InputInfo, enabling edge-level tracking
+        for fan-in scenarios. Each edge gets tracked independently.
+        """
         for node_id in self.nodes.keys():
             incoming = self._incoming.get(node_id, [])
             
-            # Build expected inputs from incoming edges
+            # Build expected inputs from incoming edges - KEY CHANGE: include edge.id
             expected_inputs = [
                 InputInfo(
-                    handle=edge.targetHandle,
+                    edge_id=edge.id,           # PRIMARY KEY for tracking
+                    handle=edge.targetHandle,  # Routing key
                     source_node=edge.source,
                     source_handle=edge.sourceHandle
                 )
@@ -133,10 +139,10 @@ class GraphEventDispatcher:
             )
             
             logger.debug(
-                "Node %s tracker: expects %d inputs from %s",
+                "Node %s tracker: expects %d inputs from edges %s",
                 node_id,
                 len(expected_inputs),
-                [i.source_node for i in expected_inputs]
+                [i.edge_id for i in expected_inputs]
             )
     
     def get_source_nodes(self) -> List[str]:

@@ -6,6 +6,8 @@ particularly for conditional nodes and their edge connections.
 
 Handle validation enforces the clean-break policy: legacy handles like
 handle_generated_end are rejected at build time.
+
+NEW (Phase 1): Added targetHandle validation via validate_edge_target_handles().
 """
 
 from __future__ import annotations
@@ -19,8 +21,12 @@ if TYPE_CHECKING:
 
 from magic_agents.util.handle_registry import (
     is_valid_source_handle,
+    is_valid_target_handle,
     is_legacy_rejected_handle,
     get_node_output_handles_from_instance,
+    get_node_input_handles_from_instance,
+    get_port_cardinality,
+    is_multi_compatible_port,
     LEGACY_REJECTED_HANDLES,
 )
 
@@ -330,12 +336,299 @@ def validate_edge_handles(
     return errors
 
 
-def run_all_validations(graph: 'AgentFlowModel') -> List[Dict[str, Any]]:
+def validate_edge_target_handles(
+    nodes: Dict[str, Any],
+    edges: List['EdgeNodeModel'],
+    mode: str = "warn"
+) -> List[Dict[str, Any]]:
+    """
+    Validate edge targetHandle values against node input handle contracts.
+    
+    NEW function (Phase 1) - parallel to validate_edge_handles() for input side.
+    
+    Validation mode: shadow + warn by default (first release).
+    - shadow/warn: unknown handles pass with warning (legacy synthesis)
+    - strict: unknown handles rejected (deferred to follow-up)
+    
+    Checks:
+    1. targetHandle must be valid for the target node's input contract
+    2. Dynamic handles (handle-tool-definition-*, handle_parser_input_*) pass
+    3. VOID nodes accept any handle (sink node)
+    4. Nodes with custom handles validated against instance
+    
+    Args:
+        nodes: Dictionary of node_id -> Node instance
+        edges: List of EdgeNodeModel
+        mode: Validation mode ("shadow", "warn", "strict")
+        
+    Returns:
+        List of validation errors/warnings
+    """
+    errors = []
+    
+    for edge in edges:
+        target_handle = edge.targetHandle
+        
+        # Skip edges without targetHandle (implicit routing or VOID)
+        if not target_handle:
+            continue
+        
+        # Get target node
+        target_node = nodes.get(edge.target)
+        if not target_node:
+            # Already handled by validate_edge_connectivity
+            continue
+        
+        # Get target node type
+        target_node_type = getattr(target_node, 'node_type', None)
+        if not target_node_type:
+            # Node might be stub or error node - skip handle validation
+            continue
+        
+        # Get input handles from the node instance (if available)
+        instance_handles = get_node_input_handles_from_instance(target_node)
+        
+        # Validate the target handle
+        is_valid, reason = is_valid_target_handle(
+            target_handle,
+            target_node_type,
+            instance_handles if instance_handles else None,
+            mode
+        )
+        
+        if not is_valid:
+            # In shadow/warn mode, this produces a warning (not blocking)
+            # In strict mode, this would be an error (deferred)
+            severity = "warning" if mode in ("shadow", "warn") else "error"
+            errors.append({
+                "type": "InvalidTargetHandle",
+                "severity": severity,
+                "code": "PORT_TARGET_HANDLE_UNKNOWN",
+                "edge_id": getattr(edge, 'id', 'unknown'),
+                "source": edge.source,
+                "target": edge.target,
+                "sourceHandle": edge.sourceHandle,
+                "targetHandle": target_handle,
+                "error_message": (
+                    f"Edge targetHandle '{target_handle}' is not a recognized input "
+                    f"for node '{edge.target}' (type: {target_node_type}). {reason}"
+                ),
+                "node_type": target_node_type,
+                "reason": reason,
+                "suggestion": (
+                    f"Check node's input handles or use canonical handles for {target_node_type}. "
+                    f"See docs/JSON_CONTRACT.md for valid handles."
+                )
+            })
+        elif "Opaque/legacy" in reason:
+            # Valid but opaque/legacy - produce advisory warning in warn mode
+            if mode == "warn":
+                errors.append({
+                    "type": "OpaqueTargetHandle",
+                    "severity": "warning",
+                    "code": "PORT_TARGET_HANDLE_LEGACY",
+                    "edge_id": getattr(edge, 'id', 'unknown'),
+                    "source": edge.source,
+                    "target": edge.target,
+                    "sourceHandle": edge.sourceHandle,
+                    "targetHandle": target_handle,
+                    "error_message": (
+                        f"Edge targetHandle '{target_handle}' is not in canonical registry "
+                        f"for node '{edge.target}' (type: {target_node_type}). "
+                        f"Using legacy synthesis - consider declaring input handles."
+                    ),
+                    "node_type": target_node_type,
+                    "reason": reason,
+                    "suggestion": (
+                        f"Consider adding '{target_handle}' to the input handle registry "
+                        f"for {target_node_type} for explicit validation."
+                    )
+                })
+    
+    return errors
+
+
+def validate_edge_fan_in_compatibility(
+    nodes: Dict[str, Any],
+    edges: List['EdgeNodeModel'],
+    mode: str = "warn"
+) -> List[Dict[str, Any]]:
+    """
+    Validate fan-in compatibility for multi-edge scenarios.
+    
+    NEW function (Phase 2) - validates cardinality and multi-compatibility.
+    
+    Rules:
+    1. Multi-edge fan-in to the same targetHandle is SUPPORTED (not banned)
+    2. Exclusive ports (cardinality="one", exclusive=True) with multiple edges: warning/error
+    3. Ambiguous ports (no declaration) with multiple edges: advisory warning
+    4. Multi-compatible ports (cardinality="many", multi_compatible=True): pass
+    5. Mixed-type fan-in allowed ONLY with explicit multi-compatibility declaration
+    
+    Args:
+        nodes: Dictionary of node_id -> Node instance
+        edges: List of EdgeNodeModel
+        mode: Validation mode ("shadow", "warn", "strict")
+        
+    Returns:
+        List of validation errors/warnings
+    """
+    errors = []
+    
+    # Group edges by target node and targetHandle
+    fan_in_groups: Dict[str, Dict[str, List['EdgeNodeModel']]] = {}
+    
+    for edge in edges:
+        target_handle = edge.targetHandle
+        if not target_handle:
+            continue
+        
+        target_node = nodes.get(edge.target)
+        if not target_node:
+            continue
+        
+        # Group by (target_node_id, targetHandle)
+        target_node_id = edge.target
+        fan_in_groups.setdefault(target_node_id, {})
+        fan_in_groups[target_node_id].setdefault(target_handle, []).append(edge)
+    
+    # Check each fan-in group
+    for target_node_id, handle_groups in fan_in_groups.items():
+        target_node = nodes.get(target_node_id)
+        if not target_node:
+            continue
+        
+        target_node_type = getattr(target_node, 'node_type', None)
+        if not target_node_type:
+            continue
+        
+        for target_handle, edges_to_handle in handle_groups.items():
+            # Single edge - no fan-in concern
+            if len(edges_to_handle) <= 1:
+                continue
+            
+            # Get cardinality info for this port
+            cardinality = get_port_cardinality(target_node_type, target_handle)
+            
+            # Case 1: Exclusive port with multiple edges
+            if cardinality.exclusive and cardinality.cardinality == "one":
+                severity = "error" if mode == "strict" else "warning"
+                errors.append({
+                    "type": "PortCardinalityViolation",
+                    "severity": severity,
+                    "code": "PORT_CARDINALITY_EXCLUSIVE_VIOLATION",
+                    "target_node": target_node_id,
+                    "target_handle": target_handle,
+                    "node_type": target_node_type,
+                    "edge_count": len(edges_to_handle),
+                    "edge_ids": [e.id for e in edges_to_handle],
+                    "error_message": (
+                        f"Port '{target_handle}' on node '{target_node_id}' (type: {target_node_type}) "
+                        f"is declared as exclusive (cardinality='one') but has {len(edges_to_handle)} "
+                        f"incoming edges. Exclusive ports should have at most one edge."
+                    ),
+                    "cardinality_info": {
+                        "cardinality": cardinality.cardinality,
+                        "exclusive": cardinality.exclusive,
+                        "multi_compatible": cardinality.multi_compatible,
+                    },
+                    "suggestion": (
+                        f"Either change the port to cardinality='many' with multi_compatibility=true, "
+                        f"or reduce edges to this port to 1."
+                    )
+                })
+            
+            # Case 2: Ambiguous cardinality with multiple edges
+            elif cardinality.cardinality == "ambiguous":
+                # Advisory warning - no explicit declaration
+                errors.append({
+                    "type": "FanInCardinalityAmbiguous",
+                    "severity": "warning",
+                    "code": "PORT_FAN_IN_CARDINALITY_AMBIGUOUS",
+                    "target_node": target_node_id,
+                    "target_handle": target_handle,
+                    "node_type": target_node_type,
+                    "edge_count": len(edges_to_handle),
+                    "edge_ids": [e.id for e in edges_to_handle],
+                    "error_message": (
+                        f"Port '{target_handle}' on node '{target_node_id}' (type: {target_node_type}) "
+                        f"has {len(edges_to_handle)} incoming edges but no explicit cardinality declaration. "
+                        f"Fan-in behavior is ambiguous - consider declaring cardinality for clarity."
+                    ),
+                    "suggestion": (
+                        f"Declare cardinality for port '{target_handle}' in PORT_CARDINALITY registry: "
+                        f"cardinality='many' and multi_compatible=true for safe multi-edge fan-in, "
+                        f"or cardinality='one' and exclusive=true to enforce single-edge constraint."
+                    )
+                })
+            
+            # Case 3: Multi-compatible port - safe fan-in
+            elif cardinality.multi_compatible:
+                # Safe - multi-edge fan-in is explicitly supported
+                logger.debug(
+                    "Safe fan-in: %d edges to %s.%s (cardinality=%s, multi_compatible=true)",
+                    len(edges_to_handle), target_node_id, target_handle, cardinality.cardinality
+                )
+                # Optionally: produce informational message in shadow mode
+                if mode == "shadow":
+                    errors.append({
+                        "type": "FanInInfo",
+                        "severity": "info",
+                        "code": "PORT_FAN_IN_DECLARED_MULTI",
+                        "target_node": target_node_id,
+                        "target_handle": target_handle,
+                        "node_type": target_node_type,
+                        "edge_count": len(edges_to_handle),
+                        "edge_ids": [e.id for e in edges_to_handle],
+                        "error_message": (
+                            f"Port '{target_handle}' on node '{target_node_id}' has {len(edges_to_handle)} "
+                            f"incoming edges (safe: port declares multi_compatibility=true)."
+                        ),
+                        "merge_policy": cardinality.merge_policy,
+                    })
+            
+            # Case 4: Non-exclusive, non-multi-compatible with multiple edges (unusual)
+            elif not cardinality.exclusive and not cardinality.multi_compatible:
+                # Warning - this configuration is unusual
+                errors.append({
+                    "type": "FanInConfigurationUnusual",
+                    "severity": "warning",
+                    "code": "PORT_FAN_IN_NON_EXCLUSIVE_NOT_MULTI",
+                    "target_node": target_node_id,
+                    "target_handle": target_handle,
+                    "node_type": target_node_type,
+                    "edge_count": len(edges_to_handle),
+                    "edge_ids": [e.id for e in edges_to_handle],
+                    "error_message": (
+                        f"Port '{target_handle}' on node '{target_node_id}' has {len(edges_to_handle)} "
+                        f"incoming edges. Port is not exclusive but also not explicitly multi-compatible. "
+                        f"Recommend declaring multi_compatibility=true for clarity."
+                    ),
+                    "suggestion": (
+                        f"Set multi_compatibility=true in PORT_CARDINALITY for '{target_handle}' "
+                        f"to explicitly allow multi-edge fan-in."
+                    )
+                })
+    
+    return errors
+
+
+def run_all_validations(graph: 'AgentFlowModel', mode: str = "warn") -> List[Dict[str, Any]]:
     """
     Run all graph validations.
     
+    NEW (Phase 2): Includes fan-in compatibility validation.
+    
+    Validation order:
+    1. Edge connectivity (structural)
+    2. Source handle validation (clean-break policy)
+    3. Target handle validation (Phase 1)
+    4. Fan-in compatibility validation (Phase 2 NEW)
+    5. Conditional-specific validation
+    
     Args:
         graph: The agent flow model to validate
+        mode: Validation mode ("shadow", "warn", "strict")
         
     Returns:
         Combined list of all validation errors/warnings
@@ -347,6 +640,12 @@ def run_all_validations(graph: 'AgentFlowModel') -> List[Dict[str, Any]]:
     
     # Edge handle validation (clean-break: reject legacy handles)
     errors.extend(validate_edge_handles(graph.nodes, graph.edges))
+    
+    # Target handle validation (Phase 1)
+    errors.extend(validate_edge_target_handles(graph.nodes, graph.edges, mode))
+    
+    # NEW: Fan-in compatibility validation (Phase 2)
+    errors.extend(validate_edge_fan_in_compatibility(graph.nodes, graph.edges, mode))
     
     # Conditional-specific validation
     errors.extend(validate_graph_conditionals(graph))

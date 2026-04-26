@@ -9,6 +9,8 @@ class UserInputNodeModel(BaseNodeModel):
     """
     UserInput node model - accepts various field names from JSON.
     The JSON definition is the source of truth.
+    
+    Session management aligned with backend thread persistence contract.
     """
     template: Optional[str] = None
     text: Optional[str] = None
@@ -17,6 +19,10 @@ class UserInputNodeModel(BaseNodeModel):
     files: Optional[list[Any] | Any] = None
     images: Optional[list[Any] | Any] = None
     extras: Optional[dict[str, Any]] = None  # Client-provided contextual data
+    
+    # Session configuration for thread persistence
+    session_id: Optional[str] = None  # External thread/conversation ID (reuse from backend)
+    session_required: bool = False  # If True, enforce session presence (auto-create fallback)
 
     @model_validator(mode='after')
     def resolve_text_content(self):

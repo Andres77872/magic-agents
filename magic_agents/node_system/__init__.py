@@ -1,9 +1,64 @@
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional, Any
 
 import networkx as nx
 
 from magic_agents.node_system.NodeChat import NodeChat
+
+
+# ============================================================================
+# LAYOUT PRESETS - CRITICAL: Must match client LayoutPresets EXACTLY
+# ============================================================================
+
+# Per spec/design: Backend LAYOUT_PRESETS MUST match client LayoutPresets (autoLayout.ts:297-318)
+# This ensures identical layout behavior whether server or client computes positions.
+# DO NOT modify these values without updating client LayoutPresets in parallel.
+
+LAYOUT_PRESETS = {
+    "standard": {
+        "direction": "LR",
+        "horizontalSpacing": 500,
+        "verticalSpacing": 400,
+    },
+    "compact": {
+        "direction": "LR",
+        "horizontalSpacing": 420,
+        "verticalSpacing": 320,
+    },
+    "vertical": {
+        "direction": "TB",  # Top-to-bottom
+        "horizontalSpacing": 400,
+        "verticalSpacing": 450,
+    },
+    "spacious": {
+        "direction": "LR",
+        "horizontalSpacing": 650,
+        "verticalSpacing": 500,
+    },
+}
+
+ALLOWED_PRESETS = list(LAYOUT_PRESETS.keys())  # ["standard", "compact", "vertical", "spacious"]
+
+
+def resolve_preset(preset_name: str) -> Dict[str, Any]:
+    """
+    Resolve preset name to layout options dict.
+    
+    Args:
+        preset_name: One of "standard", "compact", "vertical", "spacious"
+        
+    Returns:
+        Dict with direction, horizontalSpacing, verticalSpacing
+        
+    Raises:
+        ValueError: If preset_name not in ALLOWED_PRESETS
+    """
+    if preset_name not in ALLOWED_PRESETS:
+        raise ValueError(
+            f"Invalid preset '{preset_name}'. Valid presets: {', '.join(ALLOWED_PRESETS)}"
+        )
+    return LAYOUT_PRESETS[preset_name]
 from magic_agents.node_system.NodeClientLLM import NodeClientLLM
+from magic_agents.node_system.NodeConstant import NodeConstant
 from magic_agents.node_system.NodeEND import NodeEND
 from magic_agents.node_system.NodeFetch import NodeFetch
 from magic_agents.node_system.NodeLLM import NodeLLM
@@ -81,6 +136,171 @@ def assign_node_positions(nodes: List[Dict], graph: nx.DiGraph, sorted_nodes: Li
     return list(node_dict.values())
 
 
+def arrange_with_sizes(
+    nodes: List[Dict],
+    edges: List[Dict],
+    sizes: Optional[Dict[str, Dict[str, int]]] = None,
+    options: Optional[Dict[str, Any]] = None
+) -> Dict[str, Dict[str, int]]:
+    """
+    Compute node positions using size-aware topological layout.
+    
+    Args:
+        nodes: List of node dicts (must include 'id' field)
+        edges: List of edge dicts (must include 'source', 'target')
+        sizes: Optional mapping {node_id: {'width': int, 'height': int}}
+        options: Optional dict with:
+            - direction: "LR" (left-right) or "TB" (top-bottom)
+            - horizontalSpacing: int (px between columns/rows)
+            - verticalSpacing: int (px between nodes in same layer)
+            
+    Returns:
+        Mapping {node_id: {'x': int, 'y': int}}
+        
+    Direction behavior:
+        - "LR": Layers are columns; X increases per layer; Y varies within layer
+        - "TB": Layers are rows; Y increases per layer; X varies within layer
+        - Coordinate assignment swaps X/Y based on direction
+        
+    Size-aware spacing:
+        - Horizontal spacing = max(prev_layer_max_width, options.horizontalSpacing) + SPACING_BUFFER
+        - Vertical spacing = node_height + options.verticalSpacing
+        
+    Default options (when options omitted):
+        - direction: "LR"
+        - horizontalSpacing: 250
+        - verticalSpacing: 100
+    """
+    # Extract options or use defaults
+    direction = options.get('direction', 'LR') if options else 'LR'
+    horizontal_spacing = options.get('horizontalSpacing', 250) if options else 250
+    vertical_spacing = options.get('verticalSpacing', 100) if options else 100
+    
+    # Legacy default spacing values (for backward compatibility)
+    DEFAULT_HORIZONTAL = horizontal_spacing
+    DEFAULT_VERTICAL = 100  # Base height estimate
+    SPACING_BUFFER = 50
+    
+    # Handle empty nodes list
+    if len(nodes) == 0:
+        return {}
+    
+    # Build graph from edges
+    graph = build_graph(edges)
+    
+    # Get topological order (nodes in edges)
+    sorted_node_ids = perform_topological_sort(graph)
+    
+    # Collect all node IDs from input
+    all_node_ids = set(n.get('id') for n in nodes)
+    
+    # If no edges, all nodes are disconnected - position them linearly
+    if len(sorted_node_ids) == 0 and len(nodes) > 0:
+        positions: Dict[str, Dict[str, int]] = {}
+        current_x = 0
+        for node in nodes:
+            node_id = node.get('id')
+            node_height = DEFAULT_VERTICAL
+            if sizes and node_id in sizes:
+                node_height = sizes[node_id].get('height', DEFAULT_VERTICAL)
+            positions[node_id] = {
+                'x': int(current_x),
+                'y': int(0)
+            }
+            current_x += DEFAULT_HORIZONTAL + SPACING_BUFFER
+        return positions
+    
+    # Compute levels using longest path length from sources
+    levels: Dict[str, int] = {}
+    for node_id in sorted_node_ids:
+        preds = list(graph.predecessors(node_id))
+        if not preds:
+            levels[node_id] = 0
+        else:
+            levels[node_id] = 1 + max(levels.get(pred, 0) for pred in preds)
+    
+    # Group nodes by level (layer)
+    layer_groups: Dict[int, List[str]] = {}
+    for node_id in sorted_node_ids:
+        level = levels[node_id]
+        if level not in layer_groups:
+            layer_groups[level] = []
+        layer_groups[level].append(node_id)
+    
+    # Compute max width per layer for size-aware horizontal spacing
+    layer_max_widths: Dict[int, int] = {}
+    for level, node_ids in layer_groups.items():
+        max_width = DEFAULT_HORIZONTAL
+        for node_id in node_ids:
+            if sizes and node_id in sizes:
+                node_width = sizes[node_id].get('width', DEFAULT_HORIZONTAL)
+                max_width = max(max_width, node_width)
+        layer_max_widths[level] = max_width
+    
+    # Calculate positions with direction-aware coordinate assignment
+    # For LR: layers are columns (X increases per layer, Y within layer)
+    # For TB: layers are rows (Y increases per layer, X within layer)
+    positions: Dict[str, Dict[str, int]] = {}
+    layer_distance = 0  # Distance between layers (X for LR, Y for TB)
+    
+    # Process layers in order
+    max_level = max(layer_groups.keys()) if layer_groups else 0
+    for level in range(max_level + 1):
+        if level not in layer_groups:
+            continue
+        
+        node_ids_in_layer = layer_groups[level]
+        
+        # Calculate within-layer positions (Y for LR, X for TB)
+        within_layer_pos = 0
+        for node_id in node_ids_in_layer:
+            # Get node height for size-aware spacing
+            node_height = DEFAULT_VERTICAL
+            if sizes and node_id in sizes:
+                node_height = sizes[node_id].get('height', DEFAULT_VERTICAL)
+            
+            # Apply direction-aware coordinate assignment
+            if direction == 'LR':
+                # Left-to-right: layers are columns
+                positions[node_id] = {
+                    'x': int(layer_distance),
+                    'y': int(within_layer_pos)
+                }
+            else:
+                # Top-to-bottom: layers are rows (swap X/Y)
+                positions[node_id] = {
+                    'x': int(within_layer_pos),
+                    'y': int(layer_distance)
+                }
+            
+            # Next node in same layer: add spacing
+            within_layer_pos += node_height + vertical_spacing
+        
+        # Next layer: add layer spacing (horizontal spacing between layers)
+        layer_distance += (layer_max_widths[level] if direction == 'LR' else DEFAULT_VERTICAL) + horizontal_spacing
+    
+    # Handle disconnected nodes (nodes not in graph edges)
+    node_ids_in_graph = set(graph.nodes())
+    disconnected_nodes = all_node_ids - node_ids_in_graph
+    
+    # Position disconnected nodes after the main graph
+    offset = layer_distance
+    for node_id in disconnected_nodes:
+        if direction == 'LR':
+            positions[node_id] = {
+                'x': int(offset),
+                'y': int(0)
+            }
+        else:
+            positions[node_id] = {
+                'x': int(0),
+                'y': int(offset)
+            }
+        offset += DEFAULT_HORIZONTAL + SPACING_BUFFER
+    
+    return positions
+
+
 def sort_nodes(nodes: List[Dict], edges: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
     """Main function to sort nodes ensuring correct execution order and positioning."""
     graph = build_graph(edges)
@@ -95,6 +315,7 @@ def sort_nodes(nodes: List[Dict], edges: List[Dict]) -> Tuple[List[Dict], List[D
 __all__ = [
     "NodeChat",
     "NodeClientLLM",
+    "NodeConstant",
     "NodeEND",
     "NodeFetch",
     "NodeLLM",
@@ -112,5 +333,9 @@ __all__ = [
     "perform_topological_sort",
     "sort_edges_by_nodes_order",
     "assign_node_positions",
-    "sort_nodes"
+    "sort_nodes",
+    "arrange_with_sizes",
+    "LAYOUT_PRESETS",
+    "ALLOWED_PRESETS",
+    "resolve_preset",
 ]

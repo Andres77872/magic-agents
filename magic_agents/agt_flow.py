@@ -19,6 +19,7 @@ from magic_agents.models.factory.Nodes import (
     ModelAgentFlowTypesModel,
     LlmNodeModel,
     TextNodeModel,
+    ConstantNodeModel,
     UserInputNodeModel,
     ParserNodeModel,
     FetchNodeModel,
@@ -30,6 +31,7 @@ from magic_agents.models.factory.Nodes import (
     ConditionalNodeModel,
     PythonExecNodeModel,
     McpNodeModel,
+    ChatNodeModel,
 )
 from magic_agents.models.model_agent_run_log import ModelAgentRunLog
 from magic_agents.node_system import (
@@ -37,6 +39,7 @@ from magic_agents.node_system import (
     NodeLLM,
     NodeEND,
     NodeText,
+    NodeConstant,
     NodeUserInput,
     NodeFetch,
     NodeClientLLM,
@@ -55,7 +58,16 @@ from magic_agents.execution import (
 )
 from magic_agents.util.const import HANDLE_VOID
 from magic_agents.util.env_resolver import resolve_env_placeholders
-from magic_agents.util.graph_validator import ConditionalEdgeValidator, validate_edge_handles
+from magic_agents.util.graph_validator import (
+    ConditionalEdgeValidator,
+    validate_edge_handles,
+    run_all_validations,
+)
+from magic_agents.models.factory.AgentFlowModel import (
+    AgentFlowModel,
+    ContractConfig,
+    GraphContractReport,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +141,7 @@ def _assign_tool_handles(nodes: list[dict], edges: list[dict]) -> None:
 
     The counter is per-LLM-node, so each LLM node gets its own sequence.
     targetHandle is only auto-assigned when not already explicit.
-    sourceHandle is always backfilled for tool-capable edges (preserving existing values).
+    sourceHandle is ALWAYS overwritten for tool-capable edges (backend is authoritative).
     """
     node_map = {n['id']: n for n in nodes}
     tool_counters: dict[str, int] = {}  # LLM node ID -> counter
@@ -165,7 +177,7 @@ def _assign_tool_handles(nodes: list[dict], edges: list[dict]) -> None:
         else:
             # python_exec: output → default
             resolved_handle = handles.get('output', 'handle-tool-definition')
-        edge.setdefault('sourceHandle', resolved_handle)
+        edge['sourceHandle'] = resolved_handle
 
         # Only auto-assign targetHandle when not already explicit
         if not edge.get('targetHandle'):
@@ -204,10 +216,11 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False) -> Any:
     
     # Mapping of node types to (constructor, model)
     node_map = {
-        ModelAgentFlowTypesModel.CHAT: (NodeChat, None),
+        ModelAgentFlowTypesModel.CHAT: (NodeChat, ChatNodeModel),
         ModelAgentFlowTypesModel.LLM: (NodeLLM, LlmNodeModel),
         ModelAgentFlowTypesModel.END: (NodeEND, None),
         ModelAgentFlowTypesModel.TEXT: (NodeText, TextNodeModel),
+        ModelAgentFlowTypesModel.CONSTANT: (NodeConstant, ConstantNodeModel),
         ModelAgentFlowTypesModel.USER_INPUT: (NodeUserInput, UserInputNodeModel),
         ModelAgentFlowTypesModel.PARSER: (NodeParser, ParserNodeModel),
         ModelAgentFlowTypesModel.FETCH: (NodeFetch, FetchNodeModel),
@@ -237,9 +250,7 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False) -> Any:
     
     constructor, model_cls = node_map[node_type]
     
-    if node_type == ModelAgentFlowTypesModel.CHAT:
-        return constructor(load_chat=load_chat, **extra, **node_data)
-    elif node_type == ModelAgentFlowTypesModel.CONDITIONAL:
+    if node_type == ModelAgentFlowTypesModel.CONDITIONAL:
         # Validate conditional config using Pydantic model
         try:
             validated = ConditionalNodeModel(**node_data)
@@ -472,9 +483,12 @@ def validate_graph(nodes: list[dict], edges: list[dict]) -> dict:
     }
 
 
-def build(agt_data, message: str, images: list[str] = None, load_chat=None, extras: Optional[dict[str, Any]] = None) -> AgentFlowModel:
+def build(agt_data, message: str, images: list[str] = None, load_chat=None, extras: Optional[dict[str, Any]] = None, history_messages: Optional[list[dict[str, Any]]] = None) -> AgentFlowModel:
     """
     Prepare and build the agent flow graph from input data and message.
+    
+    CRITICAL FIX: Ensures all edges have unique edge.id for fan-in tracking.
+    Edge IDs are assigned before tracker construction.
 
     Args:
         agt_data: Agent data. Can be either:
@@ -482,9 +496,11 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
             - Nested structure: {'content': {'nodes': [...], 'edges': [...]}, ...}
         message (str): Message.
         images (list[str]): Images. Defaults to None.
-        load_chat: Load chat function. Defaults to None.
+        load_chat: Load chat function. Defaults to None. (DEPRECATED - backend-authoritative)
         extras (Optional[dict[str, Any]]): Client-provided contextual data that flows 
             through UserInput node to downstream nodes. Defaults to None.
+        history_messages (Optional[list[dict[str, Any]]]): Backend-authoritative persisted + runtime
+            history messages. Injected into CHAT node data as Slot 1 base. Defaults to None.
 
     Returns:
         AgentFlowModel: Agent flow graph. If validation fails, the graph will contain error information.
@@ -539,6 +555,12 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
     # Auto-generate unique targetHandle values for tool->LLM edges
     _assign_tool_handles(agt_data['nodes'], agt_data['edges'])
     
+    # CRITICAL: Ensure ALL edges have unique edge.id for fan-in tracking
+    # This is the P0 fix - edge.id is the primary key for NodeInputTracker
+    for edge in agt_data['edges']:
+        if 'id' not in edge or not edge['id']:
+            edge['id'] = uuid.uuid4().hex
+    
     nodes, edges = sort_nodes(agt_data['nodes'], agt_data['edges'])
     agt_data['nodes'] = nodes
     agt_data['edges'] = edges
@@ -561,7 +583,14 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
                 # Pass extras to UserInput node if provided
                 if extras is not None:
                     node['data']['extras'] = extras
+            elif node['type'] == ModelAgentFlowTypesModel.CHAT:
+                # BACKEND-AUTHORITATIVE: Pass history_messages to Chat node
+                # Per spec.md: Backend prepares persisted + runtime history (Slot 1)
+                # NodeChat reads this from data and uses as base_messages
+                if history_messages is not None:
+                    node['data']['history_messages'] = history_messages
         elif node['type'] == ModelAgentFlowTypesModel.END:
+            # END edges also get unique ID
             agt_data['edges'].append({
                 "id": uuid.uuid4().hex,
                 "source": node['id'],
@@ -653,6 +682,48 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
     # Set validation errors on model (private attribute)
     if validation_errors:
         agt._validation_errors = validation_errors
+    
+    # NEW (Phase 3): Run full contract validation chain and attach report
+    # Use contract_config.mode to drive validation behavior (shadow + warn default)
+    mode = agt.contract_config.mode
+    
+    # Skip validation entirely if mode is "off" (rollback path)
+    if mode == "off":
+        contract_report = GraphContractReport(
+            mode=mode,
+            edge_count=len(agt.edges),
+            node_count=len(agt.nodes),
+            diagnostics=[],  # No diagnostics when off
+        )
+        agt._contract_report = contract_report
+        logger.debug("Contract validation disabled (mode=off)")
+    else:
+        # Run full validation chain
+        contract_diagnostics = run_all_validations(agt, mode=mode)
+        
+        # Create and attach GraphContractReport
+        contract_report = GraphContractReport(
+            mode=mode,
+            edge_count=len(agt.edges),
+            node_count=len(agt.nodes),
+            diagnostics=contract_diagnostics,
+        )
+        agt._contract_report = contract_report
+        
+        # In warn mode: surface diagnostics as warnings
+        if mode == "warn":
+            for diag in contract_diagnostics:
+                severity = diag.get('severity', 'warning')
+                if severity == 'error':
+                    # In warn mode, errors become warnings (shadow + warn combined)
+                    logger.warning("Contract validation: %s", diag.get('error_message', str(diag)))
+                elif severity == 'warning':
+                    logger.warning("Contract validation: %s", diag.get('error_message', str(diag)))
+                elif severity == 'info':
+                    logger.debug("Contract info: %s", diag.get('error_message', str(diag)))
+        
+        # In shadow mode: diagnostics computed but not surfaced
+        # (attached to report only, no logging)
     
     return agt
 

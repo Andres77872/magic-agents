@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 from magic_agents.models.factory.Nodes import FetchNodeModel
 from magic_agents.node_system.Node import Node
 from magic_agents.util.env_resolver import resolve_env_placeholders
+from magic_agents.util.primitive_coercion import coerce_primitive_by_type, input_has_value
 
 logger = logging.getLogger(__name__)
 
@@ -213,29 +214,65 @@ class NodeFetch(Node):
     """
     # Default output handle name - can be overridden by JSON data.handles
     DEFAULT_OUTPUT_HANDLE = 'handle_fetch_output'
+    DEFAULT_INPUT_URL = 'handle-url'
+    DEFAULT_INPUT_METHOD = 'handle-fetch-method'
+    DEFAULT_INPUT_DATA = 'handle-fetch-data'
+    DEFAULT_INPUT_JSON_DATA = 'handle-fetch-json_data'
+    DEFAULT_INPUT_HEADERS = 'handle-fetch-headers'
 
     def __init__(self,
                  data: FetchNodeModel,
                  handles: Optional[dict] = None,
                  **kwargs) -> None:
         super().__init__(**kwargs)
-        self.method = data.method.upper().strip()
-        self.headers = data.headers or {}
-        self.params = data.params or None
-        self.url = data.url
-        self.data = data.data or None
+        self._default_method = (data.method or 'GET').upper().strip()
+        self._default_headers = data.headers or {}
+        self._default_params = data.params or None
+        self._default_url = data.url
+        self._default_data = data.data or None
         # Add jsondata attribute if it exists in the model
-        self.jsondata = getattr(data, 'json_data', None)
-        if not self.jsondata:
-            self.jsondata = None
+        self._default_jsondata = getattr(data, 'json_data', None)
+        if not self._default_jsondata:
+            self._default_jsondata = None
+        self.method = self._default_method
+        self.headers = self._default_headers
+        self.params = self._default_params
+        self.url = self._default_url
+        self.data = self._default_data
+        self.jsondata = self._default_jsondata
         # Allow JSON to override handle names
         handles = handles or {}
+        self.INPUT_HANDLE_URL = handles.get('url', self.DEFAULT_INPUT_URL)
+        self.INPUT_HANDLE_METHOD = handles.get('method', self.DEFAULT_INPUT_METHOD)
+        self.INPUT_HANDLE_DATA = handles.get('data', self.DEFAULT_INPUT_DATA)
+        self.INPUT_HANDLE_JSON_DATA = handles.get('json_data', self.DEFAULT_INPUT_JSON_DATA)
+        self.INPUT_HANDLE_HEADERS = handles.get('headers', self.DEFAULT_INPUT_HEADERS)
         self.OUTPUT_HANDLE = handles.get('output', handles.get('response', self.DEFAULT_OUTPUT_HANDLE))
         # Tool mode configuration
         self.tool_mode = getattr(data, 'tool_mode', False)
         self.tool_name = getattr(data, 'tool_name', None) or 'fetch'
         self.tool_parameters = getattr(data, 'tool_parameters', None)
         self.debug = getattr(data, 'debug', False)
+
+    def _resolve_runtime_request_config(self) -> tuple[str, str, Any, Any, Any]:
+        url = self._default_url
+        method = self._default_method
+        headers = self._default_headers
+        data = self._default_data
+        jsondata = self._default_jsondata
+
+        if input_has_value(self.inputs, self.INPUT_HANDLE_URL):
+            url = coerce_primitive_by_type(self.inputs[self.INPUT_HANDLE_URL], 'str', field_name=self.INPUT_HANDLE_URL)
+        if input_has_value(self.inputs, self.INPUT_HANDLE_METHOD):
+            method = coerce_primitive_by_type(self.inputs[self.INPUT_HANDLE_METHOD], 'str', field_name=self.INPUT_HANDLE_METHOD).upper().strip()
+        if input_has_value(self.inputs, self.INPUT_HANDLE_HEADERS):
+            headers = self.inputs[self.INPUT_HANDLE_HEADERS]
+        if input_has_value(self.inputs, self.INPUT_HANDLE_DATA):
+            data = self.inputs[self.INPUT_HANDLE_DATA]
+        if input_has_value(self.inputs, self.INPUT_HANDLE_JSON_DATA):
+            jsondata = self.inputs[self.INPUT_HANDLE_JSON_DATA]
+
+        return url, method, headers, data, jsondata
 
     async def fetch(self, session, url, headers, data=None, json_data=None, params=None):
         # Use the appropriate method (GET, POST, PUT, etc.)
@@ -282,6 +319,8 @@ class NodeFetch(Node):
         return json.loads(template.render(self.inputs).replace('\n', ''))
 
     async def process(self, chat_log):
+        self.url, self.method, self.headers, self.data, self.jsondata = self._resolve_runtime_request_config()
+
         # Tool mode: yield callable with explicit schema, do NOT execute fetch
         if self.tool_mode:
             tool_parameters = getattr(self, 'tool_parameters', None)
@@ -304,11 +343,7 @@ class NodeFetch(Node):
         data_to_send = None
         json_data_to_send = None
         params_to_send = None
-        run = False
-        for i in self.inputs.values():
-            if i:
-                run = True
-                break
+        run = any(value is not None for value in self.inputs.values())
         if not run:
             if self.debug:
                 logger.debug("NodeFetch:%s no inputs set; skipping request", self.node_id)

@@ -12,6 +12,7 @@ ModelAgentFlowType = Literal[
     'send_message',
     'chat',
     'text',
+    'constant',
     'void',
     'loop',
     'inner',
@@ -26,6 +27,7 @@ class ModelAgentFlowTypesModel:
     LLM = 'llm'
     END = 'end'
     TEXT = 'text'
+    CONSTANT = 'constant'
     USER_INPUT = 'user_input'
     PARSER = 'parser'
     FETCH = 'fetch'

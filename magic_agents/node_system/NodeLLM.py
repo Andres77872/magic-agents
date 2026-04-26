@@ -11,6 +11,7 @@ from magic_llm.model.ModelChatStream import ChatCompletionModel, ChoiceModel
 
 from magic_agents.models.factory.Nodes import LlmNodeModel
 from magic_agents.node_system.Node import Node
+from magic_agents.util.primitive_coercion import coerce_primitive_by_type, input_has_value
 
 if TYPE_CHECKING:
     from magic_llm.agent import TaskManifest, SubagentBundle
@@ -28,6 +29,12 @@ class NodeLLM(Node):
     DEFAULT_INPUT_CHAT = 'handle-chat'
     DEFAULT_INPUT_SYSTEM_CONTEXT = 'handle-system-context'
     DEFAULT_INPUT_USER_MESSAGE = 'handle_user_message'
+    DEFAULT_INPUT_TEMPERATURE = 'handle-llm-temperature'
+    DEFAULT_INPUT_TOP_P = 'handle-llm-top_p'
+    DEFAULT_INPUT_MAX_TOKENS = 'handle-llm-max_tokens'
+    DEFAULT_INPUT_STREAM = 'handle-llm-stream'
+    DEFAULT_INPUT_ITERATE = 'handle-llm-iterate'
+    DEFAULT_INPUT_JSON_OUTPUT = 'handle-llm-json_output'
     # Output handles
     DEFAULT_OUTPUT_CONTENT = 'handle_streaming_content'
     DEFAULT_OUTPUT_GENERATED = 'handle_generated_content'
@@ -53,24 +60,62 @@ class NodeLLM(Node):
         self.INPUT_HANDLER_CHAT = handles.get('chat', self.DEFAULT_INPUT_CHAT)
         self.INPUT_HANDLER_SYSTEM_CONTEXT = handles.get('system_context', handles.get('system', self.DEFAULT_INPUT_SYSTEM_CONTEXT))
         self.INPUT_HANDLER_USER_MESSAGE = handles.get('user_message', handles.get('message', self.DEFAULT_INPUT_USER_MESSAGE))
+        self.INPUT_HANDLER_TEMPERATURE = handles.get('temperature', self.DEFAULT_INPUT_TEMPERATURE)
+        self.INPUT_HANDLER_TOP_P = handles.get('top_p', self.DEFAULT_INPUT_TOP_P)
+        self.INPUT_HANDLER_MAX_TOKENS = handles.get('max_tokens', self.DEFAULT_INPUT_MAX_TOKENS)
+        self.INPUT_HANDLER_STREAM = handles.get('stream', self.DEFAULT_INPUT_STREAM)
+        self.INPUT_HANDLER_ITERATE = handles.get('iterate', self.DEFAULT_INPUT_ITERATE)
+        self.INPUT_HANDLER_JSON_OUTPUT = handles.get('json_output', handles.get('json_mode', self.DEFAULT_INPUT_JSON_OUTPUT))
         # Output handles
         self.OUTPUT_HANDLE_CONTENT = handles.get('output_content', handles.get('streaming', self.DEFAULT_OUTPUT_CONTENT))
         self.OUTPUT_HANDLE_GENERATED = handles.get('output_generated', handles.get('generated', self.DEFAULT_OUTPUT_GENERATED))
         self.OUTPUT_HANDLE_TOOL_CALLS = handles.get('output_tool_calls', self.DEFAULT_OUTPUT_TOOL_CALLS)
         # Tool input handle prefix (configurable via JSON data.handles.tool_prefix)
         self.INPUT_TOOL_PREFIX = handles.get('tool_prefix', self.DEFAULT_INPUT_TOOL_PREFIX)
+        self._default_iterate = getattr(data, 'iterate', False)
+        self._default_stream = data.stream
+        self._default_json_output = data.json_output
+        self._default_temperature = data.temperature
+        self._default_top_p = data.top_p
+        self._default_max_tokens = data.max_tokens
+        self._base_extra_data = dict(data.extra_data or {})
         # allow re-execution inside Loop when requested
-        self.iterate = getattr(data, 'iterate', False)
-        self.stream = data.stream
-        self.json_output = data.json_output
-        self.extra_data = data.extra_data
+        self.iterate = self._default_iterate
+        self.stream = self._default_stream
+        self.json_output = self._default_json_output
+        self.extra_data = dict(self._base_extra_data)
         self.generated = ''
-        if 'temperature' not in self.extra_data and data.temperature is not None:
-            self.extra_data['temperature'] = data.temperature
-        if 'top_p' not in self.extra_data and data.top_p is not None:
-            self.extra_data['top_p'] = data.top_p
-        if 'max_tokens' not in self.extra_data and data.max_tokens is not None:
-            self.extra_data['max_tokens'] = data.max_tokens
+
+    def _resolve_runtime_value(self, handle: str, default, value_type: str):
+        if input_has_value(self.inputs, handle):
+            return coerce_primitive_by_type(self.inputs[handle], value_type, field_name=handle)
+        return default
+
+    def _build_runtime_extra_data(self) -> dict:
+        extra_data = dict(self._base_extra_data)
+        has_temperature_input = input_has_value(self.inputs, self.INPUT_HANDLER_TEMPERATURE)
+        has_top_p_input = input_has_value(self.inputs, self.INPUT_HANDLER_TOP_P)
+        has_max_tokens_input = input_has_value(self.inputs, self.INPUT_HANDLER_MAX_TOKENS)
+        runtime_temperature = self._resolve_runtime_value(self.INPUT_HANDLER_TEMPERATURE, self._default_temperature, 'float')
+        runtime_top_p = self._resolve_runtime_value(self.INPUT_HANDLER_TOP_P, self._default_top_p, 'float')
+        runtime_max_tokens = self._resolve_runtime_value(self.INPUT_HANDLER_MAX_TOKENS, self._default_max_tokens, 'int')
+
+        if has_temperature_input:
+            extra_data['temperature'] = runtime_temperature
+        elif 'temperature' not in extra_data and runtime_temperature is not None:
+            extra_data['temperature'] = runtime_temperature
+
+        if has_top_p_input:
+            extra_data['top_p'] = runtime_top_p
+        elif 'top_p' not in extra_data and runtime_top_p is not None:
+            extra_data['top_p'] = runtime_top_p
+
+        if has_max_tokens_input:
+            extra_data['max_tokens'] = runtime_max_tokens
+        elif 'max_tokens' not in extra_data and runtime_max_tokens is not None:
+            extra_data['max_tokens'] = runtime_max_tokens
+
+        return extra_data
 
     async def _collect_tools(self) -> tuple[list, dict]:
         """Collect all tool definitions from tool-prefixed input handles.
@@ -244,6 +289,10 @@ class NodeLLM(Node):
         return bundle
 
     async def process(self, chat_log):
+        self.stream = self._resolve_runtime_value(self.INPUT_HANDLER_STREAM, self._default_stream, 'bool')
+        self.iterate = self._resolve_runtime_value(self.INPUT_HANDLER_ITERATE, self._default_iterate, 'bool')
+        self.json_output = self._resolve_runtime_value(self.INPUT_HANDLER_JSON_OUTPUT, self._default_json_output, 'bool')
+        self.extra_data = self._build_runtime_extra_data()
         params = self.inputs
         # Avoid logging full params to prevent leaking content; log keys only
         logger.debug("NodeLLM:%s inputs keys: %s", self.node_id, list(params.keys()))

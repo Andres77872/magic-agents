@@ -1,5 +1,6 @@
 from magic_agents.models.factory.Nodes.BaseNodeModel import ModelAgentFlowTypesModel
 from magic_agents.models.factory.Nodes.ClientNodeModel import ClientNodeModel
+from magic_agents.models.factory.Nodes.ConstantNodeModel import ConstantNodeModel
 from magic_agents.models.factory.Nodes.FetchNodeModel import FetchNodeModel
 from magic_agents.models.factory.Nodes.LlmNodeModel import LlmNodeModel
 from magic_agents.models.factory.Nodes.ParserNodeModel import ParserNodeModel
@@ -17,3 +18,4 @@ from magic_agents.models.factory.Nodes.McpNodeModel import (
     McpNodeModel,
     MCPServerConfig,
 )
+from magic_agents.models.factory.Nodes.ChatNodeModel import ChatNodeModel

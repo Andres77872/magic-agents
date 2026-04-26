@@ -335,3 +335,96 @@ class TestMultipleToolInputs:
             assert "execute_python" in tool_functions
 
         asyncio.get_event_loop().run_until_complete(_test())
+
+
+class TestAssignToolHandlesOverwritesWrongValues:
+    """Regression: _assign_tool_handles MUST overwrite wrong frontend sourceHandle values."""
+
+    def test_overwrites_wrong_fetch_sourcehandle(self):
+        """Backend normalization is authoritative: wrong JSON sourceHandle is overwritten."""
+        nodes = [
+            {"id": "fetch-1", "type": ModelAgentFlowTypesModel.FETCH,
+             "data": {"tool_mode": True, "url": "https://api.example.com"}},
+            {"id": "llm-1", "type": ModelAgentFlowTypesModel.LLM},
+        ]
+        edges = [
+            {"id": "e1", "source": "fetch-1", "target": "llm-1",
+             "sourceHandle": "handle-tool-definition"}  # WRONG! NodeFetch outputs on handle_fetch_output
+        ]
+        _assign_tool_handles(nodes, edges)
+
+        assert edges[0]['sourceHandle'] == 'handle_fetch_output'
+
+    def test_preserves_correct_custom_fetch_sourcehandle(self):
+        """When fetch node has custom handles.output, sourceHandle uses that value."""
+        nodes = [
+            {"id": "fetch-1", "type": ModelAgentFlowTypesModel.FETCH,
+             "data": {"tool_mode": True, "url": "https://api.example.com",
+                      "handles": {"output": "my-custom-handle"}}},
+            {"id": "llm-1", "type": ModelAgentFlowTypesModel.LLM},
+        ]
+        edges = [{"id": "e1", "source": "fetch-1", "target": "llm-1",
+                  "sourceHandle": "wrong-handle"}]
+        _assign_tool_handles(nodes, edges)
+
+        assert edges[0]['sourceHandle'] == 'my-custom-handle'
+
+    def test_python_exec_sourcehandle_is_handle_tool_definition(self):
+        """Python_exec edges get sourceHandle=handle-tool-definition (correct default)."""
+        nodes = [
+            {"id": "py-1", "type": ModelAgentFlowTypesModel.PYTHON_EXEC,
+             "data": {}},
+            {"id": "llm-1", "type": ModelAgentFlowTypesModel.LLM},
+        ]
+        edges = [{"id": "e1", "source": "py-1", "target": "llm-1",
+                  "sourceHandle": "wrong-handle"}]
+        _assign_tool_handles(nodes, edges)
+
+        assert edges[0]['sourceHandle'] == 'handle-tool-definition'
+
+    def test_overwrites_even_when_json_has_handle_tool_definition_for_fetch(self):
+        """Critical regression: JSON may have handle-tool-definition for fetch, must be overwritten."""
+        nodes = [
+            {"id": "fetch-1", "type": ModelAgentFlowTypesModel.FETCH,
+             "data": {"tool_mode": True, "url": "https://api.example.com"}},
+            {"id": "fetch-2", "type": ModelAgentFlowTypesModel.FETCH,
+             "data": {"tool_mode": True, "url": "https://api.example.com"}},
+            {"id": "llm-1", "type": ModelAgentFlowTypesModel.LLM},
+        ]
+        edges = [
+            {"id": "e1", "source": "fetch-1", "target": "llm-1",
+             "sourceHandle": "handle-tool-definition"},  # WRONG - deep_research.json bug
+            {"id": "e2", "source": "fetch-2", "target": "llm-1",
+             "sourceHandle": "handle-tool-definition"},  # WRONG
+        ]
+        _assign_tool_handles(nodes, edges)
+
+        assert edges[0]['sourceHandle'] == 'handle_fetch_output'
+        assert edges[1]['sourceHandle'] == 'handle_fetch_output'
+        assert edges[0]['targetHandle'] == 'handle-tool-definition-0'
+        assert edges[1]['targetHandle'] == 'handle-tool-definition-1'
+
+    def test_propagation_works_after_overwrite(self):
+        """After _assign_tool_handles overwrites wrong sourceHandle, propagation succeeds."""
+        nodes = [
+            {"id": "fetch-1", "type": ModelAgentFlowTypesModel.FETCH,
+             "data": {"tool_mode": True, "url": "https://api.example.com"}},
+            {"id": "llm-1", "type": ModelAgentFlowTypesModel.LLM},
+        ]
+        edges_dict = [
+            {"id": "e1", "source": "fetch-1", "target": "llm-1",
+             "sourceHandle": "handle-tool-definition"}  # WRONG
+        ]
+        _assign_tool_handles(nodes, edges_dict)
+
+        edges = [EdgeNodeModel(**edges_dict[0])]
+        mock_nodes = {"fetch-1": _make_mock_fetch_node(), "llm-1": _make_mock_llm_node()}
+        dispatcher = GraphEventDispatcher(mock_nodes, edges)
+
+        async def _test():
+            outputs = mock_nodes["fetch-1"].outputs
+            await dispatcher.propagate_outputs("fetch-1", outputs)
+
+            assert "handle-tool-definition-0" in mock_nodes["llm-1"].inputs
+
+        asyncio.get_event_loop().run_until_complete(_test())

@@ -15,7 +15,7 @@ import pytest
 from magic_agents.agt_flow import create_node
 from magic_agents.models.factory.Nodes import ModelAgentFlowTypesModel
 from magic_agents.node_system import (
-    NodeChat, NodeLLM, NodeEND, NodeText, NodeUserInput,
+    NodeChat, NodeLLM, NodeEND, NodeText, NodeConstant, NodeUserInput,
     NodeFetch, NodeClientLLM, NodeSendMessage, NodeParser,
     NodeLoop, NodeInner, NodeConditional,
 )
@@ -26,6 +26,7 @@ class TestCreateNodeAllTypes:
 
     @pytest.mark.parametrize("node_type,expected_class", [
         (ModelAgentFlowTypesModel.TEXT, NodeText),
+        (ModelAgentFlowTypesModel.CONSTANT, NodeConstant),
         (ModelAgentFlowTypesModel.USER_INPUT, NodeUserInput),
         (ModelAgentFlowTypesModel.LLM, NodeLLM),
         (ModelAgentFlowTypesModel.CHAT, NodeChat),
@@ -47,6 +48,8 @@ class TestCreateNodeAllTypes:
             node_def["data"] = {"text": "hello {{ input }}"}
         elif node_type == ModelAgentFlowTypesModel.TEXT:
             node_def["data"] = {"text": "hello"}
+        elif node_type == ModelAgentFlowTypesModel.CONSTANT:
+            node_def["data"] = {"value_type": "int", "value": "42"}
         elif node_type == ModelAgentFlowTypesModel.CONDITIONAL:
             node_def["data"] = {"condition": "{{ value }}"}
         elif node_type == ModelAgentFlowTypesModel.INNER:
