@@ -18,7 +18,8 @@ ModelAgentFlowType = Literal[
     'inner',
     'conditional',
     'python_exec',
-    'mcp'
+    'mcp',
+    'hook',
 ]
 
 
@@ -39,6 +40,7 @@ class ModelAgentFlowTypesModel:
     CONDITIONAL = 'conditional'
     PYTHON_EXEC = 'python_exec'
     MCP = 'mcp'
+    HOOK = 'hook'
 
 
 class BaseNodeModel(BaseModel):

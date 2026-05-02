@@ -14,7 +14,6 @@ from magic_llm.model.ModelChatStream import ChatCompletionModel
 
 from magic_agents.models.factory.AgentFlowModel import AgentFlowModel
 from magic_agents.models.factory.EdgeNodeModel import EdgeNodeModel
-from magic_agents.models.debug_feedback import GraphDebugFeedback
 from magic_agents.models.factory.Nodes import (
     ModelAgentFlowTypesModel,
     LlmNodeModel,
@@ -32,6 +31,7 @@ from magic_agents.models.factory.Nodes import (
     PythonExecNodeModel,
     McpNodeModel,
     ChatNodeModel,
+    HookNodeModel,
 )
 from magic_agents.models.model_agent_run_log import ModelAgentRunLog
 from magic_agents.node_system import (
@@ -50,6 +50,7 @@ from magic_agents.node_system import (
     NodeConditional,
     NodePythonExec,
     NodeMcp,
+    NodeHook,
     sort_nodes,
 )
 from magic_agents.execution import (
@@ -58,6 +59,8 @@ from magic_agents.execution import (
 )
 from magic_agents.util.const import HANDLE_VOID
 from magic_agents.util.env_resolver import resolve_env_placeholders
+from magic_agents.hooks.runtime_config import RuntimeConfig
+from magic_agents.hooks.flow_hooks import FlowHooks
 from magic_agents.util.graph_validator import (
     ConditionalEdgeValidator,
     validate_edge_handles,
@@ -73,6 +76,45 @@ logger = logging.getLogger(__name__)
 
 # Node types that can provide tools to LLM nodes
 _TOOL_CAPABLE_TYPES = {ModelAgentFlowTypesModel.FETCH, ModelAgentFlowTypesModel.PYTHON_EXEC, ModelAgentFlowTypesModel.MCP}
+
+
+# ─── Phase 0 Execution Tree Persistence Callback ────────────────────────────
+#
+# CallbackEmitter: a module-level registry for api.magic_llm to register
+# a persistence callback that receives structured debug events during graph
+# execution (GRAPH_START, NODE_START, LLM_GENERATION, ITERATION_START/END,
+# SUBGRAPH_START/END, GRAPH_END).
+#
+# This is strictly additive — existing debug event infrastructure is unchanged.
+# The callback is invoked from execute_graph_reactive / execute_graph_loop_reactive
+# after each debug event is yielded.
+#
+
+class CallbackEmitter:
+    """Module-level registry for execution tree persistence callbacks."""
+    
+    _callbacks: list = []
+    
+    @classmethod
+    def register(cls, callback) -> None:
+        """Register a callback that receives (event_type, payload, chat_log)."""
+        if callback not in cls._callbacks:
+            cls._callbacks.append(callback)
+    
+    @classmethod
+    def unregister(cls, callback) -> None:
+        """Unregister a previously registered callback."""
+        if callback in cls._callbacks:
+            cls._callbacks.remove(callback)
+    
+    @classmethod
+    def emit(cls, event: dict, chat_log: Optional['ModelAgentRunLog'] = None) -> None:
+        """Emit an event to all registered callbacks. Non-blocking, exceptions logged."""
+        for cb in cls._callbacks:
+            try:
+                cb(event, chat_log)
+            except Exception as exc:
+                logger.warning("CallbackEmitter: callback %s raised %s", cb, exc)
 
 
 # ─── Task Subagents Integration ─────────────────────────────────────────────
@@ -165,6 +207,14 @@ def _assign_tool_handles(nodes: list[dict], edges: list[dict]) -> None:
             if not source_data.get('tool_mode', False):
                 continue
 
+        # For python_exec nodes in node mode (data.code is set), skip tool
+        # handle assignment entirely. Node-mode python_exec edges route from
+        # handle-python_exec-result to downstream graph nodes, NOT to LLM tools.
+        if source_type == ModelAgentFlowTypesModel.PYTHON_EXEC:
+            if source_data.get('code'):
+                # Node-mode python_exec: preserve original handles, don't assign tool handles
+                continue
+
         # Resolve the source node's output handle and backfill sourceHandle
         # (always done for tool-capable edges, preserving existing values)
         handles = source_data.get('handles', {})
@@ -232,6 +282,7 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False) -> Any:
         ModelAgentFlowTypesModel.VOID: (NodeEND, None),
         ModelAgentFlowTypesModel.PYTHON_EXEC: (NodePythonExec, PythonExecNodeModel),
         ModelAgentFlowTypesModel.MCP: (NodeMcp, McpNodeModel),
+        ModelAgentFlowTypesModel.HOOK: (NodeHook, HookNodeModel),
     }
     
     if node_type not in node_map:
@@ -311,7 +362,11 @@ async def execute_graph(
     id_thread: Optional[Union[int, str]] = None,
     id_user: Optional[Union[int, str]] = None,
     extras: Optional[dict[str, Any]] = None,
-    flow_state: Optional[dict[str, Any]] = None
+    flow_state: Optional[dict[str, Any]] = None,
+    run_id: Optional[str] = None,   # Phase 0: execution tree identity
+    parent_run_id: Optional[str] = None,  # Phase 0: parent run identity
+    hooks: Optional[RuntimeConfig] = None,  # Phase 8.3: hook runtime config
+    debug_callback=None,  # Phase 1: optional async callback for debug events
 ) -> AsyncGenerator[ChatCompletionModel, None]:
     """
     Execute the agent flow graph asynchronously using reactive event-based model.
@@ -326,17 +381,40 @@ async def execute_graph(
         id_user (Optional[Union[int, str]]): User ID. Defaults to None.
         extras (Optional[dict[str, Any]]): Client-provided contextual data. Defaults to None.
         flow_state (Optional[dict[str, Any]]): Per-flow volatile state (runtime-only). Defaults to None.
+        run_id (Optional[str]): Phase 0 execution tree run identity. Defaults to None.
+        parent_run_id (Optional[str]): Phase 0 parent run identity. Defaults to None.
+        hooks (Optional[RuntimeConfig]): Phase 8.3 hook runtime config.
 
     Yields:
         AsyncGenerator[ChatCompletionModel, None]: ChatCompletionModel results.
     """
+    # Phase 8.3: Create hook registry from runtime config
+    # Priority order:
+    #   1. RuntimeConfig hooks (global + graph) — full priority
+    #   2. AgentFlowModel.hooks (graph-level) — fallback
+    #   3. No hooks — backward compatible
+    _registry = None
+    if hooks is not None and not hooks.is_empty():
+        _registry = hooks.create_registry()
+        # Also register graph-level hooks from AgentFlowModel if present
+        if graph.hooks is not None:
+            _registry.register_graph(graph.hooks)
+    elif graph.hooks is not None:
+        from magic_agents.hooks.hook_registry import HookRegistry
+        _registry = HookRegistry()
+        _registry.register_graph(graph.hooks)
+
     async for result in execute_graph_reactive(
         graph=graph,
         id_chat=id_chat,
         id_thread=id_thread,
         id_user=id_user,
         extras=extras,
-        flow_state=flow_state
+        flow_state=flow_state,
+        run_id=run_id,
+        parent_run_id=parent_run_id,
+        hooks=_registry,
+        debug_callback=debug_callback,
     ):
         yield result
 
@@ -348,6 +426,10 @@ async def execute_graph_loop(
     id_user: Optional[Union[int, str]] = None,
     extras: Optional[dict[str, Any]] = None,
     flow_state: Optional[dict[str, Any]] = None,
+    run_id: Optional[str] = None,         # Phase 0
+    parent_run_id: Optional[str] = None,   # Phase 0
+    hooks: Optional[RuntimeConfig] = None,  # Phase 8.3: hook runtime config
+    debug_callback=None,                   # Phase 1: optional async callback for debug events
 ) -> AsyncGenerator[ChatCompletionModel, None]:
     """
     Execute an agent flow graph that contains a Loop node using reactive model.
@@ -361,17 +443,33 @@ async def execute_graph_loop(
         id_user (Optional[Union[int, str]]): User ID. Defaults to None.
         extras (Optional[dict[str, Any]]): Client-provided contextual data. Defaults to None.
         flow_state (Optional[dict[str, Any]]): Per-flow volatile state. Defaults to None.
+        run_id (Optional[str]): Phase 0 run identity. Defaults to None.
+        parent_run_id (Optional[str]): Phase 0 parent run identity. Defaults to None.
+        hooks (Optional[RuntimeConfig]): Phase 8.3 hook runtime config.
 
     Yields:
         AsyncGenerator[ChatCompletionModel, None]: ChatCompletionModel results.
     """
+    # Phase 8.3: Create hook registry from runtime config
+    _registry = None
+    if hooks is not None and not hooks.is_empty():
+        _registry = hooks.create_registry()
+    elif graph.hooks is not None:
+        from magic_agents.hooks.hook_registry import HookRegistry
+        _registry = HookRegistry()
+        _registry.register_graph(graph.hooks)
+
     async for result in execute_graph_loop_reactive(
         graph=graph,
         id_chat=id_chat,
         id_thread=id_thread,
         id_user=id_user,
         extras=extras,
-        flow_state=flow_state
+        flow_state=flow_state,
+        run_id=run_id,
+        parent_run_id=parent_run_id,
+        hooks=_registry,
+        debug_callback=debug_callback,
     ):
         yield result
 
@@ -733,7 +831,9 @@ async def run_agent(
     id_chat: Optional[Union[int, str]] = None,
     id_thread: Optional[Union[int, str]] = None,
     id_user: Optional[Union[int, str]] = None,
-    extras: Optional[dict[str, Any]] = None
+    extras: Optional[dict[str, Any]] = None,
+    hooks: Optional[RuntimeConfig] = None,
+    debug_callback=None,  # Phase 1: optional async callback for debug events
 ) -> AsyncGenerator[ChatCompletionModel, None]:
     """
     Run the agent flow and yield ChatCompletionModel results as they are generated.
@@ -744,6 +844,8 @@ async def run_agent(
         id_thread (Optional[Union[int, str]]): Thread ID. Defaults to None.
         id_user (Optional[Union[int, str]]): User ID. Defaults to None.
         extras (Optional[dict[str, Any]]): Client-provided contextual data. Defaults to None.
+        hooks (Optional[RuntimeConfig]): Optional hook runtime config for global hooks.
+        debug_callback: Optional async callback for debug events (Phase 1).
 
     Yields:
         AsyncGenerator[ChatCompletionModel, None]: ChatCompletionModel results.
@@ -753,6 +855,8 @@ async def run_agent(
         id_chat=id_chat,
         id_thread=id_thread,
         id_user=id_user,
-        extras=extras
+        extras=extras,
+        hooks=hooks,
+        debug_callback=debug_callback,
     ):
         yield result

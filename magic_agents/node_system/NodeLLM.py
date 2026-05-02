@@ -3,7 +3,7 @@ import json
 import re
 import uuid
 import logging
-from typing import Optional, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING
 
 from magic_llm import MagicLLM
 from magic_llm.model import ModelChat
@@ -15,6 +15,7 @@ from magic_agents.util.primitive_coercion import coerce_primitive_by_type, input
 
 if TYPE_CHECKING:
     from magic_llm.agent import TaskManifest, SubagentBundle
+    from magic_agents.hooks.hook_registry import HookRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -288,6 +289,32 @@ class NodeLLM(Node):
         
         return bundle
 
+    def _create_hook_relay(self) -> Optional[Any]:
+        """Create a HookRelay if hooks are registered.
+
+        Checks self._hooks (set by Node.__call__) and creates a HookRelay
+        that bridges magic-agents hooks to magic-llm's AgentHooks Protocol.
+
+        Uses real execution_id/run_id from the registry (set by executor at
+        execution start) so that relay-produced HookContexts carry proper
+        traceability identity rather than empty strings.
+
+        Returns:
+            HookRelay instance if hooks available, None otherwise.
+        """
+        hooks = getattr(self, '_hooks', None)
+        if hooks is None or hooks.is_empty():
+            return None
+
+        from magic_agents.hooks.hook_relay import HookRelay
+
+        return HookRelay(
+            registry=hooks,
+            node_id=self.node_id or '',
+            graph_id=getattr(hooks, 'execution_id', ''),
+            run_id=getattr(hooks, 'run_id', ''),
+        )
+
     async def process(self, chat_log):
         self.stream = self._resolve_runtime_value(self.INPUT_HANDLER_STREAM, self._default_stream, 'bool')
         self.iterate = self._resolve_runtime_value(self.INPUT_HANDLER_ITERATE, self._default_iterate, 'bool')
@@ -385,24 +412,30 @@ class NodeLLM(Node):
                             f"NodeLLM:{self.node_id} has callable tools but magic-llm does not "
                             f"provide client.run_agent_async() or client.run_agent(). Upgrade magic-llm."
                         )
+                    hook_relay = self._create_hook_relay()
                     intention = await asyncio.to_thread(
                         client.run_agent,
                         user_input=user_msg,
                         system_prompt=sys_msg,
                         tools=tools_schemas,
                         tool_functions=tool_functions,
+                        hooks=hook_relay,
                         **self.extra_data
                     )
                 else:
+                    hook_relay = self._create_hook_relay()
                     intention = await client.run_agent_async(
                         user_input=user_msg,
                         system_prompt=sys_msg,
                         tools=tools_schemas,
                         tool_functions=tool_functions,
+                        hooks=hook_relay,
                         **self.extra_data
                     )
                 self.generated = intention.content
                 final_tool_calls = getattr(intention, 'tool_calls', []) or []
+                # Phase 0: emit LLM_GENERATION for execution tree persistence
+                yield self._emit_llm_generation(intention)
 
             elif tools_schemas:
                 # Schema-only tools: single generate call (LLM can reference tools but no executor)
@@ -412,12 +445,39 @@ class NodeLLM(Node):
                 )
                 self.generated = intention.content
                 final_tool_calls = getattr(intention, 'tool_calls', []) or []
+                # Phase 0: emit LLM_GENERATION for execution tree persistence
+                yield self._emit_llm_generation(intention)
 
             else:
                 # Existing path: no tools, single generation call
+                # === HOOK: on_llm_start (non-tool path, Phase 9) ===
+                _llm_ctx = None
+                if hasattr(self, '_hooks') and self._hooks is not None and not self._hooks.is_empty():
+                    from magic_agents.hooks.flow_hooks import HookContext as _LLM_HC
+                    _llm_ctx = _LLM_HC(
+                        execution_id=getattr(self._hooks, 'execution_id', ''),
+                        run_id=getattr(self._hooks, 'run_id', ''),
+                        node_id=self.node_id,
+                        node_type=self.node_type,
+                        node_class=self.__class__.__name__,
+                        inputs={"model": client.llm.model, "streaming": False},
+                    )
+                    await self._hooks.invoke("on_llm_start", _llm_ctx)
+
                 intention = await client.llm.async_generate(chat, **self.extra_data)
+
+                # === HOOK: on_llm_end (non-tool path, Phase 9) ===
+                if _llm_ctx is not None:
+                    _llm_ctx.outputs = {
+                        "model": getattr(intention, 'model', ''),
+                        "content": getattr(intention, 'content', ''),
+                    }
+                    await self._hooks.invoke("on_llm_end", _llm_ctx)
+
                 self.generated = intention.content
                 final_tool_calls = getattr(intention, 'tool_calls', []) or []
+                # Phase 0: emit LLM_GENERATION for execution tree persistence
+                yield self._emit_llm_generation(intention)
 
             yield self.yield_static(ChatCompletionModel(
                 id=uuid.uuid4().hex,
@@ -451,6 +511,7 @@ class NodeLLM(Node):
                             f"provide client.run_agent_stream_async() or client.run_agent_stream(). Upgrade magic-llm."
                         )
 
+                    hook_relay = self._create_hook_relay()
                     last_chunk = None
                     for chunk in await asyncio.to_thread(
                         client.run_agent_stream,
@@ -458,6 +519,7 @@ class NodeLLM(Node):
                         system_prompt=sys_msg,
                         tools=tools_schemas,
                         tool_functions=tool_functions,
+                        hooks=hook_relay,
                         **self.extra_data
                     ):
                         self.generated += chunk.choices[0].delta.content or ''
@@ -465,13 +527,17 @@ class NodeLLM(Node):
                         yield self.yield_static(chunk, content_type=self.OUTPUT_HANDLE_CONTENT)
                     if last_chunk:
                         final_tool_calls = getattr(last_chunk.choices[0].delta, 'tool_calls', []) or []
+                        # Phase 0: emit LLM_GENERATION for execution tree persistence
+                        yield self._emit_llm_generation(last_chunk)
                 else:
+                    hook_relay = self._create_hook_relay()
                     last_chunk = None
                     async for chunk in client.run_agent_stream_async(
                         user_input=user_msg,
                         system_prompt=sys_msg,
                         tools=tools_schemas,
                         tool_functions=tool_functions,
+                        hooks=hook_relay,
                         **self.extra_data
                     ):
                         self.generated += chunk.choices[0].delta.content or ''
@@ -480,6 +546,8 @@ class NodeLLM(Node):
                     # Capture tool_calls from the last chunk
                     if last_chunk:
                         final_tool_calls = getattr(last_chunk.choices[0].delta, 'tool_calls', []) or []
+                        # Phase 0: emit LLM_GENERATION for execution tree persistence
+                        yield self._emit_llm_generation(last_chunk)
             elif tools_schemas:
                 # Schema-only tools with streaming
                 self._warn_unsupported_engine(client)
@@ -490,8 +558,24 @@ class NodeLLM(Node):
                     yield self.yield_static(i, content_type=self.OUTPUT_HANDLE_CONTENT)
                 if last_chunk:
                     final_tool_calls = getattr(last_chunk.choices[0].delta, 'tool_calls', []) or []
+                    # Phase 0: emit LLM_GENERATION for execution tree persistence
+                    yield self._emit_llm_generation(last_chunk)
             else:
                 # Existing streaming path: no tools
+                # === HOOK: on_llm_start (non-tool streaming, Phase 9) ===
+                _llm_ctx = None
+                if hasattr(self, '_hooks') and self._hooks is not None and not self._hooks.is_empty():
+                    from magic_agents.hooks.flow_hooks import HookContext as _LLM_HC
+                    _llm_ctx = _LLM_HC(
+                        execution_id=getattr(self._hooks, 'execution_id', ''),
+                        run_id=getattr(self._hooks, 'run_id', ''),
+                        node_id=self.node_id,
+                        node_type=self.node_type,
+                        node_class=self.__class__.__name__,
+                        inputs={"model": client.llm.model, "streaming": True},
+                    )
+                    await self._hooks.invoke("on_llm_start", _llm_ctx)
+
                 last_chunk = None
                 async for i in client.llm.async_stream_generate(chat, **self.extra_data):
                     self.generated += i.choices[0].delta.content or ''
@@ -499,6 +583,16 @@ class NodeLLM(Node):
                     yield self.yield_static(i, content_type=self.OUTPUT_HANDLE_CONTENT)
                 if last_chunk:
                     final_tool_calls = getattr(last_chunk.choices[0].delta, 'tool_calls', []) or []
+                    # Phase 0: emit LLM_GENERATION for execution tree persistence
+                    yield self._emit_llm_generation(last_chunk)
+
+                # === HOOK: on_llm_end (non-tool streaming, Phase 9) ===
+                if _llm_ctx is not None:
+                    _llm_ctx.outputs = {
+                        "model": getattr(last_chunk, 'model', '') if last_chunk else '',
+                        "content": self.generated,
+                    }
+                    await self._hooks.invoke("on_llm_end", _llm_ctx)
         # if self.json_output:
         #     print(self.generated)
         #     self.generated = json.loads(self.generated)
@@ -560,6 +654,41 @@ class NodeLLM(Node):
         # Yield on the configured output handle
         yield self.yield_static(self.generated, content_type=self.OUTPUT_HANDLE_GENERATED)
 
+    def _emit_llm_generation(self, intention, duration_ms: Optional[float] = None) -> dict:
+        """Emit a structured LLM_GENERATION debug event for execution tree persistence.
+        
+        Phase 0 cross-repo instrumentation: called after every LLM provider response
+        (both stream and non-stream). The event includes model, token counts,
+        duration, and provider_request_id.
+        
+        Args:
+            intention: The ChatCompletionModel or synthetic response.
+            duration_ms: Optional measured call duration.
+            
+        Returns:
+            Debug event dict suitable for yielding via SYSTEM_EVENT_DEBUG channel.
+        """
+        usage = getattr(intention, 'usage', None)
+        event_payload = {
+            'event_type': 'LLM_GENERATION',
+            'node_id': self.node_id,
+            'model': getattr(intention, 'model', 'unknown'),
+            'provider_request_id': getattr(intention, 'id', None),
+            'prompt_tokens': getattr(usage, 'prompt_tokens', 0) if usage else 0,
+            'completion_tokens': getattr(usage, 'completion_tokens', 0) if usage else 0,
+            'total_tokens': getattr(usage, 'total_tokens', 0) if usage else 0,
+            'cached_tokens_read': getattr(usage, 'cached_read_tokens', 0) if usage else 0,
+            'cached_tokens_write': getattr(usage, 'cached_write_tokens', 0) if usage else 0,
+            'reasoning_tokens': getattr(usage, 'reasoning_tokens', 0) if usage else 0,
+            'audio_tokens': getattr(usage, 'audio_tokens', 0) if usage else 0,
+        }
+        if duration_ms is not None:
+            event_payload['duration_ms'] = duration_ms
+        return {
+            'type': 'debug',
+            'content': event_payload,
+        }
+
     def _capture_internal_state(self):
         """Capture LLM-specific internal state for debugging."""
         state = super()._capture_internal_state()
@@ -573,9 +702,9 @@ class NodeLLM(Node):
         
         return state
     
-    async def __call__(self, chat_log):
+    async def __call__(self, chat_log, **kwargs):
         # if configured to iterate inside a Loop, always re-run instead of using cached response
         if getattr(self, 'iterate', False):
             self._response = None
-        async for result in super().__call__(chat_log):
+        async for result in super().__call__(chat_log, **kwargs):
             yield result

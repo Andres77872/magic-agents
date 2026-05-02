@@ -70,7 +70,22 @@ from magic_agents.node_system.NodeSendMessage import NodeSendMessage
 from magic_agents.node_system.NodeText import NodeText
 from magic_agents.node_system.NodeUserInput import NodeUserInput
 from magic_agents.node_system.NodePythonExec import NodePythonExec
-from magic_agents.node_system.NodeMcp import NodeMcp
+from magic_agents.node_system.NodeHook import NodeHook
+
+_NodeMcp_class = None
+
+def get_node_mcp():
+    global _NodeMcp_class
+    if _NodeMcp_class is None:
+        from magic_agents.node_system.NodeMcp import NodeMcp
+        _NodeMcp_class = NodeMcp
+    return _NodeMcp_class
+
+class NodeMcpProxy:
+    def __new__(cls, *args, **kwargs):
+        return get_node_mcp()(*args, **kwargs)
+
+NodeMcp = NodeMcpProxy
 
 
 def build_graph(edges: List[Dict]) -> nx.DiGraph:
@@ -328,6 +343,7 @@ __all__ = [
     "NodeConditional",
     "NodePythonExec",
     "NodeMcp",
+    "NodeHook",
     "build_graph",
     "detect_cycles",
     "perform_topological_sort",

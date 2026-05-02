@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import abc
 import logging
-from typing import Any, Dict, Optional, AsyncGenerator
+from typing import Any, Dict, Optional, AsyncGenerator, TYPE_CHECKING
 from datetime import datetime, UTC
 
 from magic_agents.models.model_agent_run_log import ModelAgentRunLog
 from magic_agents.models.debug_feedback import NodeDebugInfo
 from magic_agents.util.telemetry import magic_telemetry
+
+if TYPE_CHECKING:
+    from magic_agents.hooks.hook_registry import HookRegistry
+    from magic_agents.hooks.flow_hooks import HookContext
+    from magic_agents.debug.observer import DebugObserver
 
 logger = logging.getLogger(__name__)
 
@@ -185,19 +190,73 @@ class Node(abc.ABC):
             cls.process = magic_telemetry(process_method)
 
     async def __call__(
-            self, chat_log: ModelAgentRunLog
+            self, chat_log: ModelAgentRunLog,
+            hooks: Optional['HookRegistry'] = None,
+            observer: Optional['DebugObserver'] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Invoke the node execution. Return precomputed result if already computed.
+        
+        Observer-based debugging (Phase 1):
+        - Calls observer.on_node_start() BEFORE process() executes (when observer provided)
+        - Calls observer.on_node_end() AFTER process() completes successfully
+        - Calls observer.on_node_error() in the exception handler (before re-raise)
+        - Measures duration_ms internally
+        - Legacy _start_debug_tracking() / _end_debug_tracking() retained for
+          _debug_info state but no longer yield debug events inline.
+        
+        Phase 4: Hook Invocation
+        - Invokes on_node_start hook BEFORE observer
+        - Invokes on_node_end hook AFTER success path
+        - Invokes on_node_error hook in exception path
+        - HookContext constructed only when hooks are registered (lazy)
         """
         if self._response is not None:
             # Response is precomputed; yield immediately.
             yield {"type": "end", "content": self.prep(self._response)}
             return
 
-        # Start debug tracking if enabled
-        self._start_debug_tracking()
-        
+        # Store hooks reference for subclasses (e.g., NodeLLM.process() uses this)
+        self._hooks = hooks
+
+        # === HOOK: on_node_start (BEFORE observer, Phase 4) ===
+        _hook_ctx: Optional['HookContext'] = None
+        if hooks is not None and not hooks.is_empty():
+            from magic_agents.hooks.flow_hooks import HookContext as _HC
+            _hook_start = datetime.now(UTC)
+            _hook_ctx = _HC(
+                execution_id=getattr(hooks, 'execution_id', ''),
+                run_id=getattr(hooks, 'run_id', '') or getattr(chat_log, 'run_id', '') if chat_log else '',
+                parent_run_id=getattr(chat_log, 'parent_run_id', None) if chat_log else None,
+                node_id=self.node_id,
+                node_type=self.node_type,
+                node_class=self.__class__.__name__,
+                inputs=self._safe_copy_dict(self.inputs),
+                start_time=_hook_start,
+            )
+            await hooks.invoke("on_node_start", _hook_ctx)
+
+        # Capture start time before process() for duration measurement
+        _node_start_time = datetime.now(UTC)
+        _node_start_time_iso = _node_start_time.isoformat()
+
+        # === OBSERVER: on_node_start (node-owned hook) ===
+        if observer is not None:
+            await observer.on_node_start(
+                node_id=self.node_id or "unknown",
+                node_type=self.node_type or "unknown",
+                node_class=type(self).__name__,
+                inputs=self._safe_copy_dict(self.inputs),
+            )
+
+        # Legacy debug tracking — ONLY when observer path is inactive.
+        # When observer is provided, the observer handles all debug event
+        # emission.  Legacy tracking creates NodeDebugInfo objects that can
+        # fail Pydantic validation on unusual inputs (loop sub-nodes, etc.)
+        # and is no longer needed for the observer path.
+        if observer is None:
+            self._start_debug_tracking()
+
         error_msg = None
         try:
             # Execute subclass-specific logic.
@@ -207,30 +266,73 @@ class Node(abc.ABC):
             error_msg = str(e)
             if self.debug:
                 logger.error(f"Node ({self.node_id}): Execution failed with error: {error_msg}")
-            
-            # End debug tracking and yield debug info on error
-            self._end_debug_tracking(error=error_msg)
-            
-            # Always yield debug info on error (not just in debug mode)
-            if self._debug_info:
-                yield {
-                    "type": "debug",
-                    "content": self._debug_info.model_dump()
-                }
-            else:
-                # Create minimal error debug info if debug tracking wasn't initialized
-                yield self.yield_debug_error(
+
+            _node_end_time = datetime.now(UTC)
+            _duration_ms = (_node_end_time - _node_start_time).total_seconds() * 1000
+
+            # === OBSERVER: on_node_error (BEFORE hook, BEFORE re-raise) ===
+            if observer is not None:
+                await observer.on_node_error(
+                    node_id=self.node_id or "unknown",
+                    node_type=self.node_type or "unknown",
+                    node_class=type(self).__name__,
+                    error=str(e),
                     error_type=type(e).__name__,
-                    error_message=error_msg,
-                    context={"inputs": list(self.inputs.keys())}
+                    inputs=self._safe_copy_dict(self.inputs),
+                    outputs=self._safe_copy_dict(getattr(self, "outputs", {})),
+                    duration_ms=_duration_ms,
+                    start_time=_node_start_time_iso,
                 )
-            
-            # Don't raise - just return after yielding debug info
-            return
+
+            # === HOOK: on_node_error (Phase 4) ===
+            if _hook_ctx is not None:
+                _hook_end = datetime.now(UTC)
+                _hook_ctx.timestamp = _hook_end
+                _hook_ctx.end_time = _hook_end
+                if _hook_ctx.start_time:
+                    _hook_ctx.duration_ms = (_hook_end - _hook_ctx.start_time).total_seconds() * 1000
+                _hook_ctx.error = e
+                _hook_ctx.error_type = type(e).__name__
+                _hook_ctx.error_message = error_msg
+                await hooks.invoke("on_node_error", _hook_ctx, error=e)
+
+            # Legacy debug tracking — only when observer is inactive
+            if observer is None:
+                self._end_debug_tracking(error=error_msg)
+
+            # Re-raise so executor can mark node ERROR and propagate
+            # error cascade bypass to downstream nodes (Phase 4).
+            raise
         finally:
-            # End debug tracking if not already done (normal execution path)
+            # End legacy debug tracking if not already done (normal execution path)
             if error_msg is None:
-                self._end_debug_tracking(error=None)
+                _node_end_time = datetime.now(UTC)
+                _duration_ms = (_node_end_time - _node_start_time).total_seconds() * 1000
+
+                # === OBSERVER: on_node_end (node-owned hook, success path) ===
+                if observer is not None:
+                    await observer.on_node_end(
+                        node_id=self.node_id or "unknown",
+                        node_type=self.node_type or "unknown",
+                        node_class=type(self).__name__,
+                        outputs=self._safe_copy_dict(self.outputs),
+                        internal_state=self._capture_internal_state(),
+                        duration_ms=_duration_ms,
+                        start_time=_node_start_time_iso,
+                    )
+
+                # Legacy debug tracking — only when observer is inactive
+                if observer is None:
+                    self._end_debug_tracking(error=None)
+                # === HOOK: on_node_end (AFTER debug tracking in success path, Phase 4) ===
+                if _hook_ctx is not None:
+                    _hook_end = datetime.now(UTC)
+                    _hook_ctx.timestamp = _hook_end
+                    _hook_ctx.end_time = _hook_end
+                    if _hook_ctx.start_time:
+                        _hook_ctx.duration_ms = (_hook_end - _hook_ctx.start_time).total_seconds() * 1000
+                    _hook_ctx.outputs = self._safe_copy_dict(self.outputs)
+                    await hooks.invoke("on_node_end", _hook_ctx)
 
     @abc.abstractmethod
     async def process(
@@ -248,6 +350,20 @@ class Node(abc.ABC):
         """
         return self._response
 
+    def get_debug_observer(self):
+        """Override to provide a node-specific DebugObserver.
+
+        Return None (default) to use the graph-level observer.
+        Return a DebugObserver with suppress_parent=True to replace
+        the graph observer entirely for this node's lifecycle events.
+        Return a DebugObserver (without suppress_parent) to augment
+        (both fire: graph-level first, then node-level).
+
+        Note: This is a TYPE_CHECKING import to avoid circular imports.
+        The actual type is DebugObserver from magic_agents.debug.observer.
+        """
+        return None
+
     def get_debug(self) -> bool:
         """
         Check if debug mode is enabled for this node.
@@ -262,10 +378,17 @@ class Node(abc.ABC):
             node_class=self.__class__.__name__
         )
     
-    def _start_debug_tracking(self):
-        """Start tracking debug information for this node execution."""
+    def _start_debug_tracking(self) -> Optional[NodeDebugInfo]:
+        """
+        Start tracking debug information for this node execution.
+        
+        Returns partial NodeDebugInfo with is_running=True for NODE_START event.
+        Called from __call__() before process() executes.
+        
+        Phase 1: Minimal Viable Observability - yields NODE_START event with running state.
+        """
         if not self.debug:
-            return
+            return None
         
         if self._debug_info is None:
             self._init_debug_info()
@@ -274,11 +397,32 @@ class Node(abc.ABC):
         self._debug_info.start_time = self._execution_start.isoformat()
         self._debug_info.inputs = self._safe_copy_dict(self.inputs)
         
+        # Mark as running (Phase 1: NODE_START event)
+        self._debug_info.is_running = True
+        self._debug_info.was_executed = False
+        self._debug_info.was_bypassed = False
+        
         if self.debug:
-            logger.debug(f"Node ({self.node_id}): Started execution tracking")
+            logger.debug(f"Node ({self.node_id}): Started execution tracking (is_running=True)")
+        
+        # Return partial debug info for NODE_START event
+        return NodeDebugInfo(
+            node_id=self.node_id or "unknown",
+            node_type=self.node_type or "unknown",
+            node_class=self.__class__.__name__,
+            start_time=self._execution_start.isoformat(),
+            inputs=self._safe_copy_dict(self.inputs),
+            is_running=True,
+            was_executed=False,
+            was_bypassed=False
+        )
     
     def _end_debug_tracking(self, error: Optional[str] = None):
-        """End tracking debug information and capture final state."""
+        """
+        End tracking debug information and capture final state.
+        
+        Sets is_running=False for NODE_END event (Phase 1: Minimal Viable Observability).
+        """
         if not self.debug or self._debug_info is None:
             return
         
@@ -296,14 +440,15 @@ class Node(abc.ABC):
         # Capture internal state
         self._debug_info.internal_variables = self._capture_internal_state()
         
-        # Mark execution status
+        # Mark execution status and clear running state
         self._debug_info.was_executed = True
+        self._debug_info.is_running = False  # Phase 1: NODE_END event
         self._debug_info.error = error
         
         if self.debug:
             logger.debug(
                 f"Node ({self.node_id}): Ended execution tracking "
-                f"(duration: {self._debug_info.execution_duration_ms:.2f}ms)"
+                f"(duration: {self._debug_info.execution_duration_ms:.2f}ms, is_running=False)"
             )
     
     def _capture_internal_state(self) -> Dict[str, Any]:
@@ -367,7 +512,11 @@ class Node(abc.ABC):
         return self._debug_info
     
     def mark_bypassed(self):
-        """Mark this node as bypassed (e.g., in conditional flow)."""
+        """
+        Mark this node as bypassed (e.g., in conditional flow).
+        
+        Phase 1: Sets is_running=False since bypassed nodes never execute.
+        """
         if not self.debug:
             return
             
@@ -380,8 +529,9 @@ class Node(abc.ABC):
         self._debug_info.outputs = self._safe_copy_dict(self.outputs)
         self._debug_info.internal_variables = self._capture_internal_state()
         
-        # Mark as bypassed
+        # Mark as bypassed (not running, not executed)
         self._debug_info.was_bypassed = True
         self._debug_info.was_executed = False
+        self._debug_info.is_running = False  # Phase 1: Bypassed nodes never run
         
-        logger.debug(f"Node ({self.node_id}): Marked as bypassed")
+        logger.debug(f"Node ({self.node_id}): Marked as bypassed (is_running=False)")

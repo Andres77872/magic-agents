@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 import uuid
-from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Tuple, Union
 from datetime import datetime, UTC
 
 # Loop execution constants
@@ -26,9 +27,11 @@ from magic_agents.execution.event_dispatcher import GraphEventDispatcher, NodeSt
 from magic_agents.execution.conditional_routing import ConditionalRouting
 from magic_agents.models.factory.AgentFlowModel import AgentFlowModel
 from magic_agents.models.model_agent_run_log import ModelAgentRunLog
-from magic_agents.models.debug_feedback import GraphDebugFeedback
 from magic_agents.models.factory.Nodes.ConditionalNodeModel import ConditionalSignalTypes
 from magic_agents.util.const import SYSTEM_EVENT_STREAMING, SYSTEM_EVENT_DEBUG, SYSTEM_EVENT_DEBUG_SUMMARY, SYSTEM_EVENT_TYPES
+from magic_agents.hooks.hook_registry import HookRegistry
+from magic_agents.debug.registry import ObserverRegistry
+from magic_agents.debug.observer import DebugObserver
 
 logger = logging.getLogger(__name__)
 
@@ -257,6 +260,10 @@ async def execute_graph_reactive(
     id_user: Optional[Union[int, str]] = None,
     extras: Optional[dict[str, Any]] = None,
     flow_state: Optional[dict[str, Any]] = None,
+    run_id: Optional[str] = None,         # Phase 0: execution tree identity
+    parent_run_id: Optional[str] = None,   # Phase 0: parent run identity
+    hooks: Optional[HookRegistry] = None,  # Phase 4: hook registry for graph/node hooks
+    debug_callback = None,  # Phase 1: optional async callback for debug events
 ) -> AsyncGenerator[ChatCompletionModel, None]:
     """
     Execute graph using reactive event-based model.
@@ -271,6 +278,9 @@ async def execute_graph_reactive(
         id_user: Optional user ID
         extras: Optional client-provided contextual data (for consistency with entry points)
         flow_state: Optional per-flow volatile state (runtime-only, never persisted)
+        run_id: Optional Phase 0 run identity for execution tree persistence
+        parent_run_id: Optional Phase 0 parent run identity
+        hooks: Optional HookRegistry for graph/node lifecycle hooks (Phase 4)
         
     Yields:
         Streaming content and final outputs from nodes
@@ -305,7 +315,9 @@ async def execute_graph_reactive(
         logger.info("Detected loop nodes: %s. Delegating to loop executor.", loop_nodes)
         async for msg in execute_graph_loop_reactive(
             graph, id_chat=id_chat, id_thread=id_thread, id_user=id_user,
-            extras=extras, flow_state=flow_state
+            extras=extras, flow_state=flow_state,
+            run_id=run_id, parent_run_id=parent_run_id,
+            hooks=hooks, debug_callback=debug_callback,
         ):
             yield msg
         return
@@ -314,7 +326,9 @@ async def execute_graph_reactive(
     chat_log = ModelAgentRunLog(
         id_chat=id_chat, id_thread=id_thread, id_user=id_user,
         id_app=getattr(graph, 'app_id', None) or getattr(graph, 'id_app', None),
-        flow_state=flow_state or {}  # Initialize per-flow volatile state (isolated per flow)
+        flow_state=flow_state or {},  # Initialize per-flow volatile state (isolated per flow)
+        run_id=run_id,                  # Phase 0: execution tree identity
+        parent_run_id=parent_run_id,    # Phase 0: parent run identity
     )
     
     # Inject extras into UserInput nodes if provided (for run_agent(graph, extras=...) path)
@@ -333,35 +347,84 @@ async def execute_graph_reactive(
         len(nodes), len(graph.edges)
     )
     
-    # Initialize debug feedback if enabled
-    debug_feedback: Optional[GraphDebugFeedback] = None
-    debug_config = None
-    if graph.debug:
-        # Get resolved debug config (from JSON debug_config or default)
-        debug_config = graph.resolved_debug_config
-        
-        # Only proceed if config is enabled (allows debug=true but config.enabled=false)
-        if debug_config and debug_config.enabled:
-            debug_feedback = GraphDebugFeedback(
-                execution_id=uuid.uuid4().hex,
-                graph_type=graph.type,
-                start_time=datetime.now(UTC).isoformat()
-            )
-            logger.info(
-                "Debug mode enabled: %s (config: redact=%s, max_payload=%d)",
-                debug_feedback.execution_id,
-                debug_config.redact_sensitive,
-                debug_config.max_payload_length
-            )
+    # Phase 0: emit GRAPH_START event for persistence callback
+    _graph_start_event = {
+        "type": SYSTEM_EVENT_DEBUG,
+        "content": {
+            "event_type": "GRAPH_START",
+            "run_id": run_id,
+            "parent_run_id": parent_run_id,
+            "graph_type": graph.type,
+            "node_count": len(nodes),
+            "edge_count": len(graph.edges),
+            "timestamp": datetime.now(UTC).isoformat(),
+        }
+    }
+    yield _graph_start_event
+    from magic_agents.agt_flow import CallbackEmitter
+    CallbackEmitter.emit(_graph_start_event, chat_log)
     
-    # Create event dispatcher
-    dispatcher = GraphEventDispatcher(nodes, graph.edges)
+    # Generate execution ID for traceability (used by hooks and debug feedback)
+    _execution_id = uuid.uuid4().hex
+    
+    # Phase 4: Set execution identity on registry so Node.__call__ and
+    # HookRelay can access real execution_id/run_id for HookContext construction.
+    if hooks is not None:
+        hooks.execution_id = _execution_id
+        hooks.run_id = run_id or ''
+
+    # === HOOK: on_graph_start (AFTER validation, BEFORE task creation, Phase 4) ===
+    _graph_hook_context = None
+    _graph_has_errors = False  # Track whether any node errored (for on_graph_error)
+    if hooks is not None and not hooks.is_empty():
+        from magic_agents.hooks.flow_hooks import HookContext
+        _graph_hook_context = HookContext(
+            execution_id=_execution_id,
+            sequence_number=0,
+            run_id=run_id or '',
+            metadata={
+                "graph_type": graph.type,
+                "node_count": len(nodes),
+                "edge_count": len(graph.edges),
+            }
+        )
+        await hooks.invoke("on_graph_start", _graph_hook_context)
+
+    # Initialize observer registry (replaces inline GraphDebugFeedback)
+    _debug_enabled_global = os.environ.get('DEBUG_ENABLED', 'true').strip().lower() in {'1', 'true', 'yes', 'on'}
+    _resolved_debug_config = getattr(graph, 'resolved_debug_config', None)
+    observer_registry = ObserverRegistry.create(
+        debug_enabled_global=_debug_enabled_global,
+        graph_debug=graph.debug,
+        graph_debug_config=_resolved_debug_config,
+        execution_id=_execution_id,
+        graph_type=graph.type,
+        total_nodes=len(nodes),
+        total_edges=len(graph.edges),
+        callback=debug_callback,
+    )
+    
+    # Capture execution start time for duration measurement
+    _exec_start_time = datetime.now(UTC)
+    
+    # OBSERVER: on_graph_start (executor-owned hook)
+    if observer_registry.is_active:
+        await observer_registry.graph_observer.on_graph_start(
+            graph_type=graph.type,
+            execution_id=_execution_id,
+            node_count=len(nodes),
+            edge_count=len(graph.edges),
+        )
+    
+    # Create event dispatcher with graph-level timeout
+    dispatcher = GraphEventDispatcher(nodes, graph.edges, timeout=graph.timeout)
     
     # Output queue for collecting results from parallel tasks
     output_queue: asyncio.Queue = asyncio.Queue()
     
     async def execute_single_node(node_id: str):
         """Execute a single node when ready."""
+        nonlocal _graph_has_errors
         node = nodes[node_id]
         tracker = dispatcher.get_tracker(node_id)
         
@@ -379,13 +442,14 @@ async def execute_graph_reactive(
                 node.mark_bypassed()
                 logger.debug("Node %s bypassed", node_id)
                 
-                # Track in debug
-                if debug_feedback:
-                    debug_feedback.add_edge_info(
-                        source=node_id,
-                        target="(bypassed)",
-                        source_handle="",
-                        target_handle=""
+                # Notify observer (executor-owned hook)
+                if observer_registry.is_active:
+                    _bypass_observer = observer_registry.observer_for(node_id, node)
+                    await _bypass_observer.on_node_bypass(
+                        node_id=node_id,
+                        node_type=getattr(node, 'node_type', 'unknown') or 'unknown',
+                        node_class=type(node).__name__,
+                        reason="inputs_not_ready",
                     )
                 return
             
@@ -395,8 +459,11 @@ async def execute_graph_reactive(
             
             conditional_selected_handle: Optional[str] = None
             bypass_all_signaled = False
-            
-            async for item in node(chat_log):
+
+            # Resolve observer for this node (allows per-node specialization)
+            _node_observer = observer_registry.observer_for(node_id, node) if observer_registry.is_active else None
+
+            async for item in node(chat_log, hooks=hooks, observer=_node_observer):
                 item_type = item.get("type", "")
                 
                 # Check if this is a streaming content event (for immediate output)
@@ -415,7 +482,8 @@ async def execute_graph_reactive(
                         "source_node": node_id
                     })
                 elif item_type == SYSTEM_EVENT_DEBUG:
-                    # Queue debug info
+                    # Queue debug info (legacy path — Node may still yield debug events
+                    # for backward compatibility; these are forwarded through the queue)
                     await output_queue.put(item)
                 elif ConditionalSignalTypes.is_system_signal(item_type):
                     # Track BYPASS_ALL for post-loop handling
@@ -433,15 +501,6 @@ async def execute_graph_reactive(
             # Mark completed
             dispatcher.set_state(node_id, NodeState.COMPLETED)
             logger.debug("Node %s completed", node_id)
-            
-            # Yield debug info
-            if debug_feedback and hasattr(node, 'get_debug_info'):
-                node_debug_info = node.get_debug_info()
-                if node_debug_info and node_debug_info.was_executed:
-                    await output_queue.put({
-                        "type": SYSTEM_EVENT_DEBUG,
-                        "content": node_debug_info.model_dump()
-                    })
             
             # Propagate outputs to downstream nodes
             await dispatcher.propagate_outputs(node_id, node.outputs)
@@ -486,6 +545,7 @@ async def execute_graph_reactive(
         
         except asyncio.TimeoutError:
             dispatcher.set_state(node_id, NodeState.ERROR)
+            _graph_has_errors = True
             logger.error("Node %s timed out", node_id)
             await output_queue.put({
                 "type": SYSTEM_EVENT_DEBUG,
@@ -496,9 +556,13 @@ async def execute_graph_reactive(
                     "timestamp": datetime.now(UTC).isoformat()
                 }
             })
+            # Phase 4: Propagate error bypass to downstream nodes
+            if hooks is not None and not hooks.is_empty():
+                await _propagate_error_bypass_with_hooks(node_id)
         
         except Exception as e:
             dispatcher.set_state(node_id, NodeState.ERROR)
+            _graph_has_errors = True
             logger.error("Node %s failed: %s", node_id, str(e))
             await output_queue.put({
                 "type": SYSTEM_EVENT_DEBUG,
@@ -509,7 +573,33 @@ async def execute_graph_reactive(
                     "timestamp": datetime.now(UTC).isoformat()
                 }
             })
+            # Phase 4: Propagate error bypass to downstream nodes
+            if hooks is not None and not hooks.is_empty():
+                await _propagate_error_bypass_with_hooks(node_id)
     
+    async def _propagate_error_bypass_with_hooks(failed_node_id: str):
+        """Propagate error bypass to downstream nodes and invoke on_node_bypass hooks.
+        
+        Phase 4: Marks downstream nodes as BYPASSED and fires on_node_bypass
+        hooks for each bypassed node with reason="upstream_error".
+        
+        Args:
+            failed_node_id: The node that encountered an error.
+        """
+        from magic_agents.hooks.flow_hooks import HookContext
+        bypassed_nids = await dispatcher.propagate_error_bypass(failed_node_id)
+        for bid in bypassed_nids:
+            bnode = nodes.get(bid)
+            bypass_ctx = HookContext(
+                execution_id=_execution_id,
+                run_id=run_id or '',
+                node_id=bid,
+                node_type=bnode.node_type if bnode else None,
+                node_class=bnode.__class__.__name__ if bnode else None,
+                metadata={"upstream_error_node": failed_node_id},
+            )
+            await hooks.invoke("on_node_bypass", bypass_ctx, reason="upstream_error")
+
     # Create tasks for all nodes - they will wait for their inputs
     tasks: Dict[str, asyncio.Task] = {}
     for node_id in nodes.keys():
@@ -552,27 +642,59 @@ async def execute_graph_reactive(
     # Wait for waiter task
     await waiter
     
-    # Finalize debug feedback
-    if debug_feedback:
-        for node_id, node in nodes.items():
-            if hasattr(node, 'get_debug_info'):
-                node_debug_info = node.get_debug_info()
-                if node_debug_info and (node_debug_info.was_executed or node_debug_info.was_bypassed):
-                    debug_feedback.add_node_info(node_debug_info)
-        
-        debug_feedback.finalize()
-        yield {
-            "type": "debug_summary",
-            "content": debug_feedback.model_dump()
-        }
-        
-        summary = dispatcher.get_execution_summary()
-        logger.info(
-            "Execution complete: %d completed, %d bypassed, %d errors",
-            summary["completed"],
-            summary["bypassed"],
-            summary["errors"]
+    # === HOOK: on_graph_end / on_graph_error (AFTER all tasks complete, BEFORE return, Phase 4) ===
+    # Spec requirement: on_graph_end fires for successful execution only.
+    # on_graph_error fires when any node errored; on_graph_end is NOT invoked for failures.
+    if _graph_hook_context is not None:
+        _graph_hook_context.timestamp = datetime.now(UTC)
+        _summary = dispatcher.get_execution_summary()
+        _graph_hook_context.metadata["execution_summary"] = _summary
+        if _graph_has_errors:
+            _graph_hook_context.error_message = (
+                f"Graph execution completed with {_summary['errors']} node error(s)"
+            )
+            _graph_hook_context.metadata["failed_nodes"] = _summary["states"].get("error", [])
+            await hooks.invoke("on_graph_error", _graph_hook_context, error=RuntimeError(f"Graph execution failed: {_summary['errors']} node error(s)"))
+        else:
+            await hooks.invoke("on_graph_end", _graph_hook_context)
+    
+    # Finalize observer — emit graph_end event and summary
+    _exec_end_time = datetime.now(UTC)
+    _total_duration = (_exec_end_time - _exec_start_time).total_seconds() * 1000
+    _summary = dispatcher.get_execution_summary()
+    
+    if observer_registry.is_active:
+        await observer_registry.graph_observer.on_graph_end(
+            graph_type=graph.type,
+            execution_id=_execution_id,
+            total_duration_ms=_total_duration,
+            node_count=len(nodes),
+            executed_count=_summary.get("completed", 0),
+            bypassed_count=_summary.get("bypassed", 0),
+            failed_count=_summary.get("errors", 0),
         )
+        
+        # Phase 0: emit GRAPH_END to persistence callback (separate from observer)
+        from magic_agents.agt_flow import CallbackEmitter
+        _graph_end_event = {
+            "type": SYSTEM_EVENT_DEBUG,
+            "content": {
+                "event_type": "GRAPH_END",
+                "run_id": run_id,
+                "execution_id": _execution_id,
+                "total_duration_ms": _total_duration,
+                "status": "completed" if not _graph_has_errors else "errors",
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+        }
+        CallbackEmitter.emit(_graph_end_event, chat_log)
+    
+    logger.info(
+        "Execution complete: %d completed, %d bypassed, %d errors",
+        _summary.get("completed", 0),
+        _summary.get("bypassed", 0),
+        _summary.get("errors", 0),
+    )
     
     logger.info("Finished reactive execution")
 
@@ -584,6 +706,10 @@ async def execute_graph_loop_reactive(
     id_user: Optional[Union[int, str]] = None,
     extras: Optional[dict[str, Any]] = None,
     flow_state: Optional[dict[str, Any]] = None,
+    run_id: Optional[str] = None,         # Phase 0: execution tree identity
+    parent_run_id: Optional[str] = None,   # Phase 0: parent run identity
+    hooks: Optional[HookRegistry] = None,  # Phase 4: hook registry for graph/node hooks
+    debug_callback=None,                   # Phase 1: optional async callback for debug events
 ) -> AsyncGenerator[ChatCompletionModel, None]:
     """
     Execute an agent flow graph containing a Loop node using reactive model.
@@ -598,6 +724,7 @@ async def execute_graph_loop_reactive(
         id_user: Optional user ID
         extras: Optional client-provided contextual data
         flow_state: Optional per-flow volatile state (runtime-only)
+        hooks: Optional HookRegistry for graph/node lifecycle hooks (Phase 4)
         
     Yields:
         Streaming content and final outputs from nodes
@@ -632,21 +759,73 @@ async def execute_graph_loop_reactive(
     chat_log = ModelAgentRunLog(
         id_chat=id_chat, id_thread=id_thread, id_user=id_user,
         id_app=getattr(graph, 'app_id', None) or getattr(graph, 'id_app', None),
-        flow_state=flow_state or {}  # Initialize per-flow volatile state (isolated per flow)
+        flow_state=flow_state or {},  # Initialize per-flow volatile state (isolated per flow)
+        run_id=run_id,                  # Phase 0: execution tree identity
+        parent_run_id=parent_run_id,    # Phase 0: parent run identity
     )
     
+    # Generate execution ID for hooks traceability
+    _execution_id = uuid.uuid4().hex
+
     logger.info(
         "Starting reactive loop execution: nodes=%d edges=%d",
         len(nodes), len(graph.edges)
     )
     
-    # Initialize debug feedback
-    debug_feedback: Optional[GraphDebugFeedback] = None
-    if graph.debug:
-        debug_feedback = GraphDebugFeedback(
-            execution_id=uuid.uuid4().hex,
+    # Phase 0: emit GRAPH_START event for persistence callback
+    _graph_start_event = {
+        "type": SYSTEM_EVENT_DEBUG,
+        "content": {
+            "event_type": "GRAPH_START",
+            "run_id": run_id,
+            "parent_run_id": parent_run_id,
+            "graph_type": graph.type,
+            "node_count": len(nodes),
+            "edge_count": len(graph.edges),
+            "timestamp": datetime.now(UTC).isoformat(),
+        }
+    }
+    yield _graph_start_event
+    from magic_agents.agt_flow import CallbackEmitter
+    CallbackEmitter.emit(_graph_start_event, chat_log)
+    
+    # === HOOK: on_graph_start (Phase 4) ===
+    _graph_hook_context = None
+    if hooks is not None and not hooks.is_empty():
+        from magic_agents.hooks.flow_hooks import HookContext
+        _graph_hook_context = HookContext(
+            execution_id=_execution_id,
+            sequence_number=0,
+            run_id=run_id or '',
+            metadata={
+                "graph_type": graph.type,
+                "node_count": len(nodes),
+                "edge_count": len(graph.edges),
+            }
+        )
+        await hooks.invoke("on_graph_start", _graph_hook_context)
+
+    # Initialize observer registry (replaces inline GraphDebugFeedback for loop executor)
+    _debug_enabled_global = os.environ.get('DEBUG_ENABLED', 'true').strip().lower() in {'1', 'true', 'yes', 'on'}
+    _resolved_debug_config = getattr(graph, 'resolved_debug_config', None)
+    observer_registry = ObserverRegistry.create(
+        debug_enabled_global=_debug_enabled_global,
+        graph_debug=graph.debug,
+        graph_debug_config=_resolved_debug_config,
+        execution_id=_execution_id,
+        graph_type=graph.type,
+        total_nodes=len(nodes),
+        total_edges=len(graph.edges),
+        callback=debug_callback,
+    )
+    _exec_start_time = datetime.now(UTC)
+    
+    if observer_registry.is_active:
+        await observer_registry.graph_observer.on_graph_start(
             graph_type=graph.type,
-            start_time=datetime.now(UTC).isoformat()
+            execution_id=_execution_id,
+            node_count=len(nodes),
+            edge_count=len(graph.edges),
         )
     
     # Find the loop node
@@ -665,8 +844,8 @@ async def execute_graph_loop_reactive(
         len(static_edges), len(item_edges), len(loop_back_edges), len(end_edges)
     )
     
-    # Create dispatcher for the full graph
-    dispatcher = GraphEventDispatcher(nodes, graph.edges)
+    # Create dispatcher for the full graph with graph-level timeout
+    dispatcher = GraphEventDispatcher(nodes, graph.edges, timeout=graph.timeout)
     
     # Helper to execute a single node inline
     async def execute_node_inline(node_id: str, edges_to_process: List = None):
@@ -692,7 +871,8 @@ async def execute_graph_loop_reactive(
         # Execute if not already done
         if node._response is None:
             logger.debug("Executing loop node %s", node_id)
-            async for item in node(chat_log):
+            _node_obs = observer_registry.observer_for(node_id, node) if observer_registry.is_active else None
+            async for item in node(chat_log, hooks=hooks, observer=_node_obs):
                 item_type = item.get("type", "")
                 
                 # Check if this is streaming content
@@ -712,26 +892,33 @@ async def execute_graph_loop_reactive(
                 else:
                     # All other outputs stored using their handle name
                     node.outputs[item_type] = item["content"]
-            
-            if debug_feedback and hasattr(node, 'get_debug_info'):
-                node_debug_info = node.get_debug_info()
-                if node_debug_info and node_debug_info.was_executed:
-                    yield {
-                        "type": SYSTEM_EVENT_DEBUG,
-                        "content": node_debug_info.model_dump()
-                    }
     
     # Track bypassed nodes during static phase
     bypassed_nodes: Set[str] = set()
     
+    # Pending observer bypass notifications for static phase
+    # Collected during sync propagate_bypass_static, flushed asynchronously
+    _pending_static_bypasses: List[Tuple[str, str, str]] = []
+    
     def propagate_bypass_static(node_id: str):
-        """Recursively mark nodes as bypassed in static phase."""
+        """Recursively mark nodes as bypassed in static phase.
+        
+        Calls node.mark_bypassed() for internal node state AND collects
+        observer bypass notifications into _pending_static_bypasses for
+        async drain after the static phase completes.
+        """
         if node_id in bypassed_nodes:
             return
         bypassed_nodes.add(node_id)
         node = nodes.get(node_id)
         if node and hasattr(node, 'mark_bypassed'):
             node.mark_bypassed()
+            # Collect observer notification for async drain
+            _pending_static_bypasses.append((
+                node_id,
+                getattr(node, 'node_type', 'unknown') or 'unknown',
+                type(node).__name__,
+            ))
         logger.debug("Static phase: bypassing node %s", node_id)
         # Propagate to all downstream nodes in static edges
         for edge in static_edges:
@@ -857,6 +1044,18 @@ async def execute_graph_loop_reactive(
                 handle_conditional_bypass_static(node_id, selected_handle)
                 logger.debug("Conditional %s selected handle: %s", node_id, selected_handle)
     
+    # Flush pending static bypass observer notifications
+    if observer_registry.is_active and _pending_static_bypasses:
+        _bypass_observer = observer_registry.graph_observer
+        for _nid, _ntype, _nclass in _pending_static_bypasses:
+            await _bypass_observer.on_node_bypass(
+                node_id=_nid,
+                node_type=_ntype,
+                node_class=_nclass,
+                reason="static_conditional_bypass",
+            )
+        _pending_static_bypasses.clear()
+    
     # Transfer final outputs to loop node
     for edge in static_edges:
         if edge.target == loop_id:
@@ -979,6 +1178,20 @@ async def execute_graph_loop_reactive(
             elapsed_ms = (time.time() - start_time) * 1000
             yield emit_loop_progress(loop_id, idx, total_items, item, elapsed_ms)
             
+            # Phase 0: emit ITERATION_START debug event for execution tree persistence
+            iteration_start = time.time()
+            yield {
+                "type": SYSTEM_EVENT_DEBUG,
+                "content": {
+                    "event_type": "ITERATION_START",
+                    "loop_node_id": loop_id,
+                    "iteration": idx,
+                    "total_items": total_items,
+                    "current_item_preview": str(item)[:100] if item is not None else None,
+                    "timestamp": datetime.now(UTC).isoformat(),
+                }
+            }
+            
             # Reset loop state for this iteration
             loop_node._response = None
             loop_node.outputs.clear()
@@ -994,11 +1207,18 @@ async def execute_graph_loop_reactive(
             # downstream nodes must be skipped.
             iteration_bypassed: Set[str] = set()
             
+            # Pending observer bypass notifications for this iteration.
+            # Collected during sync propagate_bypass_iteration, flushed
+            # asynchronously at the end of the iteration's node execution phase.
+            _pending_iteration_bypasses: List[Tuple[str, str, str]] = []
+            
             def propagate_bypass_iteration(from_node_id: str):
                 """Mark downstream nodes as bypassed within the iteration subgraph.
                 
                 Transitively marks all nodes reachable from from_node_id via
                 edges within the iteration subgraph as bypassed.
+                Calls node.mark_bypassed() for internal state AND collects
+                observer notifications for async flush.
                 """
                 if from_node_id in iteration_bypassed:
                     return
@@ -1006,6 +1226,12 @@ async def execute_graph_loop_reactive(
                 node = nodes.get(from_node_id)
                 if node and hasattr(node, 'mark_bypassed'):
                     node.mark_bypassed()
+                    # Collect observer notification for async drain
+                    _pending_iteration_bypasses.append((
+                        from_node_id,
+                        getattr(node, 'node_type', 'unknown') or 'unknown',
+                        type(node).__name__,
+                    ))
                 logger.debug("Iteration %d: bypassing node %s", idx, from_node_id)
                 # Propagate to downstream nodes within iteration subgraph
                 for edge in all_edges:
@@ -1084,6 +1310,18 @@ async def execute_graph_loop_reactive(
                         if target and node.outputs and edge.target not in iteration_bypassed:
                             target.add_parent(node.outputs, edge.sourceHandle, edge.targetHandle)
             
+            # Flush pending iteration bypass observer notifications
+            if observer_registry.is_active and _pending_iteration_bypasses:
+                _bypass_observer = observer_registry.graph_observer
+                for _nid, _ntype, _nclass in _pending_iteration_bypasses:
+                    await _bypass_observer.on_node_bypass(
+                        node_id=_nid,
+                        node_type=_ntype,
+                        node_class=_nclass,
+                        reason="iteration_conditional_bypass",
+                    )
+                _pending_iteration_bypasses.clear()
+            
             # NOW collect the feedback AFTER all processing is complete (Issue #1 fix)
             # The feedback-producing node should have written to loop_node.inputs
             fb = loop_node.inputs.get(loop_node.INPUT_HANDLE_LOOP)
@@ -1094,6 +1332,19 @@ async def execute_graph_loop_reactive(
             
             logger.debug("Iteration %d feedback: %s", idx, str(fb)[:100] if fb else "None")
             loop_agg.append(fb)
+            
+            # Phase 0: emit ITERATION_END debug event for execution tree persistence
+            iteration_duration_ms = (time.time() - iteration_start) * 1000
+            yield {
+                "type": SYSTEM_EVENT_DEBUG,
+                "content": {
+                    "event_type": "ITERATION_END",
+                    "loop_node_id": loop_id,
+                    "iteration": idx,
+                    "duration_ms": round(iteration_duration_ms, 2),
+                    "timestamp": datetime.now(UTC).isoformat(),
+                }
+            }
         
         # Finish loop - set aggregated result
         loop_node._response = None
@@ -1215,18 +1466,35 @@ async def execute_graph_loop_reactive(
                 if target and node.outputs:
                     target.add_parent(node.outputs, edge.sourceHandle, edge.targetHandle)
     
-    # Finalize debug feedback
-    if debug_feedback:
-        for node_id, node in nodes.items():
-            if hasattr(node, 'get_debug_info'):
-                node_debug_info = node.get_debug_info()
-                if node_debug_info and (node_debug_info.was_executed or node_debug_info.was_bypassed):
-                    debug_feedback.add_node_info(node_debug_info)
-        
-        debug_feedback.finalize()
-        yield {
-            "type": "debug_summary",
-            "content": debug_feedback.model_dump()
-        }
+    # === HOOK: on_graph_end / on_graph_error (Phase 4) ===
+    # Spec requirement: on_graph_end fires for successful execution only.
+    # on_graph_error fires when any node errored; on_graph_end is NOT invoked for failures.
+    _summary = dispatcher.get_execution_summary()
+    if _graph_hook_context is not None:
+        _graph_hook_context.timestamp = datetime.now(UTC)
+        _graph_hook_context.metadata["execution_summary"] = _summary
+        if _summary["errors"] > 0:
+            _graph_hook_context.error_message = (
+                f"Graph execution completed with {_summary['errors']} node error(s)"
+            )
+            _graph_hook_context.metadata["failed_nodes"] = _summary["states"].get("error", [])
+            await hooks.invoke("on_graph_error", _graph_hook_context, error=RuntimeError(f"Loop execution failed: {_summary['errors']} node error(s)"))
+        else:
+            await hooks.invoke("on_graph_end", _graph_hook_context)
+
+    # Finalize observer — emit graph_end event and summary
+    _exec_end_time = datetime.now(UTC)
+    _total_duration = (_exec_end_time - _exec_start_time).total_seconds() * 1000
+    
+    if observer_registry.is_active:
+        await observer_registry.graph_observer.on_graph_end(
+            graph_type=graph.type,
+            execution_id=_execution_id,
+            total_duration_ms=_total_duration,
+            node_count=len(nodes),
+            executed_count=_summary.get("completed", 0),
+            bypassed_count=_summary.get("bypassed", 0),
+            failed_count=_summary.get("errors", 0),
+        )
     
     logger.info("Finished reactive loop execution")

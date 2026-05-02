@@ -735,7 +735,7 @@ class TestInnerNodeFlowIntegration:
             "nodes": [
                 {"id": "inner_input", "type": "user_input"},
                 {"id": "inner_modify", "type": "python_exec", "data": {
-                    "code": "chat_log.flow_state['child_counter'] = 100"
+                    "code": "def run(handler): return {'ok': True}"
                 }},
                 {"id": "inner_end", "type": "end"},
             ],
@@ -743,7 +743,7 @@ class TestInnerNodeFlowIntegration:
                 {"id": "ie1", "source": "inner_input", "target": "inner_modify",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
                 {"id": "ie2", "source": "inner_modify", "target": "inner_end",
-                 "sourceHandle": "handle_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle-python_exec-result", "targetHandle": "h1"},
             ],
         }
         

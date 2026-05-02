@@ -209,6 +209,11 @@ class GraphEventDispatcher:
         """
         Propagate a node's outputs to all downstream nodes.
         
+        Phase 8.2: When an edge has hooks configured with a hook_node_id, the
+        edge traversal context is passed to the NodeHook node as input on its
+        INPUT_HANDLE_HOOK_CONTEXT handle. The NodeHook executes as part of
+        normal graph processing when the executor reaches it.
+        
         Args:
             source_node_id: ID of the node that produced outputs
             outputs: Dictionary of output handle -> content
@@ -229,6 +234,34 @@ class GraphEventDispatcher:
                     edge.targetHandle,
                     content
                 )
+                
+                # Phase 8.2: Edge-level hook — when an edge has hook config,
+                # deliver edge traversal context to the configured NodeHook node
+                # and dispatch input on the hook context handle so the node's
+                # input tracker signals the waiting task (fix: was only setting
+                # hook_node.inputs directly without dispatch, causing the hook
+                # node to hang waiting for input signal).
+                if edge.hooks and edge.hooks.enabled and edge.hooks.hook_node_id:
+                    hook_node = self.nodes.get(edge.hooks.hook_node_id)
+                    if hook_node and hasattr(hook_node, 'INPUT_HANDLE_HOOK_CONTEXT'):
+                        from magic_agents.hooks.flow_hooks import HookContext as _HC
+                        _hook_ctx = _HC(
+                            execution_id='',
+                            node_id=source_node_id,
+                            inputs={
+                                "content": content,
+                                "source": source_node_id,
+                                "target": edge.target,
+                                "source_handle": edge.sourceHandle,
+                                "target_handle": edge.targetHandle,
+                            },
+                        )
+                        hook_node.inputs[hook_node.INPUT_HANDLE_HOOK_CONTEXT] = _hook_ctx
+                        await self.dispatch_input(
+                            edge.hooks.hook_node_id,
+                            hook_node.INPUT_HANDLE_HOOK_CONTEXT,
+                            _hook_ctx,
+                        )
                 
                 logger.debug(
                     "Propagated %s.%s -> %s.%s",
@@ -335,6 +368,69 @@ class GraphEventDispatcher:
             # Recursively bypass downstream
             for edge in self._outgoing.get(node_id, []):
                 await self._recursive_bypass(edge.target)
+    
+    async def propagate_error_bypass(
+        self,
+        source_node_id: str,
+    ) -> List[str]:
+        """Propagate BYPASS to all downstream nodes after an upstream error.
+        
+        When a node fails, all nodes downstream of it must be bypassed to
+        prevent indefinite hangs (they will never receive their inputs).
+        
+        This differs from _recursive_bypass in that it's triggered by node
+        ERROR (not conditional routing) and returns the list of bypassed
+        node IDs for hook invocation by the executor.
+        
+        Args:
+            source_node_id: The node that encountered an error. All nodes
+                          reachable from this node's outgoing edges will
+                          be recursively bypassed.
+                          
+        Returns:
+            List of node IDs that were marked as BYPASSED.
+        """
+        bypassed: List[str] = []
+        
+        # Start from direct downstream of the error source
+        for edge in self._outgoing.get(source_node_id, []):
+            await self._error_bypass_collect(edge.target, bypassed)
+        
+        return bypassed
+    
+    async def _error_bypass_collect(
+        self,
+        node_id: str,
+        bypassed: List[str],
+    ) -> None:
+        """Recursively bypass downstream nodes and collect their IDs.
+        
+        Args:
+            node_id: Node to bypass.
+            bypassed: Accumulator list for bypassed node IDs.
+        """
+        if self.get_state(node_id) in (NodeState.BYPASSED, NodeState.COMPLETED, NodeState.ERROR):
+            return
+        
+        tracker = self._trackers.get(node_id)
+        if not tracker:
+            return
+        
+        # Mark all inputs as bypassed
+        await tracker.receive_bypass()
+        
+        if tracker.is_bypassed:
+            self.set_state(node_id, NodeState.BYPASSED)
+            
+            node = self.nodes.get(node_id)
+            if node and hasattr(node, 'mark_bypassed'):
+                node.mark_bypassed()
+            
+            bypassed.append(node_id)
+            
+            # Recurse downstream
+            for edge in self._outgoing.get(node_id, []):
+                await self._error_bypass_collect(edge.target, bypassed)
     
     def get_ready_nodes(self) -> List[str]:
         """Get list of nodes that are ready to execute."""

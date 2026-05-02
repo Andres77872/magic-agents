@@ -1,5 +1,7 @@
 from typing import Callable, Optional, TYPE_CHECKING, Any
 import logging
+import uuid
+from datetime import datetime, UTC
 
 # from magic_agents.agt_flow import build, execute_graph
 from magic_agents.models.factory.Nodes import InnerNodeModel
@@ -105,19 +107,67 @@ class NodeInner(Node):
                 elif node_type == ModelAgentFlowTypesModel.CHAT:
                     node.message = input_message
         
-        # Execute the inner graph with extras and isolated flow_state
-        from magic_agents.agt_flow import execute_graph
+        # Execute the inner graph with extras and isolated flow_state.
+        # We call execute_graph_reactive directly (rather than execute_graph) so we
+        # can pass our HookRegistry natively — execute_graph's `hooks` param expects
+        # a RuntimeConfig, which doesn't match self._hooks (a HookRegistry).
+        from magic_agents.execution.reactive_executor import execute_graph_reactive
         from magic_agents.util.const import SYSTEM_EVENT_DEBUG
         content = ''
         extras = []
         inner_had_error = False
-        async for evt in execute_graph(
+        
+        # Phase 0: generate child run_id for execution tree persistence
+        child_run_id = f"run-{uuid.uuid4().hex}"
+        parent_execution_id = getattr(chat_log, 'run_id', None) or self.node_id
+        
+        # NOTE: We intentionally do NOT mutate chat_log.run_id / parent_run_id here.
+        # The child graph receives a brand-new ModelAgentRunLog built from the
+        # explicit run_id=/parent_run_id= kwargs below (lines below in execute_graph_reactive),
+        # so the parent's chat_log is never read by the child. Mutating it would also
+        # create a forward-looking race when sibling NodeInner instances share the
+        # same parent chat_log concurrently.
+        
+        # Phase 0: yield SUBGRAPH_START debug event
+        yield {
+            "type": SYSTEM_EVENT_DEBUG,
+            "content": {
+                "event_type": "SUBGRAPH_START",
+                "parent_execution_id": parent_execution_id,
+                "child_run_id": child_run_id,
+                "node_id": self.node_id,
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+        }
+        
+        # Phase 8.3: propagate parent hooks into the inner sub-graph and merge with
+        # any graph-level hooks declared on the inner_graph itself. Mirrors the merge
+        # pattern in agt_flow.execute_graph (priority: parent registry first, then
+        # inner_graph.hooks registered on top).
+        #
+        # NOTE: debug_callback is intentionally NOT propagated to the child graph.
+        # Child debug events already reach the parent's callback via the manual
+        # `yield evt` forwarding in the loop below — propagating debug_callback
+        # would cause every child debug event to be delivered twice (once via the
+        # callback, once via the forwarded yield). See P0_REGRESSION_ANALYSIS.md
+        # (Option γ) for full rationale.
+        _child_hooks = self._hooks
+        if self.inner_graph.hooks is not None:
+            from magic_agents.hooks.hook_registry import HookRegistry
+            if _child_hooks is None:
+                _child_hooks = HookRegistry()
+            _child_hooks.register_graph(self.inner_graph.hooks)
+        
+        async for evt in execute_graph_reactive(
                 self.inner_graph,
                 id_chat=chat_log.id_chat,
                 id_thread=chat_log.id_thread,
                 id_user=chat_log.id_user,
                 extras=child_extras,
-                flow_state=None  # Child gets isolated empty state
+                flow_state=None,  # Child gets isolated empty state
+                run_id=child_run_id,           # Phase 0
+                parent_run_id=parent_execution_id,  # Phase 0
+                hooks=_child_hooks,
         ):
             # Propagate debug/error events from inner graph to outer graph
             if evt.get('type') == SYSTEM_EVENT_DEBUG:
@@ -146,6 +196,19 @@ class NodeInner(Node):
                 # For now, we'll skip non-ChatCompletionModel outputs
                 # In a full implementation, you might want to handle these differently
                 pass
+
+        # Phase 0: yield SUBGRAPH_END debug event
+        yield {
+            "type": SYSTEM_EVENT_DEBUG,
+            "content": {
+                "event_type": "SUBGRAPH_END",
+                "parent_execution_id": parent_execution_id,
+                "child_run_id": child_run_id,
+                "node_id": self.node_id,
+                "status": "error" if inner_had_error else "completed",
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+        }
 
         # If inner graph had errors, signal bypass so downstream nodes don't hang
         if inner_had_error:

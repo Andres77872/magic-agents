@@ -38,6 +38,9 @@ class NodeDebugInfo(BaseModel):
         default_factory=dict,
         description="Additional debug information specific to node type"
     )
+    
+    # Running state flag (Phase 1: Minimal Viable Observability)
+    is_running: bool = Field(False, description="Whether the node is currently executing (running state)")
 
 
 class GraphDebugFeedback(BaseModel):
@@ -45,6 +48,10 @@ class GraphDebugFeedback(BaseModel):
     
     execution_id: str = Field(..., description="Unique identifier for this execution")
     graph_type: str = Field(..., description="Type of graph executed")
+    # ── Phase 0 cross-repo instrumentation ──
+    # Populated from chat_log (which now carries run_id).
+    parent_execution_id: Optional[str] = Field(None, description="Parent execution span ID")
+    run_id: Optional[str] = Field(None, description="Run ID from chat_log")
     
     # Overall execution info
     start_time: str = Field(..., description="ISO timestamp when graph execution started")

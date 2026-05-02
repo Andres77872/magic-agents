@@ -9,7 +9,7 @@ Tests cover:
 """
 import asyncio
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from magic_agents.agt_flow import build, _assign_tool_handles
 from magic_agents.execution.event_dispatcher import GraphEventDispatcher
@@ -428,3 +428,101 @@ class TestAssignToolHandlesOverwritesWrongValues:
             assert "handle-tool-definition-0" in mock_nodes["llm-1"].inputs
 
         asyncio.get_event_loop().run_until_complete(_test())
+
+
+# ─── PythonExecToolWrapper: Dual-param tool schema ───────────────────
+
+
+class TestPythonExecToolWrapper:
+    """Tests for PythonExecToolWrapper dual-param tool schema."""
+
+    def test_tool_schema_has_code_and_handler_params(self):
+        """PythonExecToolWrapper.tool_schema contains both code and handler params."""
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+        wrapper = PythonExecToolWrapper(executor=MagicMock())
+
+        schema = wrapper.tool_schema
+        params = schema['function']['parameters']['properties']
+
+        assert 'code' in params, "Schema must have 'code' parameter"
+        assert params['code']['type'] == 'string'
+        assert 'handler' in params, "Schema must have 'handler' parameter"
+        assert params['handler']['type'] == 'object'
+
+    def test_tool_schema_description_contains_run_handler(self):
+        """Tool schema description references run(handler) contract."""
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+        wrapper = PythonExecToolWrapper(executor=MagicMock())
+
+        description = wrapper.tool_schema['function']['description']
+        assert 'run(handler)' in description
+
+    @pytest.mark.asyncio
+    async def test_call_with_code_legacy_path(self):
+        """__call__(code='...') delegates to PythonExecutor (legacy path)."""
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+
+        executor = AsyncMock()
+        executor.side_effect = lambda code="", **kw: f"executed: {code}"
+        wrapper = PythonExecToolWrapper(executor=executor)
+
+        result = await wrapper(code="print('hello')")
+
+        executor.assert_called_once_with(code="print('hello')")
+
+    @pytest.mark.asyncio
+    async def test_call_with_handler_uses_code_runner(self):
+        """__call__(handler={'x': 1}) uses CodeRunner for execution."""
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+        from magic_agents.node_system.python_code_runner import CodeRunner
+
+        executor = MagicMock()
+        code_runner = CodeRunner()
+        wrapper = PythonExecToolWrapper(
+            executor=executor,
+            code_runner=code_runner,
+            node_code="def run(handler): return handler['x'] * 2",
+        )
+
+        result = await wrapper(handler={"x": 5})
+
+        import json
+        parsed = json.loads(result)
+        assert parsed == {"result": 10}
+
+    @pytest.mark.asyncio
+    async def test_call_both_code_and_handler_prefers_handler(self):
+        """When both code and handler provided, handler takes precedence and warning logged."""
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+        from magic_agents.node_system.python_code_runner import CodeRunner
+
+        executor = MagicMock()
+        code_runner = CodeRunner()
+        wrapper = PythonExecToolWrapper(
+            executor=executor,
+            code_runner=code_runner,
+            node_id='test-node',
+        )
+
+        with patch('magic_agents.node_system.NodePythonExec.logger') as mock_logger:
+            result = await wrapper(code="print('ignored')", handler={"value": "test"})
+
+            # Warning should be logged
+            mock_logger.warning.assert_called_once()
+            assert 'preferring handler' in mock_logger.warning.call_args[0][0]
+
+        import json
+        parsed = json.loads(result)
+        assert isinstance(parsed, dict)
+
+    def test_tool_callable_property(self):
+        """tool_callable property returns self for tool_functions registration."""
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+        wrapper = PythonExecToolWrapper(executor=MagicMock())
+        assert wrapper.tool_callable is wrapper
+
+    def test_name_property(self):
+        """__name__ returns 'execute_python' for tool registration."""
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+        wrapper = PythonExecToolWrapper(executor=MagicMock())
+        assert wrapper.__name__ == 'execute_python'

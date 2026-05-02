@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, PrivateAttr, Field
 
 from magic_agents.models.factory.EdgeNodeModel import EdgeNodeModel
 from magic_agents.debug.config import DebugConfig
+from magic_agents.hooks.flow_hooks import FlowHooks
 
 
 class ContractConfig(BaseModel):
@@ -146,9 +147,16 @@ class AgentFlowModel(BaseModel):
     debug_config: Optional[Dict[str, Any]] = None
     nodes: dict[str, Any]
     edges: list[EdgeNodeModel]
+    timeout: float = Field(default=60.0, ge=1.0, description="Graph-level timeout for node input waiting (seconds)")
     
     # NEW: Validation configuration (Phase 3)
     contract_config: ContractConfig = Field(default_factory=ContractConfig)
+    
+    # Phase 8.1: Graph-level hook registration
+    hooks: Optional[FlowHooks] = Field(
+        default=None,
+        description="Graph-level FlowHooks for this flow instance"
+    )
     
     # Private attribute for storing validation errors
     _validation_errors: Optional[List[Dict[str, Any]]] = PrivateAttr(default=None)

@@ -570,3 +570,62 @@ class TestAssignToolHandlesPythonExec:
 
         assert edges[0]['targetHandle'] == 'handle-custom-target'
         assert edges[0]['sourceHandle'] == 'handle-custom-source'
+
+    # ─── Node-mode python_exec: skip tool handle assignment ──────────────
+
+    def test_node_mode_python_exec_skips_tool_handle_assignment(self):
+        """Node-mode python_exec (data.code set) edge is NOT modified by _assign_tool_handles."""
+        nodes = [
+            {"id": "py1", "type": "python_exec",
+             "data": {"code": "def run(handler): return handler"}},
+            {"id": "llm-1", "type": ModelAgentFlowTypesModel.LLM},
+        ]
+        edges = [
+            {"id": "e1", "source": "py1", "target": "llm-1",
+             "sourceHandle": "custom-source", "targetHandle": "custom-target"},
+        ]
+        _assign_tool_handles(nodes, edges)
+
+        # Neither sourceHandle nor targetHandle should be modified
+        assert edges[0]['sourceHandle'] == 'custom-source'
+        assert edges[0]['targetHandle'] == 'custom-target'
+
+    def test_node_mode_python_exec_no_handles_not_modified(self):
+        """Node-mode python_exec with no explicit handles: NOT auto-assigned."""
+        nodes = [
+            {"id": "py1", "type": "python_exec",
+             "data": {"code": "def run(handler): return handler"}},
+            {"id": "llm-1", "type": ModelAgentFlowTypesModel.LLM},
+        ]
+        edges = [
+            {"id": "e1", "source": "py1", "target": "llm-1"},
+        ]
+        _assign_tool_handles(nodes, edges)
+
+        # No sourceHandle auto-assigned, no targetHandle auto-assigned
+        assert 'sourceHandle' not in edges[0] or edges[0].get('sourceHandle') is None
+        assert 'targetHandle' not in edges[0] or edges[0].get('targetHandle') is None
+
+    def test_tool_mode_python_exec_still_gets_handles(self):
+        """Tool-mode python_exec (no code) still gets tool handles assigned."""
+        nodes = [
+            {"id": "py1", "type": "python_exec", "data": {}},
+            {"id": "py2", "type": "python_exec",
+             "data": {"code": "def run(handler): return handler"}},
+            {"id": "llm-1", "type": ModelAgentFlowTypesModel.LLM},
+        ]
+        edges = [
+            # Tool-mode edge
+            {"id": "e1", "source": "py1", "target": "llm-1"},
+            # Node-mode edge
+            {"id": "e2", "source": "py2", "target": "llm-1"},
+        ]
+        _assign_tool_handles(nodes, edges)
+
+        # Tool-mode edge gets handles
+        assert edges[0]['sourceHandle'] == 'handle-tool-definition'
+        assert edges[0]['targetHandle'] == 'handle-tool-definition-0'
+
+        # Node-mode edge is NOT modified
+        assert 'sourceHandle' not in edges[1] or edges[1].get('sourceHandle') is None
+        assert 'targetHandle' not in edges[1] or edges[1].get('targetHandle') is None

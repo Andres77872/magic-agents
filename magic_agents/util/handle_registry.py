@@ -96,6 +96,12 @@ CANONICAL_OUTPUT_HANDLES: Dict[str, Set[str]] = {
     ModelAgentFlowTypesModel.MCP: {
         'handle-tool-definition',
     },
+    # Phase 6: NodeHook output handles
+    ModelAgentFlowTypesModel.HOOK: {
+        'handle-user-output',
+        'handle-debug-output',
+        'handle-feedback-output',
+    },
 }
 
 # NEW: Canonical input handles per node type (Phase 1)
@@ -140,6 +146,10 @@ CANONICAL_INPUT_HANDLES: Dict[str, Set[str]] = {
     ModelAgentFlowTypesModel.VOID: set(),  # Terminal sink - no inputs validated
     ModelAgentFlowTypesModel.PYTHON_EXEC: set(),  # No input handles
     ModelAgentFlowTypesModel.MCP: set(),  # No input handles
+    # Phase 6: NodeHook input handles
+    ModelAgentFlowTypesModel.HOOK: {
+        'handle-hook-context',
+    },
 }
 
 # NEW: Port cardinality metadata (Phase 2)
@@ -200,6 +210,12 @@ PORT_CARDINALITY: Dict[str, Dict[str, CardinalityInfo]] = {
     ModelAgentFlowTypesModel.CHAT: {},
     ModelAgentFlowTypesModel.PYTHON_EXEC: {},
     ModelAgentFlowTypesModel.MCP: {},
+    # Phase 6: NodeHook cardinality
+    ModelAgentFlowTypesModel.HOOK: {
+        'handle-hook-context': CardinalityInfo(
+            cardinality="one", exclusive=True
+        ),
+    },
 }
 
 

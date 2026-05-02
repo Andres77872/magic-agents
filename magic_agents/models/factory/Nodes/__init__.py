@@ -19,3 +19,10 @@ from magic_agents.models.factory.Nodes.McpNodeModel import (
     MCPServerConfig,
 )
 from magic_agents.models.factory.Nodes.ChatNodeModel import ChatNodeModel
+from magic_agents.models.factory.Nodes.HookNodeModel import (
+    HookNodeModel,
+    DEFAULT_INPUT_HOOK_CONTEXT,
+    DEFAULT_OUTPUT_USER,
+    DEFAULT_OUTPUT_DEBUG,
+    DEFAULT_OUTPUT_FEEDBACK,
+)
