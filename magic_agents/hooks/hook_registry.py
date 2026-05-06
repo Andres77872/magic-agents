@@ -87,6 +87,34 @@ class HookRegistry:
         if node_id not in self._node_hooks:
             self._node_hooks[node_id] = []
         self._node_hooks[node_id].append(hook)
+
+    def clone(self) -> "HookRegistry":
+        """Return an execution-scoped copy with the same registered hooks.
+
+        The hook objects themselves are intentionally shared observer instances;
+        registry membership lists are copied so child graph registration can add
+        its own graph hooks without mutating the parent registry.
+        """
+        cloned = HookRegistry(global_hooks=list(self._global_hooks))
+        cloned._graph_hooks = list(self._graph_hooks)
+        cloned._node_hooks = {
+            node_id: list(hooks)
+            for node_id, hooks in self._node_hooks.items()
+        }
+        cloned.execution_id = self.execution_id
+        cloned.run_id = self.run_id
+        return cloned
+
+    def export_hooks(self) -> Dict[str, Any]:
+        """Export registered hook lists for tests/introspection."""
+        return {
+            "global": list(self._global_hooks),
+            "graph": list(self._graph_hooks),
+            "node": {
+                node_id: list(hooks)
+                for node_id, hooks in self._node_hooks.items()
+            },
+        }
     
     async def invoke(
         self,

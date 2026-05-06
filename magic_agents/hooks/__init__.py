@@ -53,6 +53,18 @@ from magic_agents.hooks.emit_context import EmitInterface
 
 from magic_agents.hooks.hook_relay import HookRelay
 
+from magic_agents.hooks.persistence import (
+    AssistantMessageContext,
+    ExecutionPersistencePort,
+    GraphPersistenceHook,
+    PersistenceHook,
+)
+
+from magic_agents.hooks.debug_sse import DebugSSEHook
+
+from magic_agents.hooks import contracts
+from magic_agents.hooks.context_factory import HookContextFactory
+
 
 # Public API
 __all__ = [
@@ -76,6 +88,17 @@ __all__ = [
     
     # Relay adapter
     "HookRelay",
+
+    # Reusable hook implementations
+    "AssistantMessageContext",
+    "ExecutionPersistencePort",
+    "GraphPersistenceHook",
+    "PersistenceHook",
+    "DebugSSEHook",
+
+    # Contracts & Factory
+    "contracts",
+    "HookContextFactory",
 ]
 
 

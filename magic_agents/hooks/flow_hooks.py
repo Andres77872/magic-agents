@@ -13,6 +13,7 @@ Contracts:
 
 from __future__ import annotations
 
+import warnings
 from typing import Protocol, runtime_checkable, Optional, Any, Dict, List
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
@@ -27,6 +28,20 @@ class FlowHooks(Protocol):
     Exceptions are isolated (logged, execution continues).
     
     Naming follows industry-standard on_{component}_{action} pattern.
+    
+    Channel Ordering Contract:
+    For START events (graph start, node start):
+      Phase 0 (debug event yield) → Phase 1 (observer) → Phase 4 (hook)
+    For END events (graph end, node end):
+      Phase 4 (hook) → Phase 1 (observer) → Phase 0 (debug event yield)
+    For BYPASS events:
+      Phase 1 (observer) → Phase 4 (hook)
+    For ERROR events:
+      Phase 4 (hook) → Phase 1 (observer) → Phase 0 (debug event yield)
+    
+    This ordering ensures debug events are yielded first on start (persistence
+    before dispatch) and hooks fire first on end/error (observability before
+    persistence).
     """
     
     # === GRAPH LIFECYCLE (Tier 1, 2) ===
@@ -89,7 +104,10 @@ class FlowHooks(Protocol):
     async def on_llm_start(self, context: HookContext, llm_config: Optional[Dict[str, Any]] = None) -> None:
         """Called before LLM call in NodeLLM.
         
-        llm_config contains model, provider, streaming, tools, etc.
+        llm_config is populated with real config data when available from
+        the HookRelay path. Contains model, provider, streaming, tools,
+        tool_choice, deduplicate, and other available config fields.
+        May be None when config data is entirely unavailable.
         """
         ...
     
@@ -97,6 +115,24 @@ class FlowHooks(Protocol):
         """Called after LLM call completes.
         
         response contains the LLM output summary.
+        """
+        ...
+    
+    async def on_llm_loop_end(self, context: HookContext) -> None:
+        """Called ONCE after agent loop completion (aggregated data).
+        
+        Carries accumulated content from ALL iterations/generations.
+        Fires for BOTH streaming and non-streaming paths.
+        Does NOT fire on budget-exceeded exit (use on_node_error instead).
+        
+        Per-iteration data is available via on_llm_end events (N times).
+        This event is the aggregate signal (1 time per loop).
+        
+        Args:
+            context: HookContext with LLMLoopEndInputs in outputs.
+                Key fields: model, content, iteration (0-indexed),
+                total_iterations (1-indexed count), provider_request_id,
+                prompt_tokens, completion_tokens, total_tokens.
         """
         ...
     
@@ -127,6 +163,24 @@ class HookContext:
     
     Deep copies are provided for inputs/outputs to prevent mutation.
     """
+    
+    def __post_init__(self) -> None:
+        """Emit deprecation warning when HookContext is constructed directly.
+        
+        Use HookContextFactory.build_*_context() methods for schema-validated
+        contexts instead.
+        """
+        import traceback
+        # Only warn if this is a direct HookContext construction,
+        # not from a subclass
+        if type(self) is HookContext:
+            warnings.warn(
+                "Direct HookContext() construction is deprecated. "
+                "Use HookContextFactory.build_*_context() methods for "
+                "schema-validated contexts.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
     
     # === Identity ===
     execution_id: str  # Unique execution trace ID (graph_id)
@@ -168,6 +222,10 @@ class HookContext:
         
         Error objects are not serialized directly - only type/message.
         Emit interface is excluded from serialization.
+        
+        Note: Only serializes base HookContext fields. Extension subclass fields
+        are intentionally omitted (they are deprecated and not populated by
+        HookContextFactory).
         """
         return {
             "execution_id": self.execution_id,
@@ -194,9 +252,10 @@ class HookContext:
 
 @dataclass
 class NodeLLMHookContext(HookContext):
-    """Extended context for NodeLLM-specific hooks.
+    """[DEPRECATED] Extended context for NodeLLM-specific hooks.
     
     Provides LLM-specific fields: model, provider, streaming, tokens, tools.
+    This extension is deprecated. Use HookContext with metadata fields instead.
     """
     
     model: Optional[str] = None
@@ -209,9 +268,10 @@ class NodeLLMHookContext(HookContext):
 
 @dataclass
 class NodeMcpHookContext(HookContext):
-    """Extended context for NodeMcp-specific hooks.
+    """[DEPRECATED] Extended context for NodeMcp-specific hooks.
     
     Provides MCP-specific fields: session, tools discovered, bundle.
+    This extension is deprecated. Use HookContext with metadata fields instead.
     """
     
     session_id: Optional[str] = None
@@ -221,9 +281,10 @@ class NodeMcpHookContext(HookContext):
 
 @dataclass
 class NodeLoopHookContext(HookContext):
-    """Extended context for NodeLoop-specific hooks.
+    """[DEPRECATED] Extended context for NodeLoop-specific hooks.
     
     Provides loop-specific fields: items count, current index, aggregation.
+    This extension is deprecated. Use HookContext with metadata fields instead.
     """
     
     items_count: int = 0

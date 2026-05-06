@@ -62,7 +62,9 @@ class GraphEventDispatcher:
         nodes: Dict[str, Any],
         edges: List[EdgeNodeModel],
         max_concurrent: int = 10,
-        timeout: float = 60.0
+        timeout: float = 60.0,
+        execution_id: str = "",
+        run_id: str = "",
     ):
         """
         Initialize the event dispatcher.
@@ -72,11 +74,16 @@ class GraphEventDispatcher:
             edges: List of EdgeNodeModel defining connections
             max_concurrent: Maximum concurrent node executions
             timeout: Timeout for waiting on inputs (seconds)
+            execution_id: Graph execution ID for hook traceability.
+            run_id: Run ID for hook traceability.
         """
         self.nodes = nodes
         self.edges = edges
         self.max_concurrent = max_concurrent
         self.timeout = timeout
+        self._execution_id = execution_id
+        self._run_id = run_id
+        self._sequence_counter: int = 0
         
         # Build dependency maps
         self._incoming: Dict[str, List[EdgeNodeModel]] = {}
@@ -244,17 +251,21 @@ class GraphEventDispatcher:
                 if edge.hooks and edge.hooks.enabled and edge.hooks.hook_node_id:
                     hook_node = self.nodes.get(edge.hooks.hook_node_id)
                     if hook_node and hasattr(hook_node, 'INPUT_HANDLE_HOOK_CONTEXT'):
-                        from magic_agents.hooks.flow_hooks import HookContext as _HC
-                        _hook_ctx = _HC(
-                            execution_id='',
+                        self._sequence_counter += 1
+                        source_node = self.nodes.get(source_node_id)
+                        from magic_agents.hooks.context_factory import HookContextFactory
+                        _hook_ctx = HookContextFactory.build_edge_context(
+                            execution_id=self._execution_id,
+                            run_id=self._run_id,
                             node_id=source_node_id,
-                            inputs={
-                                "content": content,
-                                "source": source_node_id,
-                                "target": edge.target,
-                                "source_handle": edge.sourceHandle,
-                                "target_handle": edge.targetHandle,
-                            },
+                            node_type=getattr(source_node, 'node_type', 'unknown') if source_node else 'unknown',
+                            node_class=source_node.__class__.__name__ if source_node else '',
+                            sequence_number=self._sequence_counter,
+                            source=source_node_id,
+                            target=edge.target,
+                            content=content,
+                            source_handle=edge.sourceHandle,
+                            target_handle=edge.targetHandle,
                         )
                         hook_node.inputs[hook_node.INPUT_HANDLE_HOOK_CONTEXT] = _hook_ctx
                         await self.dispatch_input(

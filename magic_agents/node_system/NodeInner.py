@@ -151,11 +151,12 @@ class NodeInner(Node):
         # would cause every child debug event to be delivered twice (once via the
         # callback, once via the forwarded yield). See P0_REGRESSION_ANALYSIS.md
         # (Option γ) for full rationale.
-        _child_hooks = self._hooks
+        from magic_agents.hooks.hook_registry import HookRegistry
+        _child_hooks = self._hooks.clone() if self._hooks is not None else HookRegistry()
+        if self._hooks is not None:
+            _child_hooks.execution_id = self._hooks.execution_id
+            _child_hooks.run_id = self._hooks.run_id
         if self.inner_graph.hooks is not None:
-            from magic_agents.hooks.hook_registry import HookRegistry
-            if _child_hooks is None:
-                _child_hooks = HookRegistry()
             _child_hooks.register_graph(self.inner_graph.hooks)
         
         async for evt in execute_graph_reactive(

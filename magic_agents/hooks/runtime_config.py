@@ -158,10 +158,19 @@ class RuntimeConfig:
         
         return registry
     
-    def is_empty(self) -> bool:
-        """Check if this config has no hooks at any level.
+    @classmethod
+    def has_global_hooks(cls) -> bool:
+        """Check if global hooks are registered at the class level.
         
         Returns:
-            True if no global + no graph hooks, False otherwise.
+            True if any global hooks are registered, False otherwise.
         """
-        return len(self._global_hooks) == 0 and len(self._graph_hooks) == 0
+        return len(cls._global_hooks) > 0
+
+    def is_empty(self) -> bool:
+        """Check if this config has instance-level graph hooks.
+        
+        Returns:
+            True if no graph hooks registered on this instance, False otherwise.
+        """
+        return len(self._graph_hooks) == 0

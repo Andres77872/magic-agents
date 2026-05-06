@@ -377,16 +377,16 @@ async def execute_graph_reactive(
     _graph_hook_context = None
     _graph_has_errors = False  # Track whether any node errored (for on_graph_error)
     if hooks is not None and not hooks.is_empty():
-        from magic_agents.hooks.flow_hooks import HookContext
-        _graph_hook_context = HookContext(
+        from magic_agents.hooks.context_factory import HookContextFactory
+        _graph_hook_context = HookContextFactory.build_graph_context(
             execution_id=_execution_id,
-            sequence_number=0,
             run_id=run_id or '',
             metadata={
+                "graph_id": getattr(graph, 'id', '') or '',
                 "graph_type": graph.type,
                 "node_count": len(nodes),
                 "edge_count": len(graph.edges),
-            }
+            },
         )
         await hooks.invoke("on_graph_start", _graph_hook_context)
 
@@ -417,7 +417,12 @@ async def execute_graph_reactive(
         )
     
     # Create event dispatcher with graph-level timeout
-    dispatcher = GraphEventDispatcher(nodes, graph.edges, timeout=graph.timeout)
+    dispatcher = GraphEventDispatcher(
+        nodes, graph.edges,
+        timeout=graph.timeout,
+        execution_id=_execution_id,
+        run_id=run_id or '',
+    )
     
     # Output queue for collecting results from parallel tasks
     output_queue: asyncio.Queue = asyncio.Queue()
@@ -437,6 +442,13 @@ async def execute_graph_reactive(
             should_execute = await tracker.wait_ready(timeout=dispatcher.timeout)
             
             if not should_execute:
+                # GUARD: If error cascade already bypassed this node via
+                # _propagate_error_bypass_with_hooks, the dispatcher state
+                # is already BYPASSED and the hook was already fired with
+                # reason="upstream_error". Skip redundant not_ready hook.
+                if dispatcher.get_state(node_id) == NodeState.BYPASSED:
+                    return
+                
                 # Node is bypassed
                 dispatcher.set_state(node_id, NodeState.BYPASSED)
                 node.mark_bypassed()
@@ -451,6 +463,20 @@ async def execute_graph_reactive(
                         node_class=type(node).__name__,
                         reason="inputs_not_ready",
                     )
+                
+                # HOOK: on_node_bypass (Phase 4) — reason="not_ready"
+                if hooks is not None and not hooks.is_empty():
+                    from magic_agents.hooks.context_factory import HookContextFactory
+                    _bypass_ctx = HookContextFactory.build_bypass_context(
+                        execution_id=_execution_id,
+                        run_id=run_id or '',
+                        node_id=node_id,
+                        node_type=getattr(node, 'node_type', 'unknown') or 'unknown',
+                        node_class=type(node).__name__,
+                        reason="not_ready",
+                        metadata={"bypass_path": "single_node", "phase": "static"},
+                    )
+                    await hooks.invoke("on_node_bypass", _bypass_ctx, reason="not_ready")
                 return
             
             # Execute the node
@@ -586,16 +612,17 @@ async def execute_graph_reactive(
         Args:
             failed_node_id: The node that encountered an error.
         """
-        from magic_agents.hooks.flow_hooks import HookContext
+        from magic_agents.hooks.context_factory import HookContextFactory
         bypassed_nids = await dispatcher.propagate_error_bypass(failed_node_id)
         for bid in bypassed_nids:
             bnode = nodes.get(bid)
-            bypass_ctx = HookContext(
+            bypass_ctx = HookContextFactory.build_bypass_context(
                 execution_id=_execution_id,
                 run_id=run_id or '',
                 node_id=bid,
                 node_type=bnode.node_type if bnode else None,
                 node_class=bnode.__class__.__name__ if bnode else None,
+                reason="upstream_error",
                 metadata={"upstream_error_node": failed_node_id},
             )
             await hooks.invoke("on_node_bypass", bypass_ctx, reason="upstream_error")
@@ -792,16 +819,16 @@ async def execute_graph_loop_reactive(
     # === HOOK: on_graph_start (Phase 4) ===
     _graph_hook_context = None
     if hooks is not None and not hooks.is_empty():
-        from magic_agents.hooks.flow_hooks import HookContext
-        _graph_hook_context = HookContext(
+        from magic_agents.hooks.context_factory import HookContextFactory
+        _graph_hook_context = HookContextFactory.build_graph_context(
             execution_id=_execution_id,
-            sequence_number=0,
             run_id=run_id or '',
             metadata={
+                "graph_id": getattr(graph, 'id', '') or '',
                 "graph_type": graph.type,
                 "node_count": len(nodes),
                 "edge_count": len(graph.edges),
-            }
+            },
         )
         await hooks.invoke("on_graph_start", _graph_hook_context)
 
@@ -845,7 +872,12 @@ async def execute_graph_loop_reactive(
     )
     
     # Create dispatcher for the full graph with graph-level timeout
-    dispatcher = GraphEventDispatcher(nodes, graph.edges, timeout=graph.timeout)
+    dispatcher = GraphEventDispatcher(
+        nodes, graph.edges,
+        timeout=graph.timeout,
+        execution_id=_execution_id,
+        run_id=run_id or '',
+    )
     
     # Helper to execute a single node inline
     async def execute_node_inline(node_id: str, edges_to_process: List = None):
@@ -898,7 +930,7 @@ async def execute_graph_loop_reactive(
     
     # Pending observer bypass notifications for static phase
     # Collected during sync propagate_bypass_static, flushed asynchronously
-    _pending_static_bypasses: List[Tuple[str, str, str]] = []
+    _pending_static_bypasses: List[Tuple[str, str, str, str, str]] = []
     
     def propagate_bypass_static(node_id: str):
         """Recursively mark nodes as bypassed in static phase.
@@ -918,6 +950,8 @@ async def execute_graph_loop_reactive(
                 node_id,
                 getattr(node, 'node_type', 'unknown') or 'unknown',
                 type(node).__name__,
+                _execution_id,
+                run_id or '',
             ))
         logger.debug("Static phase: bypassing node %s", node_id)
         # Propagate to all downstream nodes in static edges
@@ -1044,10 +1078,25 @@ async def execute_graph_loop_reactive(
                 handle_conditional_bypass_static(node_id, selected_handle)
                 logger.debug("Conditional %s selected handle: %s", node_id, selected_handle)
     
+    # HOOK: on_node_bypass for static phase conditional bypasses (Phase 4) — reason="condition"
+    if hooks is not None and not hooks.is_empty() and _pending_static_bypasses:
+        from magic_agents.hooks.context_factory import HookContextFactory
+        for _nid, _ntype, _nclass, _eid, _rid in _pending_static_bypasses:
+            _bypass_ctx = HookContextFactory.build_bypass_context(
+                execution_id=_eid,
+                run_id=_rid,
+                node_id=_nid,
+                node_type=_ntype,
+                node_class=_nclass,
+                reason="condition",
+                metadata={"phase": "static"},
+            )
+            await hooks.invoke("on_node_bypass", _bypass_ctx, reason="condition")
+    
     # Flush pending static bypass observer notifications
     if observer_registry.is_active and _pending_static_bypasses:
         _bypass_observer = observer_registry.graph_observer
-        for _nid, _ntype, _nclass in _pending_static_bypasses:
+        for _nid, _ntype, _nclass, _eid, _rid in _pending_static_bypasses:
             await _bypass_observer.on_node_bypass(
                 node_id=_nid,
                 node_type=_ntype,
@@ -1210,7 +1259,7 @@ async def execute_graph_loop_reactive(
             # Pending observer bypass notifications for this iteration.
             # Collected during sync propagate_bypass_iteration, flushed
             # asynchronously at the end of the iteration's node execution phase.
-            _pending_iteration_bypasses: List[Tuple[str, str, str]] = []
+            _pending_iteration_bypasses: List[Tuple[str, str, str, str, str]] = []
             
             def propagate_bypass_iteration(from_node_id: str):
                 """Mark downstream nodes as bypassed within the iteration subgraph.
@@ -1231,6 +1280,8 @@ async def execute_graph_loop_reactive(
                         from_node_id,
                         getattr(node, 'node_type', 'unknown') or 'unknown',
                         type(node).__name__,
+                        _execution_id,
+                        run_id or '',
                     ))
                 logger.debug("Iteration %d: bypassing node %s", idx, from_node_id)
                 # Propagate to downstream nodes within iteration subgraph
@@ -1310,10 +1361,25 @@ async def execute_graph_loop_reactive(
                         if target and node.outputs and edge.target not in iteration_bypassed:
                             target.add_parent(node.outputs, edge.sourceHandle, edge.targetHandle)
             
+            # HOOK: on_node_bypass for iteration phase conditional bypasses (Phase 4) — reason="condition"
+            if hooks is not None and not hooks.is_empty() and _pending_iteration_bypasses:
+                from magic_agents.hooks.context_factory import HookContextFactory
+                for _nid, _ntype, _nclass, _eid, _rid in _pending_iteration_bypasses:
+                    _bypass_ctx = HookContextFactory.build_bypass_context(
+                        execution_id=_eid,
+                        run_id=_rid,
+                        node_id=_nid,
+                        node_type=_ntype,
+                        node_class=_nclass,
+                        reason="condition",
+                        metadata={"phase": "iteration"},
+                    )
+                    await hooks.invoke("on_node_bypass", _bypass_ctx, reason="condition")
+            
             # Flush pending iteration bypass observer notifications
             if observer_registry.is_active and _pending_iteration_bypasses:
                 _bypass_observer = observer_registry.graph_observer
-                for _nid, _ntype, _nclass in _pending_iteration_bypasses:
+                for _nid, _ntype, _nclass, _eid, _rid in _pending_iteration_bypasses:
                     await _bypass_observer.on_node_bypass(
                         node_id=_nid,
                         node_type=_ntype,

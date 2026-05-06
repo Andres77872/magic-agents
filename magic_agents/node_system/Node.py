@@ -222,17 +222,17 @@ class Node(abc.ABC):
         # === HOOK: on_node_start (BEFORE observer, Phase 4) ===
         _hook_ctx: Optional['HookContext'] = None
         if hooks is not None and not hooks.is_empty():
-            from magic_agents.hooks.flow_hooks import HookContext as _HC
+            from magic_agents.hooks.context_factory import HookContextFactory
             _hook_start = datetime.now(UTC)
-            _hook_ctx = _HC(
+            _hook_ctx = HookContextFactory.build_node_context(
                 execution_id=getattr(hooks, 'execution_id', ''),
-                run_id=getattr(hooks, 'run_id', '') or getattr(chat_log, 'run_id', '') if chat_log else '',
-                parent_run_id=getattr(chat_log, 'parent_run_id', None) if chat_log else None,
+                run_id=getattr(hooks, 'run_id', '') or (getattr(chat_log, 'run_id', '') if chat_log else ''),
                 node_id=self.node_id,
                 node_type=self.node_type,
                 node_class=self.__class__.__name__,
                 inputs=self._safe_copy_dict(self.inputs),
                 start_time=_hook_start,
+                parent_run_id=getattr(chat_log, 'parent_run_id', None) if chat_log else None,
             )
             await hooks.invoke("on_node_start", _hook_ctx)
 

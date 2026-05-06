@@ -255,8 +255,10 @@ class RedactTransformer:
                 result.append(item)
         return result
     
-    def _is_sensitive_key(self, key: str) -> bool:
+    def _is_sensitive_key(self, key: Any) -> bool:
         """Check if a key matches any sensitive pattern."""
+        if not isinstance(key, str):
+            return False
         key_lower = key.lower()
         return any(sensitive in key_lower for sensitive in self._sensitive_keys)
 

@@ -434,6 +434,9 @@ class DefaultDebugCapture:
         """
         Capture an edge traversal event.
         
+        [DEPRECATED] No-op — edge traversal telemetry uses EdgeHookConfig → NodeHook
+        dispatch instead.
+        
         Args:
             source_node: Source node ID
             target_node: Target node ID

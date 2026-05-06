@@ -454,6 +454,8 @@ async def execute_graph_loop(
     _registry = None
     if hooks is not None and not hooks.is_empty():
         _registry = hooks.create_registry()
+        if graph.hooks is not None:
+            _registry.register_graph(graph.hooks)
     elif graph.hooks is not None:
         from magic_agents.hooks.hook_registry import HookRegistry
         _registry = HookRegistry()
@@ -574,6 +576,38 @@ def validate_graph(nodes: list[dict], edges: list[dict]) -> dict:
     # Note: Multiple END nodes are allowed (no validation needed)
     end_nodes = [node for node in nodes if node['type'] == ModelAgentFlowTypesModel.END]
     logger.info("Graph contains %d END node(s) (multiple END nodes are allowed)", len(end_nodes))
+
+    # Task 3.11: JSON NodeHook validation — type: "hook" nodes MUST have function_template
+    hook_nodes = [node for node in nodes if node.get('type') == ModelAgentFlowTypesModel.HOOK]
+    for hook_node in hook_nodes:
+        node_id = hook_node.get('id', 'unknown')
+        data = hook_node.get('data', {})
+        # function_template can be in data or at top level
+        function_template = data.get('function_template') or hook_node.get('function_template')
+        if not function_template:
+            errors.append({
+                "error_type": "HookValidationError",
+                "error_message": f"Hook node '{node_id}' is missing required field 'function_template'.",
+                "context": {"node_id": node_id, "missing_field": "function_template"}
+            })
+
+    # Task 3.11: EdgeHookConfig validation — hook_node_id must reference a valid node ID
+    hook_node_ids = {n.get('id') for n in hook_nodes}
+    for edge in edges:
+        edge_hooks = edge.get('hooks') or {}
+        if isinstance(edge_hooks, dict):
+            hook_node_ref = edge_hooks.get('hook_node_id')
+            if hook_node_ref and hook_node_ref not in node_ids:
+                edge_id = edge.get('id', 'unknown')
+                errors.append({
+                    "error_type": "HookValidationError",
+                    "error_message": f"Edge '{edge_id}' references non-existent hook_node_id '{hook_node_ref}'.",
+                    "context": {
+                        "edge_id": edge_id,
+                        "hook_node_id": hook_node_ref,
+                        "valid_node_ids": list(node_ids),
+                    }
+                })
     
     return {
         "valid": len(errors) == 0,
@@ -625,6 +659,17 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
         agt_data = graph_data
     
     agt_data = resolve_env_placeholders(agt_data)
+
+    # Task 3.10 (F22): Diagnostic warning for dict "hooks" in JSON agent definitions.
+    # Graph-level hooks cannot be set from JSON — they must be FlowHooks instances.
+    # Emit a warning and remove the key to prevent silent misconfiguration.
+    if 'hooks' in agt_data and isinstance(agt_data['hooks'], dict):
+        logger.warning(
+            "Graph-level hooks cannot be set from JSON. "
+            "Use type: 'hook' nodes or EdgeHookConfig instead. "
+            "The 'hooks' key in agent data will be ignored."
+        )
+        del agt_data['hooks']
 
     # Validate the graph structure before building
     validation_result = validate_graph(agt_data['nodes'], agt_data['edges'])

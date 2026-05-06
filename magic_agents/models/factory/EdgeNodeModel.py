@@ -12,10 +12,13 @@ Phase 8.2: Added EdgeHookConfig and EdgeNodeModel.hooks field for edge-level
 hook configuration. A hook attached to an edge fires when output propagates
 through that edge to the target node.
 """
+import logging
 import uuid
 from typing import Optional
 
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 
 class EdgeHookConfig(BaseModel):
@@ -36,7 +39,8 @@ class EdgeHookConfig(BaseModel):
     )
     hook_type: str = Field(
         default="on_edge_traversed",
-        description="Hook event type identifier"
+        description="[DEPRECATED] This field is no longer used. Edge hook dispatch is determined by hook_node_id only.",
+        deprecated=True
     )
     timeout_override: Optional[int] = Field(
         default=None,
@@ -46,6 +50,16 @@ class EdgeHookConfig(BaseModel):
         default=True,
         description="Whether this hook is active"
     )
+
+    def model_post_init(self, __context) -> None:
+        """Post-initialization hook to emit deprecation warnings."""
+        if self.hook_type is not None and self.hook_type != "on_edge_traversed":
+            logger.warning(
+                "EdgeHookConfig.hook_type is deprecated and will be removed. "
+                "Edge hook dispatch is determined by hook_node_id only. "
+                "Received hook_type=%r",
+                self.hook_type,
+            )
 
 
 class EdgeNodeModel(BaseModel):

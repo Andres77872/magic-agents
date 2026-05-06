@@ -289,30 +289,54 @@ class NodeLLM(Node):
         
         return bundle
 
-    def _create_hook_relay(self) -> Optional[Any]:
-        """Create a HookRelay if hooks are registered.
+    def _create_hook_relay(self, client: Any = None) -> Any:
+        """Create a HookRelay for tool call/result collection.
 
-        Checks self._hooks (set by Node.__call__) and creates a HookRelay
-        that bridges magic-agents hooks to magic-llm's AgentHooks Protocol.
+        When hooks are registered (self._hooks set by Node.__call__), creates
+        a HookRelay that bridges magic-agents hooks to magic-llm's AgentHooks
+        Protocol and collects tool call/result data.
 
-        Uses real execution_id/run_id from the registry (set by executor at
-        execution start) so that relay-produced HookContexts carry proper
-        traceability identity rather than empty strings.
+        When no hooks are registered, creates a standalone HookRelay collector
+        that still captures on_tool_start/on_tool_complete data without
+        invoking any flow hooks. This ensures the streaming tool path can
+        emit TOOL_CALL/TOOL_RESULT debug events for persistence even for
+        graphs without configured hooks.
+
+        Args:
+            client: Optional MagicLLM client. When provided, builds a best-effort
+                llm_config dict with model, provider, streaming, and json_output
+                fields for hook event propagation.
 
         Returns:
-            HookRelay instance if hooks available, None otherwise.
+            HookRelay instance (always, never None).
         """
-        hooks = getattr(self, '_hooks', None)
-        if hooks is None or hooks.is_empty():
-            return None
-
         from magic_agents.hooks.hook_relay import HookRelay
 
+        # Build best-effort llm_config from available NodeLLM state
+        llm_config: dict[str, Any] = {}
+        if client is not None:
+            llm_config["model"] = getattr(client.llm, 'model', '')
+            llm_config["provider"] = (
+                getattr(client.llm, 'engine_name', '')
+                or getattr(client, 'engine', '')
+            )
+        llm_config["streaming"] = self.stream
+        llm_config["json_output"] = self.json_output
+
+        hooks = getattr(self, '_hooks', None)
+        if hooks is not None and not hooks.is_empty():
+            return HookRelay(
+                registry=hooks,
+                node_id=self.node_id or '',
+                graph_id=getattr(hooks, 'execution_id', ''),
+                run_id=getattr(hooks, 'run_id', ''),
+                llm_config=llm_config,
+                timeout=30.0,  # Increased from 5s default for persistence hooks
+            )
+
         return HookRelay(
-            registry=hooks,
             node_id=self.node_id or '',
-            graph_id=getattr(hooks, 'execution_id', ''),
-            run_id=getattr(hooks, 'run_id', ''),
+            llm_config=llm_config,
         )
 
     async def process(self, chat_log):
@@ -412,7 +436,7 @@ class NodeLLM(Node):
                             f"NodeLLM:{self.node_id} has callable tools but magic-llm does not "
                             f"provide client.run_agent_async() or client.run_agent(). Upgrade magic-llm."
                         )
-                    hook_relay = self._create_hook_relay()
+                    hook_relay = self._create_hook_relay(client=client)
                     intention = await asyncio.to_thread(
                         client.run_agent,
                         user_input=user_msg,
@@ -422,8 +446,9 @@ class NodeLLM(Node):
                         hooks=hook_relay,
                         **self.extra_data
                     )
+                    await hook_relay.flush_pending_hooks()
                 else:
-                    hook_relay = self._create_hook_relay()
+                    hook_relay = self._create_hook_relay(client=client)
                     intention = await client.run_agent_async(
                         user_input=user_msg,
                         system_prompt=sys_msg,
@@ -432,10 +457,27 @@ class NodeLLM(Node):
                         hooks=hook_relay,
                         **self.extra_data
                     )
+                    await hook_relay.flush_pending_hooks()
                 self.generated = intention.content
-                final_tool_calls = getattr(intention, 'tool_calls', []) or []
+                # Use REAL collected tool calls, not intention.tool_calls (always empty for callable-tool path)
+                if hook_relay is not None and hook_relay.collected_tool_calls:
+                    final_tool_calls = list(hook_relay.collected_tool_calls)
+                else:
+                    final_tool_calls = getattr(intention, 'tool_calls', []) or []
                 # Phase 0: emit LLM_GENERATION for execution tree persistence
                 yield self._emit_llm_generation(intention)
+
+                # Emit tool_call/tool_result debug events for API persistence
+                if hook_relay is not None:
+                    for te in hook_relay.get_collected_tool_data_for_yield():
+                        yield {
+                            'type': 'debug',
+                            'content': {
+                                'event_type': 'TOOL_CALL' if te['type'] == 'tool_call' else 'TOOL_RESULT',
+                                'node_id': self.node_id,
+                                'data': te['data'],
+                            }
+                        }
 
             elif tools_schemas:
                 # Schema-only tools: single generate call (LLM can reference tools but no executor)
@@ -453,14 +495,15 @@ class NodeLLM(Node):
                 # === HOOK: on_llm_start (non-tool path, Phase 9) ===
                 _llm_ctx = None
                 if hasattr(self, '_hooks') and self._hooks is not None and not self._hooks.is_empty():
-                    from magic_agents.hooks.flow_hooks import HookContext as _LLM_HC
-                    _llm_ctx = _LLM_HC(
+                    from magic_agents.hooks.context_factory import HookContextFactory
+                    _llm_ctx = HookContextFactory.build_llm_context(
                         execution_id=getattr(self._hooks, 'execution_id', ''),
                         run_id=getattr(self._hooks, 'run_id', ''),
                         node_id=self.node_id,
-                        node_type=self.node_type,
+                        node_type=self.node_type or '',
                         node_class=self.__class__.__name__,
-                        inputs={"model": client.llm.model, "streaming": False},
+                        model=client.llm.model,
+                        streaming=False,
                     )
                     await self._hooks.invoke("on_llm_start", _llm_ctx)
 
@@ -511,7 +554,7 @@ class NodeLLM(Node):
                             f"provide client.run_agent_stream_async() or client.run_agent_stream(). Upgrade magic-llm."
                         )
 
-                    hook_relay = self._create_hook_relay()
+                    hook_relay = self._create_hook_relay(client=client)
                     last_chunk = None
                     for chunk in await asyncio.to_thread(
                         client.run_agent_stream,
@@ -526,11 +569,24 @@ class NodeLLM(Node):
                         last_chunk = chunk
                         yield self.yield_static(chunk, content_type=self.OUTPUT_HANDLE_CONTENT)
                     if last_chunk:
-                        final_tool_calls = getattr(last_chunk.choices[0].delta, 'tool_calls', []) or []
-                        # Phase 0: emit LLM_GENERATION for execution tree persistence
+                        if hook_relay is not None and hook_relay.collected_tool_calls:
+                            final_tool_calls = list(hook_relay.collected_tool_calls)
+                        else:
+                            final_tool_calls = getattr(last_chunk.choices[0].delta, 'tool_calls', []) or []
                         yield self._emit_llm_generation(last_chunk)
+                        if hook_relay is not None:
+                            for te in hook_relay.get_collected_tool_data_for_yield():
+                                yield {
+                                    'type': 'debug',
+                                    'content': {
+                                        'event_type': 'TOOL_CALL' if te['type'] == 'tool_call' else 'TOOL_RESULT',
+                                        'node_id': self.node_id,
+                                        'data': te['data'],
+                                    }
+                                }
+                    await hook_relay.flush_pending_hooks()
                 else:
-                    hook_relay = self._create_hook_relay()
+                    hook_relay = self._create_hook_relay(client=client)
                     last_chunk = None
                     async for chunk in client.run_agent_stream_async(
                         user_input=user_msg,
@@ -545,9 +601,22 @@ class NodeLLM(Node):
                         yield self.yield_static(chunk, content_type=self.OUTPUT_HANDLE_CONTENT)
                     # Capture tool_calls from the last chunk
                     if last_chunk:
-                        final_tool_calls = getattr(last_chunk.choices[0].delta, 'tool_calls', []) or []
-                        # Phase 0: emit LLM_GENERATION for execution tree persistence
+                        if hook_relay is not None and hook_relay.collected_tool_calls:
+                            final_tool_calls = list(hook_relay.collected_tool_calls)
+                        else:
+                            final_tool_calls = getattr(last_chunk.choices[0].delta, 'tool_calls', []) or []
                         yield self._emit_llm_generation(last_chunk)
+                        if hook_relay is not None:
+                            for te in hook_relay.get_collected_tool_data_for_yield():
+                                yield {
+                                    'type': 'debug',
+                                    'content': {
+                                        'event_type': 'TOOL_CALL' if te['type'] == 'tool_call' else 'TOOL_RESULT',
+                                        'node_id': self.node_id,
+                                        'data': te['data'],
+                                    }
+                                }
+                    await hook_relay.flush_pending_hooks()
             elif tools_schemas:
                 # Schema-only tools with streaming
                 self._warn_unsupported_engine(client)
@@ -565,14 +634,15 @@ class NodeLLM(Node):
                 # === HOOK: on_llm_start (non-tool streaming, Phase 9) ===
                 _llm_ctx = None
                 if hasattr(self, '_hooks') and self._hooks is not None and not self._hooks.is_empty():
-                    from magic_agents.hooks.flow_hooks import HookContext as _LLM_HC
-                    _llm_ctx = _LLM_HC(
+                    from magic_agents.hooks.context_factory import HookContextFactory
+                    _llm_ctx = HookContextFactory.build_llm_context(
                         execution_id=getattr(self._hooks, 'execution_id', ''),
                         run_id=getattr(self._hooks, 'run_id', ''),
                         node_id=self.node_id,
-                        node_type=self.node_type,
+                        node_type=self.node_type or '',
                         node_class=self.__class__.__name__,
-                        inputs={"model": client.llm.model, "streaming": True},
+                        model=client.llm.model,
+                        streaming=True,
                     )
                     await self._hooks.invoke("on_llm_start", _llm_ctx)
 

@@ -388,10 +388,27 @@ class TestRedactTransformer:
         """Test adding custom redact keys."""
         transformer = RedactTransformer(additional_keys={"custom_secret"})
         event = DebugEvent(payload={"custom_secret": "value"})
-        
+
         result = transformer.transform(event)
-        
+
         assert result.payload["custom_secret"] == "***REDACTED***"
+
+    def test_non_string_keys_do_not_crash(self):
+        """Non-string keys in payload mappings must pass through without crashing."""
+        transformer = RedactTransformer()
+        event = DebugEvent(payload={
+            "inputs": {
+                None: "keep",
+                123: {"token": "secret"},
+                "api_key": "secret",
+            }
+        })
+
+        result = transformer.transform(event)
+
+        assert result.payload["inputs"][None] == "keep"
+        assert result.payload["inputs"][123]["token"] == "***REDACTED***"
+        assert result.payload["inputs"]["api_key"] == "***REDACTED***"
 
 
 class TestFilterTransformer:

@@ -15,8 +15,10 @@ Contracts:
 - Errors are isolated (logged, not propagated) per spec requirement
 """
 import asyncio
+import json
 import logging
-from typing import TYPE_CHECKING, Any, Dict, Optional
+import uuid
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 from magic_llm.agent.hooks import AgentHooks
 from magic_llm.agent.types import AgentState, ToolResult
@@ -63,6 +65,11 @@ class HookRelay(AgentHooks):
         run_id: str = "",
         emit: Optional[Any] = None,
         registry: Optional['HookRegistry'] = None,
+        timeout: float = 5.0,
+        llm_config: Optional[Dict[str, Any]] = None,
+        parent_run_id: Optional[str] = None,
+        nested_depth: int = 0,
+        nested_request_id: Optional[str] = None,
     ):
         """Initialize HookRelay with flow hooks and execution context.
 
@@ -75,6 +82,16 @@ class HookRelay(AgentHooks):
             emit: Optional EmitInterface for hook function outputs.
             registry: Optional HookRegistry for multi-hook dispatch.
                 Preferred over flow_hooks when both are provided.
+            timeout: Default timeout in seconds for flush_pending_hooks().
+            llm_config: Optional dict with LLM configuration data (model,
+                provider, streaming, tools, tool_choice, deduplicate, etc.)
+                populated best-effort from NodeLLM context.
+            parent_run_id: Optional run_id of the parent loop for nested
+                LLM hook correlation.
+            nested_depth: Nesting depth for nested LLM hook events.
+                0 = root loop, 1 = first child, etc.
+            nested_request_id: Unique UUID hex for nested invocation
+                correlation. Auto-generated if not provided.
         """
         self._flow_hooks = flow_hooks
         self._registry = registry
@@ -83,6 +100,31 @@ class HookRelay(AgentHooks):
         self._run_id = run_id
         self._emit = emit
         self._sequence: int = 0
+
+        self._pending_futures: Set[asyncio.Task] = set()
+        self._flush_timeout: float = timeout
+
+        self._current_provider_request_id: Optional[str] = None
+        self._llm_config: Dict[str, Any] = llm_config or {}
+        self._parent_run_id: Optional[str] = parent_run_id
+        self._nested_depth: int = nested_depth
+        self._nested_request_id: str = nested_request_id or uuid.uuid4().hex
+
+        self._collected_tool_calls: List[Dict[str, Any]] = []
+        self._collected_tool_results: List[Dict[str, Any]] = []
+
+    @staticmethod
+    def _iteration_from_state(state: AgentState, fallback: int = 0) -> int:
+        """Return canonical loop iteration metadata from AgentState.
+
+        Newer magic-llm exposes the current 0-indexed loop counter as
+        ``AgentState.step``. Older states used ``iteration``. Keep the fallback
+        so existing consumers with legacy state objects remain compatible.
+        """
+        value = getattr(state, "step", None)
+        if value is None:
+            value = getattr(state, "iteration", fallback)
+        return value
 
     def _next_sequence(self) -> int:
         """Get the next sequence number for HookContext."""
@@ -97,45 +139,97 @@ class HookRelay(AgentHooks):
     ) -> HookContext:
         """Build a HookContext with execution identity injected.
 
+        Uses HookContextFactory.build_llm_context() for core identity fields,
+        then merges outputs and error_message for backward compatibility.
+
+        Injects nested correlation metadata (nested_depth, parent_run_id,
+        nested_request_id) into the context for nested LLM loop tracking.
+        Uses the runtime DEPTH ContextVar from magic-llm (when available)
+        for accurate nesting depth, falling back to construction-time
+        _nested_depth.
+
         Args:
             inputs: Optional input data for the context.
             outputs: Optional output data for the context.
             error_message: Optional error message for error contexts.
 
         Returns:
-            HookContext with node_id, graph_id, run_id populated.
+            HookContext with node_id, graph_id, run_id populated,
+            plus nested correlation metadata when applicable.
         """
-        return HookContext(
+        from magic_agents.hooks.context_factory import HookContextFactory
+        ctx = HookContextFactory.build_llm_context(
             execution_id=self._graph_id,
-            sequence_number=self._next_sequence(),
             run_id=self._run_id,
             node_id=self._node_id,
             node_type="LLM",
             node_class="NodeLLM",
-            inputs=inputs or {},
-            outputs=outputs or {},
-            error_message=error_message,
-            emit=self._emit,
+            sequence_number=self._next_sequence(),
+            **(inputs or {}),
         )
+        if outputs:
+            ctx.outputs = outputs
+        if error_message:
+            ctx.error_message = error_message
+        ctx.emit = self._emit
+
+        # Inject nested correlation metadata for ALL events.
+        # Uses runtime DEPTH ContextVar when available (more accurate
+        # than construction-time _nested_depth for shared HookRelay
+        # across parent/child loops).
+        try:
+            from magic_llm.agent import DEPTH as _runtime_depth
+            ctx.metadata["nested_depth"] = _runtime_depth.get()
+        except (ImportError, AttributeError):
+            ctx.metadata["nested_depth"] = self._nested_depth
+
+        ctx.metadata["nested_request_id"] = self._nested_request_id
+        if self._parent_run_id is not None:
+            ctx.metadata["parent_run_id"] = self._parent_run_id
+            ctx.parent_run_id = self._parent_run_id
+
+        return ctx
 
     # === AgentHooks Protocol Implementation ===
 
     def on_iteration_start(self, iteration: int, state: AgentState) -> None:
         """Called before each LLM call in the agent loop.
 
-        Translates to: FlowHooks.on_llm_start(context)
+        Translates to: FlowHooks.on_llm_start(context, llm_config=...)
+
+        Populates context.inputs with best-effort LLM config data (model,
+        provider, streaming, tools, tool_choice, deduplicate) from the
+        HookRelay's _llm_config dict. Delivers the full llm_config dict
+        as an extra kwarg to on_llm_start.
+
+        Note: Nested correlation metadata (nested_depth, parent_run_id,
+        nested_request_id) is injected at _build_context() level for
+        ALL events, not here.
 
         Args:
             iteration: The current 0-indexed iteration number.
             state: The current agent state (read-only).
         """
+        state_iteration = self._iteration_from_state(state, iteration)
         context = self._build_context(
             inputs={
                 "iteration": iteration,
-                "llm_call_count": getattr(state, 'iteration', iteration),
+                "llm_call_count": state_iteration,
+                "model": self._llm_config.get("model"),
+                "provider": self._llm_config.get("provider"),
+                "streaming": self._llm_config.get("streaming"),
+                "tools": self._llm_config.get("tools"),
+                "tool_choice": self._llm_config.get("tool_choice"),
+                "deduplicate": self._llm_config.get("deduplicate"),
             }
         )
-        self._safe_invoke_sync("on_llm_start", context)
+
+        # Build llm_config dict for extra kwarg (None when empty to distinguish
+        # "no data" from "all fields are None")
+        extra = None
+        if self._llm_config:
+            extra = {"llm_config": dict(self._llm_config)}
+        self._safe_invoke_sync("on_llm_start", context, extra=extra)
 
     def on_llm_response(
         self, response: ModelChatResponse, state: AgentState
@@ -144,15 +238,31 @@ class HookRelay(AgentHooks):
 
         Translates to: FlowHooks.on_llm_end(context)
 
+        Injects provider_request_id from response.id (cached for tool event
+        correlation), token usage from response.usage, and iteration metadata
+        from state.
+
         Args:
             response: The raw LLM response.
             state: The current agent state (read-only).
         """
+        self._current_provider_request_id = getattr(response, 'id', None)
+
+        usage = getattr(response, 'usage', None) or {}
+        prompt_tokens = usage.get('prompt_tokens') if isinstance(usage, dict) else getattr(usage, 'prompt_tokens', None)
+        completion_tokens = usage.get('completion_tokens') if isinstance(usage, dict) else getattr(usage, 'completion_tokens', None)
+        total_tokens = usage.get('total_tokens') if isinstance(usage, dict) else getattr(usage, 'total_tokens', None)
+
         context = self._build_context(
             outputs={
                 "model": getattr(response, 'model', 'unknown'),
                 "content": getattr(response, 'content', ''),
                 "finish_reason": getattr(response, 'finish_reason', None),
+                "provider_request_id": self._current_provider_request_id,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+                "iteration": self._iteration_from_state(state),
             }
         )
         self._safe_invoke_sync("on_llm_end", context)
@@ -168,6 +278,10 @@ class HookRelay(AgentHooks):
 
         Translates to: FlowHooks.on_tool_start(context)
 
+        Injects provider_request_id from the most recent LLM response
+        (cached in _current_provider_request_id) and iteration metadata
+        into both the HookContext and the collected tool call entry.
+
         Args:
             tool_name: The name of the tool about to be executed.
             tool_call_id: The provider-specific tool call identifier.
@@ -179,14 +293,31 @@ class HookRelay(AgentHooks):
                 "tool_name": tool_name,
                 "tool_call_id": tool_call_id,
                 "arguments": arguments,
+                "provider_request_id": self._current_provider_request_id,
+                "iteration": self._iteration_from_state(state),
             }
         )
         self._safe_invoke_sync("on_tool_start", context)
+
+        self._collected_tool_calls.append({
+            "id": tool_call_id,
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "arguments": json.dumps(arguments) if isinstance(arguments, dict) else str(arguments),
+            },
+            "provider_request_id": self._current_provider_request_id,
+            "iteration": self._iteration_from_state(state),
+        })
 
     def on_tool_complete(self, result: ToolResult, state: AgentState) -> None:
         """Called after each tool execution (success or error).
 
         Translates to: FlowHooks.on_tool_end(context)
+
+        Injects provider_request_id from the most recent LLM response
+        (cached in _current_provider_request_id) and iteration metadata
+        into both the HookContext and the collected tool result entry.
 
         Args:
             result: The structured tool execution result.
@@ -197,31 +328,75 @@ class HookRelay(AgentHooks):
                 "tool_name": getattr(result, 'name', 'unknown'),
                         "result": getattr(result, 'content', ''),
                 "success": getattr(result, 'error', None) is None,
+                "execution_time_ms": getattr(result, 'duration_ms', None),
+                "provider_request_id": self._current_provider_request_id,
+                "iteration": self._iteration_from_state(state),
             },
             error_message=getattr(result, 'error', None),
         )
         self._safe_invoke_sync("on_tool_end", context)
 
+        status = "error" if result.is_error else "completed"
+        entry: Dict[str, Any] = {
+            "role": "tool",
+            "tool_call_id": result.tool_call_id or "",
+            "content": result.content,
+            "status": status,
+            "execution_time_ms": result.duration_ms,
+            "provider_request_id": self._current_provider_request_id,
+            "iteration": self._iteration_from_state(state),
+        }
+        if result.is_error and result.error:
+            entry["tool_error"] = result.error
+        self._collected_tool_results.append(entry)
+
     def on_loop_complete(
         self, final_response: ModelChatResponse, state: AgentState
     ) -> None:
-        """Called after the loop exits (normal completion or budget-exceeded).
+        """Called after the loop exits (NORMAL exit only, NOT budget-exceeded).
 
-        Translates to: FlowHooks.on_llm_end(context) for final aggregation.
+        Translates to: FlowHooks.on_llm_loop_end(context) for aggregated
+        loop completion. Fires ONCE per loop, after all per-iteration
+        on_llm_end events.
+
+        Carries accumulated content from ALL iterations, iteration metadata
+        (0-indexed iteration, 1-indexed total_iterations), provider_request_id
+        from final response, and token usage data.
+
+        Clears _current_provider_request_id after firing to prevent stale
+        values from leaking between loops.
+
+        NOTE: This fires for normal completion only. Budget-exceeded exits
+        are handled by on_budget_exceeded() and never reach this method.
 
         Args:
             final_response: The final LLM response.
             state: The final agent state (read-only).
         """
+        iteration = self._iteration_from_state(state)
+        usage = getattr(final_response, 'usage', None) or {}
+        prompt_tokens = usage.get('prompt_tokens') if isinstance(usage, dict) else getattr(usage, 'prompt_tokens', None)
+        completion_tokens = usage.get('completion_tokens') if isinstance(usage, dict) else getattr(usage, 'completion_tokens', None)
+        total_tokens = usage.get('total_tokens') if isinstance(usage, dict) else getattr(usage, 'total_tokens', None)
+
         context = self._build_context(
             outputs={
                 "model": getattr(final_response, 'model', 'unknown'),
                 "content": getattr(final_response, 'content', ''),
-                "iterations": getattr(state, 'iteration', 0),
-                "loop_complete": True,
+                "content_preview": (getattr(final_response, 'content', '') or '')[:200],
+                "finish_reason": getattr(final_response, 'finish_reason', None),
+                "iteration": iteration,
+                "total_iterations": iteration + 1,
+                "provider_request_id": getattr(final_response, 'id', None),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
             }
         )
-        self._safe_invoke_sync("on_llm_end", context)
+        self._safe_invoke_sync("on_llm_loop_end", context)
+
+        # Clear cached provider_request_id to prevent stale values between loops
+        self._current_provider_request_id = None
 
     def on_budget_exceeded(self, budget_type: str, details: str) -> None:
         """Called when a budget constraint is violated.
@@ -240,6 +415,40 @@ class HookRelay(AgentHooks):
             inputs={"budget_type": budget_type, "details": details},
         )
         self._safe_invoke_sync("on_node_error", context, {"error": None})
+
+    # === Async Bridge: Pending Futures ===
+
+    async def flush_pending_hooks(self) -> None:
+        """Wait for all pending async hook tasks to complete.
+
+        Snapshots _pending_futures to prevent list mutation race during
+        asyncio.wait(). Cancels any timed-out tasks and clears the set.
+        Safe to call multiple times (clears after each call).
+
+        Task exceptions are handled via return_exceptions=True and are NOT
+        propagated to the caller — errors are isolated per spec requirement.
+        """
+        if not self._pending_futures:
+            return
+
+        # Snapshot to prevent list mutation race during asyncio.wait
+        futures = list(self._pending_futures)
+        done, pending = await asyncio.wait(
+            futures,
+            timeout=self._flush_timeout,
+            return_when=asyncio.ALL_COMPLETED,
+        )
+
+        if pending:
+            logger.warning(
+                "%d pending hook(s) timed out after %.1fs. Cancelling.",
+                len(pending), self._flush_timeout,
+            )
+            for task in pending:
+                task.cancel()
+
+        # Clear ALL tasks — completed tasks are done, pending are cancelled
+        self._pending_futures.clear()
 
     # === Internal Helpers ===
 
@@ -317,13 +526,14 @@ class HookRelay(AgentHooks):
             if loop.is_running():
                 # Schedule the async registry invoke in the event loop
                 if extra is not None:
-                    asyncio.ensure_future(
+                    task = asyncio.create_task(
                         self._registry.invoke(hook_name, context, **extra)
                     )
                 else:
-                    asyncio.ensure_future(
+                    task = asyncio.create_task(
                         self._registry.invoke(hook_name, context)
                     )
+                self._pending_futures.add(task)
             else:
                 logger.warning(
                     "HookRelay cannot invoke '%s' via registry: "
@@ -358,9 +568,10 @@ class HookRelay(AgentHooks):
             loop = asyncio.get_running_loop()
             if loop.is_running():
                 if extra is not None:
-                    asyncio.ensure_future(method(context, **extra))
+                    task = asyncio.create_task(method(context, **extra))
                 else:
-                    asyncio.ensure_future(method(context))
+                    task = asyncio.create_task(method(context))
+                self._pending_futures.add(task)
             else:
                 logger.warning(
                     "FlowHooks.%s is async but event loop is not running. "
@@ -373,3 +584,52 @@ class HookRelay(AgentHooks):
                 "Hook will be skipped in sync context.",
                 hook_name,
             )
+
+    def get_collected_tool_data_for_yield(self, clear: bool = True) -> List[Dict[str, Any]]:
+        """Return tool call/result data as yieldable events.
+
+        Each event dict has ``type`` ('tool_call' or 'tool_result') and ``data``
+        containing the structured payload for insert_tool_messages().
+
+        When clear=True (default), internal lists are emptied after read to
+        prevent duplicate accumulation across iterations (F18 fix).
+
+        Args:
+            clear: If True, clear internal collections after reading.
+                Use clear=False for inspection/debugging purposes.
+
+        Returns:
+            list of event dicts with type and data keys.
+        """
+        events: List[Dict[str, Any]] = []
+
+        # Snapshot tool calls
+        tool_calls_copy = list(self._collected_tool_calls)
+        for tc in tool_calls_copy:
+            events.append({
+                "type": "tool_call",
+                "data": {
+                    "role": "assistant",
+                    "tool_calls": [tc],
+                },
+            })
+
+        # Snapshot tool results
+        tool_results_copy = list(self._collected_tool_results)
+        for tr in tool_results_copy:
+            events.append({
+                "type": "tool_result",
+                "data": tr,
+            })
+
+        # Clear if requested (prevents double-accumulation, F18)
+        if clear:
+            self._collected_tool_calls.clear()
+            self._collected_tool_results.clear()
+
+        return events
+
+    @property
+    def collected_tool_calls(self) -> List[Dict[str, Any]]:
+        """Raw collected tool call dicts (OpenAI format)."""
+        return list(self._collected_tool_calls)
