@@ -330,6 +330,7 @@ class HookRelay(AgentHooks):
                 "success": getattr(result, 'error', None) is None,
                 "execution_time_ms": getattr(result, 'duration_ms', None),
                 "provider_request_id": self._current_provider_request_id,
+                "tool_call_id": getattr(result, 'tool_call_id', ''),
                 "iteration": self._iteration_from_state(state),
             },
             error_message=getattr(result, 'error', None),

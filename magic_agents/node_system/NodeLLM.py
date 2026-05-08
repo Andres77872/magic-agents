@@ -481,10 +481,48 @@ class NodeLLM(Node):
 
             elif tools_schemas:
                 # Schema-only tools: single generate call (LLM can reference tools but no executor)
+                # === HOOK: on_llm_start (schema-only tools non-streaming path, Phase 0 R0.1) ===
+                _llm_ctx = None
+                if hasattr(self, '_hooks') and self._hooks is not None and not self._hooks.is_empty():
+                    from magic_agents.hooks.context_factory import HookContextFactory
+                    _llm_ctx = HookContextFactory.build_llm_context(
+                        execution_id=getattr(self._hooks, 'execution_id', ''),
+                        run_id=getattr(self._hooks, 'run_id', ''),
+                        node_id=self.node_id,
+                        node_type=self.node_type or '',
+                        node_class=self.__class__.__name__,
+                        model=client.llm.model,
+                        streaming=False,
+                        llm_config={
+                            "model": client.llm.model,
+                            "provider": getattr(client.llm, 'engine_name', ''),
+                            "tools_schemas": tools_schemas,
+                        },
+                    )
+                    await self._hooks.invoke("on_llm_start", _llm_ctx)
+
                 self._warn_unsupported_engine(client)
                 intention = await client.llm.async_generate(
                     chat, tools=tools_schemas, **self.extra_data
                 )
+
+                # === HOOK: on_llm_end (schema-only tools non-streaming path, Phase 0 R0.1) ===
+                if _llm_ctx is not None:
+                    usage = getattr(intention, 'usage', None)
+                    finish_reason = None
+                    if hasattr(intention, 'choices') and intention.choices:
+                        finish_reason = intention.choices[0].finish_reason
+                    _llm_ctx.outputs = {
+                        "model": getattr(intention, 'model', ''),
+                        "content": getattr(intention, 'content', ''),
+                        "provider_request_id": getattr(intention, 'id', None),
+                        "prompt_tokens": getattr(usage, 'prompt_tokens', None) if usage else None,
+                        "completion_tokens": getattr(usage, 'completion_tokens', None) if usage else None,
+                        "total_tokens": getattr(usage, 'total_tokens', None) if usage else None,
+                        "finish_reason": finish_reason,
+                    }
+                    await self._hooks.invoke("on_llm_end", _llm_ctx)
+
                 self.generated = intention.content
                 final_tool_calls = getattr(intention, 'tool_calls', []) or []
                 # Phase 0: emit LLM_GENERATION for execution tree persistence
@@ -509,11 +547,20 @@ class NodeLLM(Node):
 
                 intention = await client.llm.async_generate(chat, **self.extra_data)
 
-                # === HOOK: on_llm_end (non-tool path, Phase 9) ===
+                # === HOOK: on_llm_end (non-tool non-streaming path, Phase 0 R0.4) ===
                 if _llm_ctx is not None:
+                    usage = getattr(intention, 'usage', None)
+                    finish_reason = None
+                    if hasattr(intention, 'choices') and intention.choices:
+                        finish_reason = intention.choices[0].finish_reason
                     _llm_ctx.outputs = {
                         "model": getattr(intention, 'model', ''),
                         "content": getattr(intention, 'content', ''),
+                        "provider_request_id": getattr(intention, 'id', None),
+                        "prompt_tokens": getattr(usage, 'prompt_tokens', None) if usage else None,
+                        "completion_tokens": getattr(usage, 'completion_tokens', None) if usage else None,
+                        "total_tokens": getattr(usage, 'total_tokens', None) if usage else None,
+                        "finish_reason": finish_reason,
                     }
                     await self._hooks.invoke("on_llm_end", _llm_ctx)
 
@@ -619,6 +666,26 @@ class NodeLLM(Node):
                     await hook_relay.flush_pending_hooks()
             elif tools_schemas:
                 # Schema-only tools with streaming
+                # === HOOK: on_llm_start (schema-only tools streaming path, Phase 0 R0.2) ===
+                _llm_ctx = None
+                if hasattr(self, '_hooks') and self._hooks is not None and not self._hooks.is_empty():
+                    from magic_agents.hooks.context_factory import HookContextFactory
+                    _llm_ctx = HookContextFactory.build_llm_context(
+                        execution_id=getattr(self._hooks, 'execution_id', ''),
+                        run_id=getattr(self._hooks, 'run_id', ''),
+                        node_id=self.node_id,
+                        node_type=self.node_type or '',
+                        node_class=self.__class__.__name__,
+                        model=client.llm.model,
+                        streaming=True,
+                        llm_config={
+                            "model": client.llm.model,
+                            "provider": getattr(client.llm, 'engine_name', ''),
+                            "tools_schemas": tools_schemas,
+                        },
+                    )
+                    await self._hooks.invoke("on_llm_start", _llm_ctx)
+
                 self._warn_unsupported_engine(client)
                 last_chunk = None
                 async for i in client.llm.async_stream_generate(chat, tools=tools_schemas, **self.extra_data):
@@ -626,6 +693,23 @@ class NodeLLM(Node):
                     last_chunk = i
                     yield self.yield_static(i, content_type=self.OUTPUT_HANDLE_CONTENT)
                 if last_chunk:
+                    # === HOOK: on_llm_end (schema-only tools streaming path, Phase 0 R0.2) ===
+                    if _llm_ctx is not None:
+                        usage = getattr(last_chunk, 'usage', None)
+                        finish_reason = None
+                        if hasattr(last_chunk, 'choices') and last_chunk.choices:
+                            finish_reason = last_chunk.choices[0].finish_reason
+                        _llm_ctx.outputs = {
+                            "model": getattr(last_chunk, 'model', ''),
+                            "content": self.generated,
+                            "provider_request_id": getattr(last_chunk, 'id', None),
+                            "prompt_tokens": getattr(usage, 'prompt_tokens', None) if usage else None,
+                            "completion_tokens": getattr(usage, 'completion_tokens', None) if usage else None,
+                            "total_tokens": getattr(usage, 'total_tokens', None) if usage else None,
+                            "finish_reason": finish_reason,
+                        }
+                        await self._hooks.invoke("on_llm_end", _llm_ctx)
+
                     final_tool_calls = getattr(last_chunk.choices[0].delta, 'tool_calls', []) or []
                     # Phase 0: emit LLM_GENERATION for execution tree persistence
                     yield self._emit_llm_generation(last_chunk)
@@ -656,11 +740,20 @@ class NodeLLM(Node):
                     # Phase 0: emit LLM_GENERATION for execution tree persistence
                     yield self._emit_llm_generation(last_chunk)
 
-                # === HOOK: on_llm_end (non-tool streaming, Phase 9) ===
+                # === HOOK: on_llm_end (non-tool streaming path, Phase 0 R0.4) ===
                 if _llm_ctx is not None:
+                    usage = getattr(last_chunk, 'usage', None) if last_chunk else None
+                    finish_reason = None
+                    if last_chunk and hasattr(last_chunk, 'choices') and last_chunk.choices:
+                        finish_reason = last_chunk.choices[0].finish_reason
                     _llm_ctx.outputs = {
                         "model": getattr(last_chunk, 'model', '') if last_chunk else '',
                         "content": self.generated,
+                        "provider_request_id": getattr(last_chunk, 'id', None) if last_chunk else None,
+                        "prompt_tokens": getattr(usage, 'prompt_tokens', None) if usage else None,
+                        "completion_tokens": getattr(usage, 'completion_tokens', None) if usage else None,
+                        "total_tokens": getattr(usage, 'total_tokens', None) if usage else None,
+                        "finish_reason": finish_reason,
                     }
                     await self._hooks.invoke("on_llm_end", _llm_ctx)
         # if self.json_output:
