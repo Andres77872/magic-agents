@@ -12,6 +12,9 @@ Start with:
 - [docs/wiki/ARCHITECTURE.md](docs/wiki/ARCHITECTURE.md)
 - [docs/wiki/GRAPH_FORMAT.md](docs/wiki/GRAPH_FORMAT.md)
 - [docs/nodes/README.md](docs/nodes/README.md)
+- [docs/hooks/README.md](docs/hooks/README.md)
+- [docs/JSON_CONTRACT.md](docs/JSON_CONTRACT.md)
+- [docs/issues/README.md](docs/issues/README.md)
 
 ## Installation
 
@@ -62,16 +65,18 @@ async def main():
 asyncio.run(main())
 ```
 
+This example uses the OpenAI client configuration, so set `OPENAI_API_KEY` before running it.
+
 ## Built-in nodes
 
-The current runtime supports 15 built-in node types:
+The current runtime supports 17 built-in node types:
 
-`user_input`, `text`, `parser`, `fetch`, `client`, `llm`, `chat`, `send_message`, `loop`, `conditional`, `inner`, `end`, `void`, `python_exec`, `mcp`
+`user_input`, `text`, `constant`, `parser`, `fetch`, `client`, `llm`, `chat`, `send_message`, `loop`, `conditional`, `inner`, `end`, `void`, `hook`, `python_exec`, `mcp`
 
-Use the docs for current per-node behavior and routing details.
+Use the docs for current per-node behavior and routing details: [docs/nodes/README.md](docs/nodes/README.md) for per-node pages and [docs/wiki/NODE_REFERENCE.md](docs/wiki/NODE_REFERENCE.md) for the wiki-level node index.
 
 ## Examples
 
-- [examples/json/](examples/json/)
+- [examples/json/INDEX.md](examples/json/INDEX.md)
 - [examples/conditional/INDEX.md](examples/conditional/INDEX.md)
 - [examples/loop/INDEX.md](examples/loop/INDEX.md)
