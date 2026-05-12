@@ -104,6 +104,7 @@ class GraphPersistenceHook:
         self._node_execution_ids: dict[str, str] = {}
         self._llm_execution_id = ""
         self._tool_execution_ids: list[str] = []
+        self._tool_execution_id_by_tool_call: dict[str, str] = {}
 
     @property
     def run_id(self) -> str:
@@ -132,6 +133,18 @@ class GraphPersistenceHook:
         self._node_execution_ids.clear()
         self._llm_execution_id = ""
         self._tool_execution_ids.clear()
+        self._tool_execution_id_by_tool_call.clear()
+
+    def consume_tool_execution_id_mapping(self) -> dict[str, str]:
+        """Return tool_call_id→execution_id mapping and clear internal storage.
+
+        One-shot consumption: returns a copy, then clears internal dict.
+        Safe for multiple calls (second call returns empty dict).
+        Never raises.
+        """
+        result = dict(self._tool_execution_id_by_tool_call)
+        self._tool_execution_id_by_tool_call.clear()
+        return result
 
     @staticmethod
     def _error_payload(error: Exception) -> dict[str, str]:
@@ -307,19 +320,30 @@ class GraphPersistenceHook:
         if not self._run_id:
             return
         tool_name = context.inputs.get("tool_name") or "unknown"
+        tool_call_id = context.inputs.get("tool_call_id")
         execution_id = await self._sink.begin_execution(
             id_run=self._run_id,
             parent_execution_id=self._llm_execution_id or self._root_execution_id or None,
             execution_kind="tool_call",
             execution_name=tool_name,
-            execution_meta={"tool_name": tool_name, "tool_call_id": context.inputs.get("tool_call_id")},
+            execution_meta={
+                "tool_name": tool_name,
+                "tool_call_id": tool_call_id,
+                "arguments": context.inputs.get("arguments"),
+            },
             nested_depth=self._nested_depth + 1,
         )
         self._tool_execution_ids.append(execution_id)
+        if tool_call_id:
+            self._tool_execution_id_by_tool_call[tool_call_id] = execution_id
         await self._sink.record_event(
             id_execution=execution_id,
             event_type="tool_start",
-            event_payload={"tool_name": tool_name, "tool_call_id": context.inputs.get("tool_call_id")},
+            event_payload={
+                "tool_name": tool_name,
+                "tool_call_id": tool_call_id,
+                "arguments": context.inputs.get("arguments"),
+            },
         )
 
     async def on_tool_end(self, context: HookContext) -> None:
