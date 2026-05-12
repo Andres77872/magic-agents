@@ -85,6 +85,7 @@ class GraphPersistenceHook:
         id_user: str,
         id_agent: str | None = None,
         assistant_message: AssistantMessageContext | None = None,
+        call_source: str = "hook",
         nested_depth: int = 0,
         nested_request_id: str | None = None,
         parent_run_id: str | None = None,
@@ -95,6 +96,7 @@ class GraphPersistenceHook:
         self._id_user = id_user
         self._id_agent = id_agent
         self._assistant_message = assistant_message
+        self._call_source = call_source
         self._nested_depth = nested_depth
         self._nested_request_id = nested_request_id
         self._parent_run_id = parent_run_id
@@ -284,6 +286,11 @@ class GraphPersistenceHook:
             "prompt_tokens": data.get("prompt_tokens", 0) or 0,
             "completion_tokens": data.get("completion_tokens", 0) or 0,
             "total_tokens": data.get("total_tokens", 0) or 0,
+            "cached_tokens_read": data.get("cached_tokens_read", 0) or 0,
+            "cached_tokens_write": data.get("cached_tokens_write", 0) or 0,
+            "reasoning_tokens": data.get("reasoning_tokens", 0) or 0,
+            "audio_tokens": data.get("audio_tokens", 0) or 0,
+            "raw_usage_json": data.get("raw_usage_json"),
             "call_sequence": context.sequence_number,
         }
         await self._sink.record_usage_fact(
@@ -296,7 +303,7 @@ class GraphPersistenceHook:
                 "input_price_mtok": context.inputs.get("input_price_mtok", 0),
                 "output_price_mtok": context.inputs.get("output_price_mtok", 0),
             },
-            call_source="hook",
+            call_source=self._call_source,
             id_message=self._assistant_message.id_message if self._assistant_message else None,
             provider_request_id=data.get("provider_request_id"),
         )

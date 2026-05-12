@@ -253,6 +253,45 @@ class HookRelay(AgentHooks):
         completion_tokens = usage.get('completion_tokens') if isinstance(usage, dict) else getattr(usage, 'completion_tokens', None)
         total_tokens = usage.get('total_tokens') if isinstance(usage, dict) else getattr(usage, 'total_tokens', None)
 
+        # Extract detail fields — handle both object-style (UsageModel) and dict-style usage.
+        # Per spec HOOK_RELAY_FORWARD_ALL_USAGE_FIELDS: forward ALL UsageModel detail fields
+        # including cached_tokens_read, cached_tokens_write, reasoning_tokens, audio_tokens,
+        # and raw_usage_json. For object-style, also check nested prompt_tokens_details and
+        # completion_tokens_details (where magic-llm UsageModel stores these fields).
+        if isinstance(usage, dict):
+            cached_tokens_read = usage.get('cached_tokens_read')
+            cached_tokens_write = usage.get('cached_tokens_write')
+            reasoning_tokens = usage.get('reasoning_tokens')
+            audio_tokens = usage.get('audio_tokens')
+            raw_usage_json = usage.get('raw_usage_json')
+        else:
+            # Try direct attributes first (provider-specific usage objects may have these)
+            cached_tokens_read = getattr(usage, 'cached_tokens_read', None)
+            if cached_tokens_read is None:
+                prompt_details = getattr(usage, 'prompt_tokens_details', None)
+                if prompt_details is not None:
+                    cached_tokens_read = getattr(prompt_details, 'cached_tokens', None)
+
+            cached_tokens_write = getattr(usage, 'cached_tokens_write', None)
+
+            reasoning_tokens = getattr(usage, 'reasoning_tokens', None)
+            if reasoning_tokens is None:
+                completion_details = getattr(usage, 'completion_tokens_details', None)
+                if completion_details is not None:
+                    reasoning_tokens = getattr(completion_details, 'reasoning_tokens', None)
+
+            audio_tokens = getattr(usage, 'audio_tokens', None)
+            if audio_tokens is None:
+                prompt_details = getattr(usage, 'prompt_tokens_details', None)
+                completion_details = getattr(usage, 'completion_tokens_details', None)
+                audio_prompt = getattr(prompt_details, 'audio_tokens', 0) if prompt_details is not None else 0
+                audio_comp = getattr(completion_details, 'audio_tokens', 0) if completion_details is not None else 0
+                audio_tokens = (audio_prompt or 0) + (audio_comp or 0)
+
+            raw_usage_json = getattr(usage, 'raw_usage_json', None)
+            if raw_usage_json is None and hasattr(usage, 'model_dump'):
+                raw_usage_json = usage.model_dump()
+
         context = self._build_context(
             outputs={
                 "model": getattr(response, 'model', 'unknown'),
@@ -262,6 +301,11 @@ class HookRelay(AgentHooks):
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": total_tokens,
+                "cached_tokens_read": cached_tokens_read,
+                "cached_tokens_write": cached_tokens_write,
+                "reasoning_tokens": reasoning_tokens,
+                "audio_tokens": audio_tokens,
+                "raw_usage_json": raw_usage_json,
                 "iteration": self._iteration_from_state(state),
             }
         )
