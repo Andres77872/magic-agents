@@ -30,6 +30,7 @@ from magic_agents.models.model_agent_run_log import ModelAgentRunLog
 from magic_agents.models.factory.Nodes.ConditionalNodeModel import ConditionalSignalTypes
 from magic_agents.util.const import SYSTEM_EVENT_STREAMING, SYSTEM_EVENT_DEBUG, SYSTEM_EVENT_DEBUG_SUMMARY, SYSTEM_EVENT_TYPES
 from magic_agents.hooks.hook_registry import HookRegistry
+from magic_agents.hooks.runtime_config import RuntimeConfig
 from magic_agents.debug.registry import ObserverRegistry
 from magic_agents.debug.observer import DebugObserver
 
@@ -253,6 +254,57 @@ def reset_iteration_nodes(nodes: Dict[str, Any], iteration_nodes: Set[str]) -> N
                 node.generated = ''
 
 
+def _wire_hooks_to_registry(
+    registry: HookRegistry,
+    runtime_config: Optional[RuntimeConfig],
+    graph: AgentFlowModel,
+    id_chat: str,
+    id_thread: str,
+    id_user: str,
+) -> None:
+    """Wire persistence and debug hooks into existing HookRegistry.
+
+    P1-3 + P1-4: Registers GraphPersistenceHook and DebugSSEHook as global-tier
+    hooks on the existing HookRegistry. No new hook manager is created.
+
+    Graph override takes precedence over RuntimeConfig for persistence:
+      - graph.persistence_enabled=False → skip persistence entirely
+      - graph.persistence_enabled=True → use graph-level value
+      - graph.persistence_enabled=None (default) → fall back to RuntimeConfig
+
+    Args:
+        registry: Existing HookRegistry instance (must have execution_id/run_id set).
+        runtime_config: Optional RuntimeConfig with persistence/SSE configuration.
+        graph: AgentFlowModel with optional persistence_enabled override.
+        id_chat: Chat/session identity.
+        id_thread: Thread identity.
+        id_user: User identity.
+    """
+    if runtime_config is None:
+        return
+
+    # === GraphPersistenceHook (P1-3) ===
+    # Graph override wins if set; otherwise fall back to RuntimeConfig
+    graph_persistence = getattr(graph, 'persistence_enabled', None)
+    if graph_persistence is False:
+        # Graph explicitly disabled persistence — skip entirely
+        pass
+    elif graph_persistence is True or runtime_config.is_persistence_enabled():
+        hook = runtime_config.build_persistence_hook(
+            id_chat=id_chat,
+            id_thread=id_thread,
+            id_user=id_user,
+        )
+        if hook is not None:
+            registry.register_global(hook)
+
+    # === DebugSSEHook (P1-4) ===
+    if runtime_config.is_debug_sse_enabled():
+        hook = runtime_config.build_debug_sse_hook(id_chat=id_chat)
+        if hook is not None:
+            registry.register_global(hook)
+
+
 async def execute_graph_reactive(
     graph: AgentFlowModel,
     id_chat: Optional[Union[int, str]] = None,
@@ -263,6 +315,7 @@ async def execute_graph_reactive(
     run_id: Optional[str] = None,         # Phase 0: execution tree identity
     parent_run_id: Optional[str] = None,   # Phase 0: parent run identity
     hooks: Optional[HookRegistry] = None,  # Phase 4: hook registry for graph/node hooks
+    runtime_config: Optional[RuntimeConfig] = None,  # Phase 4: runtime config for persistence/SSE auto-wiring
     debug_callback = None,  # Phase 1: optional async callback for debug events
 ) -> AsyncGenerator[ChatCompletionModel, None]:
     """
@@ -281,6 +334,7 @@ async def execute_graph_reactive(
         run_id: Optional Phase 0 run identity for execution tree persistence
         parent_run_id: Optional Phase 0 parent run identity
         hooks: Optional HookRegistry for graph/node lifecycle hooks (Phase 4)
+        runtime_config: Optional RuntimeConfig for persistence/SSE auto-wiring (Phase 4)
         
     Yields:
         Streaming content and final outputs from nodes
@@ -307,7 +361,20 @@ async def execute_graph_reactive(
         if blocking_errors:
             logger.error("Aborting execution: %d blocking validation error(s)", len(blocking_errors))
             return
-    
+
+    # Phase 4: Wire persistence and debug hooks into existing HookRegistry.
+    # Must happen BEFORE the loop detection (which may early-return to loop executor)
+    # so that loop graphs also receive auto-wired hooks on the shared registry.
+    if hooks is not None and runtime_config is not None:
+        _wire_hooks_to_registry(
+            registry=hooks,
+            runtime_config=runtime_config,
+            graph=graph,
+            id_chat=str(id_chat) if id_chat is not None else '',
+            id_thread=str(id_thread) if id_thread is not None else '',
+            id_user=str(id_user) if id_user is not None else '',
+        )
+
     # Detect loop nodes - delegate to loop handler
     from magic_agents.node_system import NodeLoop
     loop_nodes = [nid for nid, node in graph.nodes.items() if isinstance(node, NodeLoop)]
@@ -366,7 +433,7 @@ async def execute_graph_reactive(
     
     # Generate execution ID for traceability (used by hooks and debug feedback)
     _execution_id = uuid.uuid4().hex
-    
+
     # Phase 4: Set execution identity on registry so Node.__call__ and
     # HookRelay can access real execution_id/run_id for HookContext construction.
     if hooks is not None:

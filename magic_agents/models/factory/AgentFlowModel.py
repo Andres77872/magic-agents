@@ -158,6 +158,14 @@ class AgentFlowModel(BaseModel):
         description="Graph-level FlowHooks for this flow instance"
     )
     
+    # P1-3: Graph-level persistence override.
+    # When None (default): defer to RuntimeConfig.persistence_enabled.
+    # When True/False: override RuntimeConfig value (graph wins).
+    persistence_enabled: Optional[bool] = Field(
+        default=None,
+        description="Graph-level persistence override. None=defer to RuntimeConfig, True/False=override."
+    )
+    
     # Private attribute for storing validation errors
     _validation_errors: Optional[List[Dict[str, Any]]] = PrivateAttr(default=None)
     

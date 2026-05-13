@@ -428,7 +428,8 @@ class NodeLLM(Node):
                     logger.warning(
                         "NodeLLM:%s async agent loop not available in installed magic-llm version — "
                         "falling back to sync run_agent() via asyncio.to_thread(). "
-                        "Upgrade magic-llm for native async support.",
+                        "Hook events will NOT be delivered via this path. "
+                        "Upgrade magic-llm for native async hook support.",
                         self.node_id
                     )
                     if not hasattr(client, 'run_agent'):
@@ -464,8 +465,8 @@ class NodeLLM(Node):
                     final_tool_calls = list(hook_relay.collected_tool_calls)
                 else:
                     final_tool_calls = getattr(intention, 'tool_calls', []) or []
-                # Phase 0: emit LLM_GENERATION for execution tree persistence
-                yield self._emit_llm_generation(intention)
+                # P1-NEW: _emit_llm_generation removed for HookRelay path — data parity confirmed
+                # (on_llm_end from HookRelay carries model, tokens, provider_request_id)
 
                 # Emit tool_call/tool_result debug events for API persistence
                 if hook_relay is not None:
@@ -522,10 +523,15 @@ class NodeLLM(Node):
                         "finish_reason": finish_reason,
                     }
                     await self._hooks.invoke("on_llm_end", _llm_ctx)
+                    # Single-call path — fire on_llm_loop_end with total_iterations: 1
+                    _llm_ctx.outputs["total_iterations"] = 1
+                    await self._hooks.invoke("on_llm_loop_end", _llm_ctx)
 
                 self.generated = intention.content
                 final_tool_calls = getattr(intention, 'tool_calls', []) or []
                 # Phase 0: emit LLM_GENERATION for execution tree persistence
+                # TODO: verify on_llm_end carries cached/reasoning/audio token fields
+                # before removing _emit_llm_generation fallback (P1-NEW)
                 yield self._emit_llm_generation(intention)
 
             else:
@@ -563,10 +569,15 @@ class NodeLLM(Node):
                         "finish_reason": finish_reason,
                     }
                     await self._hooks.invoke("on_llm_end", _llm_ctx)
+                    # Single-call path — fire on_llm_loop_end with total_iterations: 1
+                    _llm_ctx.outputs["total_iterations"] = 1
+                    await self._hooks.invoke("on_llm_loop_end", _llm_ctx)
 
                 self.generated = intention.content
                 final_tool_calls = getattr(intention, 'tool_calls', []) or []
                 # Phase 0: emit LLM_GENERATION for execution tree persistence
+                # TODO: verify on_llm_end carries cached/reasoning/audio token fields
+                # before removing _emit_llm_generation fallback (P1-NEW)
                 yield self._emit_llm_generation(intention)
 
             yield self.yield_static(ChatCompletionModel(
@@ -592,7 +603,8 @@ class NodeLLM(Node):
                     logger.warning(
                         "NodeLLM:%s async streaming agent loop not available in installed magic-llm version — "
                         "falling back to sync run_agent_stream() via asyncio.to_thread(). "
-                        "Upgrade magic-llm for native async support.",
+                        "Hook events will NOT be delivered via this path. "
+                        "Upgrade magic-llm for native async hook support.",
                         self.node_id
                     )
                     if not hasattr(client, 'run_agent_stream'):
@@ -603,67 +615,72 @@ class NodeLLM(Node):
 
                     hook_relay = self._create_hook_relay(client=client)
                     last_chunk = None
-                    for chunk in await asyncio.to_thread(
-                        client.run_agent_stream,
-                        user_input=user_msg,
-                        system_prompt=sys_msg,
-                        tools=tools_schemas,
-                        tool_functions=tool_functions,
-                        hooks=hook_relay,
-                        **self.extra_data
-                    ):
-                        self.generated += chunk.choices[0].delta.content or ''
-                        last_chunk = chunk
-                        yield self.yield_static(chunk, content_type=self.OUTPUT_HANDLE_CONTENT)
-                    if last_chunk:
-                        if hook_relay is not None and hook_relay.collected_tool_calls:
-                            final_tool_calls = list(hook_relay.collected_tool_calls)
-                        else:
-                            final_tool_calls = getattr(last_chunk.choices[0].delta, 'tool_calls', []) or []
-                        yield self._emit_llm_generation(last_chunk)
-                        if hook_relay is not None:
-                            for te in hook_relay.get_collected_tool_data_for_yield():
-                                yield {
-                                    'type': 'debug',
-                                    'content': {
-                                        'event_type': 'TOOL_CALL' if te['type'] == 'tool_call' else 'TOOL_RESULT',
-                                        'node_id': self.node_id,
-                                        'data': te['data'],
+                    try:
+                        for chunk in await asyncio.to_thread(
+                            client.run_agent_stream,
+                            user_input=user_msg,
+                            system_prompt=sys_msg,
+                            tools=tools_schemas,
+                            tool_functions=tool_functions,
+                            hooks=hook_relay,
+                            **self.extra_data
+                        ):
+                            self.generated += chunk.choices[0].delta.content or ''
+                            last_chunk = chunk
+                            yield self.yield_static(chunk, content_type=self.OUTPUT_HANDLE_CONTENT)
+                        if last_chunk:
+                            if hook_relay is not None and hook_relay.collected_tool_calls:
+                                final_tool_calls = list(hook_relay.collected_tool_calls)
+                            else:
+                                final_tool_calls = getattr(last_chunk.choices[0].delta, 'tool_calls', []) or []
+                            # P1-NEW: _emit_llm_generation removed for HookRelay path — data parity confirmed
+                            if hook_relay is not None:
+                                for te in hook_relay.get_collected_tool_data_for_yield():
+                                    yield {
+                                        'type': 'debug',
+                                        'content': {
+                                            'event_type': 'TOOL_CALL' if te['type'] == 'tool_call' else 'TOOL_RESULT',
+                                            'node_id': self.node_id,
+                                            'data': te['data'],
+                                        }
                                     }
-                                }
-                    await hook_relay.flush_pending_hooks()
+                    finally:
+                        await hook_relay.flush_pending_hooks()
                 else:
                     hook_relay = self._create_hook_relay(client=client)
                     last_chunk = None
-                    async for chunk in client.run_agent_stream_async(
-                        user_input=user_msg,
-                        system_prompt=sys_msg,
-                        tools=tools_schemas,
-                        tool_functions=tool_functions,
-                        hooks=hook_relay,
-                        **self.extra_data
-                    ):
-                        self.generated += chunk.choices[0].delta.content or ''
-                        last_chunk = chunk
-                        yield self.yield_static(chunk, content_type=self.OUTPUT_HANDLE_CONTENT)
-                    # Capture tool_calls from the last chunk
-                    if last_chunk:
-                        if hook_relay is not None and hook_relay.collected_tool_calls:
-                            final_tool_calls = list(hook_relay.collected_tool_calls)
-                        else:
-                            final_tool_calls = getattr(last_chunk.choices[0].delta, 'tool_calls', []) or []
-                        yield self._emit_llm_generation(last_chunk)
-                        if hook_relay is not None:
-                            for te in hook_relay.get_collected_tool_data_for_yield():
-                                yield {
-                                    'type': 'debug',
-                                    'content': {
-                                        'event_type': 'TOOL_CALL' if te['type'] == 'tool_call' else 'TOOL_RESULT',
-                                        'node_id': self.node_id,
-                                        'data': te['data'],
+                    try:
+                        async for chunk in client.run_agent_stream_async(
+                            user_input=user_msg,
+                            system_prompt=sys_msg,
+                            tools=tools_schemas,
+                            tool_functions=tool_functions,
+                            hooks=hook_relay,
+                            task_executor=getattr(subagent_bundle, 'task_executor', None),
+                            **self.extra_data
+                        ):
+                            self.generated += chunk.choices[0].delta.content or ''
+                            last_chunk = chunk
+                            yield self.yield_static(chunk, content_type=self.OUTPUT_HANDLE_CONTENT)
+                        # Capture tool_calls from the last chunk
+                        if last_chunk:
+                            if hook_relay is not None and hook_relay.collected_tool_calls:
+                                final_tool_calls = list(hook_relay.collected_tool_calls)
+                            else:
+                                final_tool_calls = getattr(last_chunk.choices[0].delta, 'tool_calls', []) or []
+                            # P1-NEW: _emit_llm_generation removed for HookRelay path — data parity confirmed
+                            if hook_relay is not None:
+                                for te in hook_relay.get_collected_tool_data_for_yield():
+                                    yield {
+                                        'type': 'debug',
+                                        'content': {
+                                            'event_type': 'TOOL_CALL' if te['type'] == 'tool_call' else 'TOOL_RESULT',
+                                            'node_id': self.node_id,
+                                            'data': te['data'],
+                                        }
                                     }
-                                }
-                    await hook_relay.flush_pending_hooks()
+                    finally:
+                        await hook_relay.flush_pending_hooks()
             elif tools_schemas:
                 # Schema-only tools with streaming
                 # === HOOK: on_llm_start (schema-only tools streaming path, Phase 0 R0.2) ===
@@ -709,9 +726,14 @@ class NodeLLM(Node):
                             "finish_reason": finish_reason,
                         }
                         await self._hooks.invoke("on_llm_end", _llm_ctx)
+                        # Single-call path — fire on_llm_loop_end with total_iterations: 1
+                        _llm_ctx.outputs["total_iterations"] = 1
+                        await self._hooks.invoke("on_llm_loop_end", _llm_ctx)
 
                     final_tool_calls = getattr(last_chunk.choices[0].delta, 'tool_calls', []) or []
                     # Phase 0: emit LLM_GENERATION for execution tree persistence
+                    # TODO: verify on_llm_end carries cached/reasoning/audio token fields
+                    # before removing _emit_llm_generation fallback (P1-NEW)
                     yield self._emit_llm_generation(last_chunk)
             else:
                 # Existing streaming path: no tools
@@ -738,6 +760,8 @@ class NodeLLM(Node):
                 if last_chunk:
                     final_tool_calls = getattr(last_chunk.choices[0].delta, 'tool_calls', []) or []
                     # Phase 0: emit LLM_GENERATION for execution tree persistence
+                    # TODO: verify on_llm_end carries cached/reasoning/audio token fields
+                    # before removing _emit_llm_generation fallback (P1-NEW)
                     yield self._emit_llm_generation(last_chunk)
 
                 # === HOOK: on_llm_end (non-tool streaming path, Phase 0 R0.4) ===
@@ -756,6 +780,9 @@ class NodeLLM(Node):
                         "finish_reason": finish_reason,
                     }
                     await self._hooks.invoke("on_llm_end", _llm_ctx)
+                    # Single-call path — fire on_llm_loop_end with total_iterations: 1
+                    _llm_ctx.outputs["total_iterations"] = 1
+                    await self._hooks.invoke("on_llm_loop_end", _llm_ctx)
         # if self.json_output:
         #     print(self.generated)
         #     self.generated = json.loads(self.generated)

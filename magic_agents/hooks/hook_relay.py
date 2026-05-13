@@ -190,6 +190,73 @@ class HookRelay(AgentHooks):
 
         return ctx
 
+    def _build_tool_context(
+        self,
+        tool_name: str = "",
+        tool_call_id: str = "",
+        arguments: dict[str, Any] | None = None,
+        result: Any = None,
+        success: bool = True,
+        error_message: str | None = None,
+        execution_time_ms: float | None = None,
+        provider_request_id: str | None = None,
+        iteration: int = 0,
+    ) -> HookContext:
+        """Build a HookContext for tool events with proper node_type='TOOL'.
+
+        Uses HookContextFactory.build_tool_context() for validated construction
+        with tool-specific fields. Injects nested correlation metadata (same
+        pattern as _build_context).
+
+        Args:
+            tool_name: Name of the tool being executed.
+            tool_call_id: Provider-specific tool call identifier.
+            arguments: The parsed tool arguments dict.
+            result: The tool execution result object (for on_tool_complete).
+            success: Whether the tool execution succeeded.
+            error_message: Error message on failure.
+            execution_time_ms: Tool execution duration in milliseconds.
+            provider_request_id: Provider request ID for correlation.
+            iteration: The loop iteration number.
+
+        Returns:
+            HookContext with node_type='TOOL', tool-specific fields, and
+            nested correlation metadata.
+        """
+        from magic_agents.hooks.context_factory import HookContextFactory
+        ctx = HookContextFactory.build_tool_context(
+            execution_id=self._graph_id,
+            run_id=self._run_id,
+            node_id=self._node_id,
+            node_type="TOOL",
+            node_class="NodeLLM",
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            arguments=arguments,
+            result=result,
+            success=success,
+            error_message=error_message,
+            execution_time_ms=execution_time_ms,
+            provider_request_id=provider_request_id,
+            iteration=iteration,
+        )
+        ctx.sequence_number = self._next_sequence()
+        ctx.emit = self._emit
+
+        # Inject nested correlation metadata for ALL tool events.
+        try:
+            from magic_llm.agent import DEPTH as _runtime_depth
+            ctx.metadata["nested_depth"] = _runtime_depth.get()
+        except (ImportError, AttributeError):
+            ctx.metadata["nested_depth"] = self._nested_depth
+
+        ctx.metadata["nested_request_id"] = self._nested_request_id
+        if self._parent_run_id is not None:
+            ctx.metadata["parent_run_id"] = self._parent_run_id
+            ctx.parent_run_id = self._parent_run_id
+
+        return ctx
+
     # === AgentHooks Protocol Implementation ===
 
     def on_iteration_start(self, iteration: int, state: AgentState) -> None:
@@ -322,6 +389,9 @@ class HookRelay(AgentHooks):
 
         Translates to: FlowHooks.on_tool_start(context)
 
+        Uses _build_tool_context() so tool events carry node_type='TOOL'
+        instead of the previous hardcoded 'LLM'.
+
         Injects provider_request_id from the most recent LLM response
         (cached in _current_provider_request_id) and iteration metadata
         into both the HookContext and the collected tool call entry.
@@ -332,14 +402,14 @@ class HookRelay(AgentHooks):
             arguments: The parsed tool arguments.
             state: The current agent state (read-only).
         """
-        context = self._build_context(
-            inputs={
-                "tool_name": tool_name,
-                "tool_call_id": tool_call_id,
-                "arguments": arguments,
-                "provider_request_id": self._current_provider_request_id,
-                "iteration": self._iteration_from_state(state),
-            }
+        provider_request_id = self._current_provider_request_id
+        iteration = self._iteration_from_state(state)
+        context = self._build_tool_context(
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            arguments=arguments,
+            provider_request_id=provider_request_id,
+            iteration=iteration,
         )
         self._safe_invoke_sync("on_tool_start", context)
 
@@ -350,14 +420,17 @@ class HookRelay(AgentHooks):
                 "name": tool_name,
                 "arguments": json.dumps(arguments) if isinstance(arguments, dict) else str(arguments),
             },
-            "provider_request_id": self._current_provider_request_id,
-            "iteration": self._iteration_from_state(state),
+            "provider_request_id": provider_request_id,
+            "iteration": iteration,
         })
 
     def on_tool_complete(self, result: ToolResult, state: AgentState) -> None:
         """Called after each tool execution (success or error).
 
         Translates to: FlowHooks.on_tool_end(context)
+
+        Uses _build_tool_context() so tool events carry node_type='TOOL'
+        instead of the previous hardcoded 'LLM'.
 
         Injects provider_request_id from the most recent LLM response
         (cached in _current_provider_request_id) and iteration metadata
@@ -367,18 +440,27 @@ class HookRelay(AgentHooks):
             result: The structured tool execution result.
             state: The current agent state (read-only).
         """
-        context = self._build_context(
-            outputs={
-                "tool_name": getattr(result, 'name', 'unknown'),
-                        "result": getattr(result, 'content', ''),
-                "success": getattr(result, 'error', None) is None,
-                "execution_time_ms": getattr(result, 'duration_ms', None),
-                "provider_request_id": self._current_provider_request_id,
-                "tool_call_id": getattr(result, 'tool_call_id', ''),
-                "iteration": self._iteration_from_state(state),
-            },
-            error_message=getattr(result, 'error', None),
+        tool_name = getattr(result, 'name', 'unknown')
+        success = getattr(result, 'error', None) is None
+        execution_time_ms = getattr(result, 'duration_ms', None)
+        error_message = getattr(result, 'error', None)
+        provider_request_id = self._current_provider_request_id
+        iteration = self._iteration_from_state(state)
+        tool_call_id = getattr(result, 'tool_call_id', '')
+        context = self._build_tool_context(
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            success=success,
+            error_message=error_message,
+            execution_time_ms=execution_time_ms,
+            provider_request_id=provider_request_id,
+            iteration=iteration,
         )
+        # Merge additional outputs not covered by build_tool_context
+        context.outputs["result"] = getattr(result, 'content', '')
+        context.outputs["provider_request_id"] = provider_request_id
+        context.outputs["tool_call_id"] = tool_call_id
+        context.outputs["iteration"] = iteration
         self._safe_invoke_sync("on_tool_end", context)
 
         status = "error" if result.is_error else "completed"
@@ -588,7 +670,8 @@ class HookRelay(AgentHooks):
         except RuntimeError:
             logger.warning(
                 "HookRelay cannot invoke '%s' via registry: "
-                "no event loop available (sync-only context).",
+                "no event loop available (sync-only context). "
+                "Hook event will NOT be delivered.",
                 hook_name,
             )
 
@@ -625,8 +708,9 @@ class HookRelay(AgentHooks):
                 )
         except RuntimeError:
             logger.warning(
-                "FlowHooks.%s is async but no event loop is available. "
-                "Hook will be skipped in sync context.",
+                "HookRelay cannot invoke '%s' via async method: "
+                "no event loop available (sync-only context). "
+                "Hook event will NOT be delivered.",
                 hook_name,
             )
 

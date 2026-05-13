@@ -109,3 +109,73 @@ class DebugSSEHook:
 
     async def on_node_bypass(self, context: HookContext, reason: str) -> None:
         self._emit("node_bypass", {"node_id": context.node_id, "reason": reason})
+
+    # ── LLM Lifecycle ──────────────────────────────────────────────────
+
+    async def on_llm_start(
+        self,
+        context: HookContext,
+        llm_config: dict[str, Any] | None = None,
+    ) -> None:
+        self._emit(
+            "llm_start",
+            {
+                "node_id": context.node_id,
+                "model": (context.inputs or {}).get("model", ""),
+                "provider": (context.inputs or {}).get("provider", ""),
+                "llm_config": llm_config,
+            },
+        )
+
+    async def on_llm_end(
+        self,
+        context: HookContext,
+        response: dict[str, Any] | None = None,
+    ) -> None:
+        outputs = context.outputs or {}
+        tokens = {k: v for k, v in outputs.items()
+                  if k.endswith("_tokens") or k.startswith("cached_tokens_") or k == "raw_usage_json"}
+        self._emit(
+            "llm_end",
+            {
+                "node_id": context.node_id,
+                "finish_reason": outputs.get("finish_reason"),
+                "tokens": tokens,
+            },
+        )
+
+    async def on_llm_loop_end(self, context: HookContext) -> None:
+        outputs = context.outputs or {}
+        content_preview = (outputs.get("content_preview", "") or "")[:100]
+        self._emit(
+            "llm_loop_end",
+            {
+                "node_id": context.node_id,
+                "total_iterations": outputs.get("total_iterations"),
+                "content_preview": content_preview,
+            },
+        )
+
+    # ── Tool Lifecycle ─────────────────────────────────────────────────
+
+    async def on_tool_start(self, context: HookContext) -> None:
+        inputs = context.inputs or {}
+        self._emit(
+            "tool_start",
+            {
+                "node_id": context.node_id,
+                "tool_name": inputs.get("tool_name"),
+                "tool_call_id": inputs.get("tool_call_id"),
+            },
+        )
+
+    async def on_tool_end(self, context: HookContext) -> None:
+        outputs = context.outputs or {}
+        self._emit(
+            "tool_end",
+            {
+                "node_id": context.node_id,
+                "tool_name": outputs.get("tool_name") or (context.inputs or {}).get("tool_name"),
+                "success": outputs.get("success"),
+            },
+        )

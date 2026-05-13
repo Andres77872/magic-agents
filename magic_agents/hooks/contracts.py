@@ -63,7 +63,9 @@ class GraphErrorInputs(TypedDict, total=False):
 # ─── Node Lifecycle ─────────────────────────────────────────────────────────
 
 class NodeStartInputs(TypedDict, total=False):
-    """Required: node_id, node_type, node_class, input_keys."""
+    """Required: node_id, node_type, node_class.
+    inputs: Dict[str, Any] — full node input data (not just key names).
+    """
     node_id: str
     node_type: str
     node_class: str
@@ -111,6 +113,8 @@ class LLMEndInputs(TypedDict, total=False):
 
     Added: provider_request_id, prompt_tokens, completion_tokens,
     total_tokens, iteration (0-indexed).
+    Added: cached_tokens_read, cached_tokens_write, reasoning_tokens,
+    audio_tokens, raw_usage_json — detail token fields from UsageModel.
     Fires per-provider-request (N times for N-iteration loop).
     loop_complete discriminator REMOVED — use on_llm_loop_end instead.
     """
@@ -118,11 +122,17 @@ class LLMEndInputs(TypedDict, total=False):
     content: str
     content_preview: str
     finish_reason: Optional[str]
-    provider_request_id: Optional[str]  # NEW — from response.id
-    prompt_tokens: Optional[int]        # NEW — from response.usage
-    completion_tokens: Optional[int]    # NEW — from response.usage
-    total_tokens: Optional[int]         # NEW — from response.usage
-    iteration: int                      # NEW — 0-indexed iteration
+    provider_request_id: Optional[str]  # from response.id
+    prompt_tokens: Optional[int]        # from response.usage
+    completion_tokens: Optional[int]    # from response.usage
+    total_tokens: Optional[int]         # from response.usage
+    iteration: int                      # 0-indexed iteration
+    # Detail token fields from UsageModel (added in P1-6)
+    cached_tokens_read: Optional[int]
+    cached_tokens_write: Optional[int]
+    reasoning_tokens: Optional[int]
+    audio_tokens: Optional[int]
+    raw_usage_json: Optional[Dict[str, Any]]
 
 
 class LLMLoopEndInputs(TypedDict, total=False):
@@ -133,6 +143,9 @@ class LLMLoopEndInputs(TypedDict, total=False):
 
     iteration: 0-indexed final iteration number.
     total_iterations: 1-indexed count (total iterations executed).
+
+    Added: cached_tokens_read, cached_tokens_write, reasoning_tokens,
+    audio_tokens, raw_usage_json — detail token fields from UsageModel.
     """
     model: str
     content: str
@@ -144,6 +157,12 @@ class LLMLoopEndInputs(TypedDict, total=False):
     prompt_tokens: Optional[int]
     completion_tokens: Optional[int]
     total_tokens: Optional[int]
+    # Detail token fields from UsageModel (added in P1-6)
+    cached_tokens_read: Optional[int]
+    cached_tokens_write: Optional[int]
+    reasoning_tokens: Optional[int]
+    audio_tokens: Optional[int]
+    raw_usage_json: Optional[Dict[str, Any]]
 
 
 # ─── Tool Lifecycle ─────────────────────────────────────────────────────────
@@ -159,10 +178,15 @@ class ToolEndInputs(TypedDict, total=False):
     """Required: tool_name, success.
 
     Optional: execution_time_ms (float) — populated from result.duration_ms (S3).
+    Added: provider_request_id, iteration, tool_call_id — correlation fields.
     """
     tool_name: str
     success: bool
     execution_time_ms: Optional[float]
+    # Correlation fields (added in P1-6)
+    provider_request_id: Optional[str]
+    iteration: int
+    tool_call_id: Optional[str]
 
 
 # ─── Edge Hook ──────────────────────────────────────────────────────────────
