@@ -68,7 +68,7 @@ Supports auto-wiring of `GraphPersistenceHook` (via `persistence_enabled` + `per
 | `build_llm_context` | `context_factory.py:292` | LLM lifecycle events (node_type="LLM") |
 | `build_tool_context` | `context_factory.py:354` | Tool lifecycle events (node_type="TOOL") |
 
-Direct `HookContext()` construction is deprecated (`flow_hooks.py:146-162`).
+Direct `HookContext()` construction is deprecated (`flow_hooks.py:167-183`).
 
 ## Runtime Flow
 
@@ -92,7 +92,7 @@ Direct `HookContext()` construction is deprecated (`flow_hooks.py:146-162`).
 | 2 (Graph) | Per-graph | `registry.register_graph(hook)` or `AgentFlowModel.hooks` | Every node in the graph |
 | 1 (Global) | Application | `RuntimeConfig.register_global_hook(hook)` or auto-wired via `_wire_hooks_to_registry()` | ALL executions in the process |
 
-All hooks execute in parallel via `asyncio.gather(*tasks, return_exceptions=True)` (`hook_registry.py:135-167`). Errors are logged but never propagated.
+All hooks execute in parallel via `asyncio.gather(*tasks, return_exceptions=True)` (`hook_registry.py:163-195`). Errors are logged but never propagated.
 
 ## Graph Integration
 
@@ -114,7 +114,7 @@ All hooks execute in parallel via `asyncio.gather(*tasks, return_exceptions=True
 
 ### Tool Context Construction
 
-Tool events (`on_tool_start`, `on_tool_end`) are routed through `_build_tool_context()` (`hook_relay.py:240-270`) which calls `HookContextFactory.build_tool_context()` with `node_type="TOOL"`. This is distinct from LLM events which use `_build_context()` → `HookContextFactory.build_llm_context()` with `node_type="LLM"`.
+Tool events (`on_tool_start`, `on_tool_end`) are routed through `_build_tool_context()` (`hook_relay.py:193-258`) which calls `HookContextFactory.build_tool_context()` with `node_type="TOOL"`. This is distinct from LLM events which use `_build_context()` (`hook_relay.py:134-191`) → `HookContextFactory.build_llm_context()` with `node_type="LLM"`.
 
 ## NodeHook Integration
 
@@ -255,7 +255,7 @@ Every `HookContext` produced by `HookRelay` carries the following metadata:
 
 - `HookRelay.__init__()` (`hook_relay.py:36-115`): accepts `parent_run_id`, `nested_depth`, `nested_request_id` constructor params
 - `_build_context()` (`hook_relay.py:140-192`): injects nested correlation into `ctx.metadata` using runtime `DEPTH` ContextVar when available (more accurate) or the construction-time `_nested_depth` as fallback
-- `_build_tool_context()` (`hook_relay.py:240-270`): same correlation injection pattern for tool events
+- `_build_tool_context()` (`hook_relay.py:193-258`): same correlation injection pattern for tool events
 - Feature flags: `ENABLE_SUBAGENTS` and `ENABLE_NESTED_LLM_NODES` both default to `False` (opt-in required for nested execution)
 
 ### Sequence

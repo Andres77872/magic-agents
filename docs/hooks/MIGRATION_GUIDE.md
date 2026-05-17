@@ -10,7 +10,7 @@ Documents deprecations and recommended migration paths for consumers of the hook
 
 **Status**: ⚠️ Deprecated since Phase 4.
 
-**Evidence**: `flow_hooks.py:146-162` — `__post_init__` emits `DeprecationWarning` when `type(self) is HookContext`.
+**Evidence**: `flow_hooks.py:167-183` — `__post_init__` emits `DeprecationWarning` when `type(self) is HookContext`.
 
 ### Before (deprecated)
 

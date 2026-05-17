@@ -47,9 +47,9 @@ Reason for `on_node_bypass`: one of `"upstream_error"`, `"condition"`, `"not_rea
 
 | Method | Signature | Invoked |
 |--------|-----------|---------|
-| `on_llm_start` | `(self, context: HookContext, llm_config: Optional[Dict[str, Any]] = None) -> None` | Before each LLM call in the agent loop (`hook_relay.py:195-233`). `llm_config` IS populated with real config data when available (model, provider, streaming, tools, tool_choice, deduplicate). May be `None` when config is unavailable. |
-| `on_llm_end` | `(self, context: HookContext) -> None` | After each LLM response, per provider request (`hook_relay.py:234-268`). Carries per-iteration data only. |
-| `on_llm_loop_end` | `(self, context: HookContext) -> None` | **NEW** — After loop completes, aggregated once per loop (`hook_relay.py:354-400`). Carries accumulated content from ALL iterations. NOT the same as `on_llm_end`. |
+| `on_llm_start` | `(self, context: HookContext, llm_config: Optional[Dict[str, Any]] = None) -> None` | Before each LLM call in the agent loop (`hook_relay.py:262-299`). `llm_config` IS populated with real config data when available (model, provider, streaming, tools, tool_choice, deduplicate). May be `None` when config is unavailable. |
+| `on_llm_end` | `(self, context: HookContext) -> None` | After each LLM response, per provider request (`hook_relay.py:301-379`). Carries per-iteration data only. |
+| `on_llm_loop_end` | `(self, context: HookContext) -> None` | **NEW** — After loop completes, aggregated once per loop (`hook_relay.py:480-526`). Carries accumulated content from ALL iterations. NOT the same as `on_llm_end`. |
 
 `on_llm_end` now fires **once per provider request** (N times for an N-iteration loop). Loop completion is signaled exclusively by the separate `on_llm_loop_end` method. There is **no** double-fire: `on_llm_end` and `on_llm_loop_end` are distinct events with distinct semantics.
 
@@ -57,8 +57,8 @@ Reason for `on_node_bypass`: one of `"upstream_error"`, `"condition"`, `"not_rea
 
 | Method | Signature | Invoked |
 |--------|-----------|---------|
-| `on_tool_start` | `(self, context: HookContext) -> None` | Before tool execution (`hook_relay.py:270-311`) |
-| `on_tool_end` | `(self, context: HookContext) -> None` | After tool execution (`hook_relay.py:313-352`) |
+| `on_tool_start` | `(self, context: HookContext) -> None` | Before tool execution (`hook_relay.py:381-425`) |
+| `on_tool_end` | `(self, context: HookContext) -> None` | After tool execution (`hook_relay.py:427-478`) |
 
 `context.inputs` for `on_tool_start`: `tool_name`, `tool_call_id`, `arguments`, `provider_request_id`, `iteration`.
 `context.outputs` for `on_tool_end`: `tool_name`, `success`, `execution_time_ms`, `provider_request_id`, `iteration`.

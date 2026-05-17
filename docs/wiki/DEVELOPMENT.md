@@ -13,7 +13,7 @@ This page is for contributors touching docs or runtime internals.
 | `magic_agents/node_system/` | Node behavior |
 | `magic_agents/models/factory/Nodes/` | Node config fields and aliases |
 | `magic_agents/mcp/` | MCP integration |
-| `.issue/` | Issue investigation source material |
+| `.issue/` | Local/private issue investigation source material; public known-issue docs live under `docs/issues/` |
 
 ## Documentation maintenance rules
 

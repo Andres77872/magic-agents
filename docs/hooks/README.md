@@ -6,6 +6,7 @@ The magic-agents hook system provides **observer-only lifecycle hooks** for grap
 
 1. **FlowHooks Protocol** — async observer interface (12 lifecycle methods) for programmatic consumers (logging, metrics, tracing).
 2. **NodeHook** — a `type: "hook"` node that executes user-defined Python function templates via `exec()`.
+3. **CallbackEmitter** — a module-level compatibility/debug callback registry for selected executor debug events.
 
 Hooks are **observers**: they see events but MUST NOT modify execution state or alter control flow.
 
@@ -47,6 +48,7 @@ Add `EdgeHookConfig` to an edge: `"hooks": { "hook_node_id": "my-hook-node", "en
 | HookRegistry (3-tier dispatch) | ✅ Implemented | 453 lines |
 | RuntimeConfig (global/graph) | ✅ Implemented | e2e + integration |
 | HookRelay (magic-llm bridge) | ✅ Implemented | ~200 unit + ~400 integration |
+| CallbackEmitter (module-level debug bridge) | ✅ Implemented | graph boundary events only |
 | EdgeHookConfig | ✅ Implemented | 674 lines integration |
 | NodeHook (Python template) | ✅ Implemented (Phase 1 only) | via edge + e2e |
 | EmitInterface | ✅ Implemented | ~100 unit |
@@ -67,6 +69,7 @@ Add `EdgeHookConfig` to an edge: `"hooks": { "hook_node_id": "my-hook-node", "en
 | [CONTRACTS.md](CONTRACTS.md) | Hook implementers | HookContext, factory, TypedDict schemas, bypass reasons |
 | [RUNTIME_CONFIG.md](RUNTIME_CONFIG.md) | Application devs | RuntimeConfig, HookRegistry, registration API |
 | [HOOK_RELAY.md](HOOK_RELAY.md) | Integration devs | magic-llm bridge, async bridge, flushing |
+| [CALLBACK_EMITTER.md](CALLBACK_EMITTER.md) | Integration devs | Module-level debug callback registry and persistence tradeoffs |
 | [NODE_HOOK.md](NODE_HOOK.md) | NodeHook authors | exec template, emit API, timeout, safety |
 | [EDGE_HOOKS.md](EDGE_HOOKS.md) | Graph builders | EdgeHookConfig, hook dispatch on traversal |
 | [BUILD_INTEGRATION.md](BUILD_INTEGRATION.md) | Platform devs | build()/JSON behavior, hooks stripping |

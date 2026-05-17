@@ -104,5 +104,5 @@ That is why consumers and tests must branch on the event `type` instead of blind
 
 ## Related systems that touch debug output
 
-- `CallbackEmitter` bridges structured execution/debug events to external callbacks
+- `CallbackEmitter` in `magic_agents.agt_flow` bridges selected structured execution/debug events to external callbacks; current direct emissions are graph boundary events. See [../hooks/CALLBACK_EMITTER.md](../hooks/CALLBACK_EMITTER.md).
 - hooks and debug observers are separate systems: hooks observe lifecycle, observers format/filter/emit debug data

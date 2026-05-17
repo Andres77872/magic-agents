@@ -68,6 +68,8 @@ It auto-fills:
 - `sourceHandle` based on the provider node
 - `targetHandle` as `handle-tool-definition-N` when missing
 
+Exception: `python_exec` has two modes. When its node data includes `code`, it runs as a normal graph node and `_assign_tool_handles()` intentionally skips automatic tool-handle assignment (`agt_flow.py:210-216`). In that node-mode case, existing handles are preserved so the result can route through graph edges instead of being treated as an LLM tool definition. Omit `data.code` only when you want `python_exec` to behave as a tool provider for an LLM.
+
 ### 5. Sorting and positioning
 
 `sort_nodes()` uses `perform_topological_sort()` plus automatic positions for nodes with missing or default positions.
@@ -105,6 +107,6 @@ Even though execution is covered in detail elsewhere, these components are part 
 - `GraphDebugFeedback` — whole-graph execution summary
 - `RuntimeConfig` / `HookRegistry` — graph/node lifecycle hook registration and invocation
 - `ObserverRegistry` — per-execution debug observer resolution (`NullObserver`, `DefaultObserver`, `CompositeObserver`)
-- `CallbackEmitter` — callback bridge for persisted execution/debug output consumers
+- `CallbackEmitter` — module-level callback bridge for selected persisted execution/debug output consumers; see [../hooks/CALLBACK_EMITTER.md](../hooks/CALLBACK_EMITTER.md)
 
 See [EXECUTION_MODEL.md](EXECUTION_MODEL.md).

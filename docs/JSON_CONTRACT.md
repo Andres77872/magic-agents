@@ -287,7 +287,7 @@ Each edge in `edges` array must contain:
 | Node Type | Input Handles |
 |-----------|---------------|
 | `constant` | None (source node) |
-| `llm` | `handle-client-provider`, `handle-chat`, `handle-system-context`, `handle_user_message`, tool handles |
+| `llm` | `handle-client-provider`, `handle-chat`, `handle-system-context`, `handle_user_message`, tool handles; runtime-overridable generation handles: `handle-llm-temperature`, `handle-llm-top_p`, `handle-llm-max_tokens`, `handle-llm-stream`, `handle-llm-iterate`, `handle-llm-json_output` |
 | `end` | `handle_flow_input` |
 | `parser` | Arbitrary (template references) |
 | `hook` | `handle-hook-context` (receives `HookContext` at runtime) |

@@ -4,7 +4,7 @@
 
 `HookRelay` bridges magic-llm's **sync** `AgentHooks` protocol to magic-agents' **async** `FlowHooks` protocol. This gives graph-level visibility into LLM calls and tool executions inside magic-llm without modifying magic-llm's contract.
 
-**File**: `magic_agents/hooks/hook_relay.py:1-636`
+**File**: `magic_agents/hooks/hook_relay.py:1-764`
 
 **Status**: ✅ Implemented.
 
@@ -22,12 +22,12 @@ magic-agents FlowHooks (async)
 
 | magic-llm AgentHooks Method | FlowHooks Target | File:Line |
 |-----------------------------|------------------|-----------|
-| `on_iteration_start` | `on_llm_start(context, llm_config=...)` | `hook_relay.py:195-233` |
-| `on_llm_response` | `on_llm_end(context)` | `hook_relay.py:234-268` |
-| `on_tool_start` | `on_tool_start(context)` | `hook_relay.py:270-311` |
-| `on_tool_complete` | `on_tool_end(context)` | `hook_relay.py:313-352` |
-| `on_loop_complete` | **`on_llm_loop_end(context)`** | `hook_relay.py:354-400` |
-| `on_budget_exceeded` | `on_node_error(context)` | `hook_relay.py:402-418` |
+| `on_iteration_start` | `on_llm_start(context, llm_config=...)` | `hook_relay.py:262-299` |
+| `on_llm_response` | `on_llm_end(context)` | `hook_relay.py:301-379` |
+| `on_tool_start` | `on_tool_start(context)` | `hook_relay.py:381-425` |
+| `on_tool_complete` | `on_tool_end(context)` | `hook_relay.py:427-478` |
+| `on_loop_complete` | **`on_llm_loop_end(context)`** | `hook_relay.py:480-526` |
+| `on_budget_exceeded` | `on_node_error(context)` | `hook_relay.py:528-544` |
 
 **Key change**: `on_loop_complete` now maps to `on_llm_loop_end`, NOT to `on_llm_end`. Loop completion is signaled by a distinct method. There is no `loop_complete=True` discriminator — this was removed in a clean cut with no deprecation window.
 
@@ -112,7 +112,7 @@ The `llm_config` extra kwarg on `on_llm_start` carries the full dict of availabl
 
 ## Nested Hook Correlation
 
-When nested LLM nodes execute (via `PARENT_HOOKS` ContextVar in `TaskExecutor._execute_nested_llm_node()`), ALL events carry correlation metadata injected by `HookRelay._build_context()` (`hook_relay.py:176-190`):
+When nested LLM nodes execute (via `PARENT_HOOKS` ContextVar in `TaskExecutor._execute_nested_llm_node()`), ALL events carry correlation metadata injected by `HookRelay._build_context()` (`hook_relay.py:176-190`) and `_build_tool_context()` (`hook_relay.py:246-257`):
 
 | Field | Location | Type | Description |
 |-------|----------|------|-------------|
@@ -130,16 +130,16 @@ The config dict contains best-effort data — all fields are optional and may be
 
 ## Async Bridge
 
-`HookRelay` methods are **sync** (implements `AgentHooks` protocol), but `FlowHooks` methods are **async**. The bridge at `hook_relay.py:456-587` handles the mismatch:
+`HookRelay` methods are **sync** (implements `AgentHooks` protocol), but `FlowHooks` methods are **async**. The bridge at `hook_relay.py:582-716` handles the mismatch:
 
-1. **Via HookRegistry** (preferred): `asyncio.create_task(registry.invoke(...))` schedules the async call in the running event loop (`hook_relay.py:509-549`).
-2. **Via single FlowHooks**: `getattr` + `iscoroutinefunction` check → `create_task` for async, direct call for sync (`hook_relay.py:551-587`).
-3. **No running loop**: Logs warning, hook is skipped (`hook_relay.py:538-549`, `576-587`).
+1. **Via HookRegistry** (preferred): `asyncio.create_task(registry.invoke(...))` schedules the async call in the running event loop (`hook_relay.py:635-676`).
+2. **Via single FlowHooks**: `getattr` + `iscoroutinefunction` check → `create_task` for async, direct call for sync (`hook_relay.py:613-625`, `678-716`).
+3. **No running loop**: Logs warning, hook is skipped (`hook_relay.py:664-676`, `702-716`).
 
 ## Flushing Behavior
 
 ```python
-await hook_relay.flush_pending_hooks()  # hook_relay.py:422-452
+await hook_relay.flush_pending_hooks()  # hook_relay.py:548-578
 ```
 
 Call at the end of a NodeLLM iteration to await all pending async tasks. Uses `asyncio.wait()` with configurable timeout (default 5s). Pending tasks beyond timeout are **cancelled** via `task.cancel()` and the `_pending_futures` set is cleared entirely.
@@ -151,7 +151,7 @@ Call at the end of a NodeLLM iteration to await all pending async tasks. Uses `a
 `HookRelay` accumulates tool calls and results during LLM iterations:
 
 ```python
-hook_relay.get_collected_tool_data_for_yield(clear=True)  # hook_relay.py:589-631
+hook_relay.get_collected_tool_data_for_yield(clear=True)  # hook_relay.py:717-759
 ```
 
 Returns yieldable events (`tool_call`, `tool_result`). `clear=True` (default) empties internal lists after read to prevent double-accumulation.
@@ -163,6 +163,6 @@ Each collected entry now carries correlation metadata:
 
 ## Risks
 
-1. **Sync-only fallback**: When `asyncio.create_task` cannot be called (no running event loop), hook methods are silently skipped with a `logger.warning` at `hook_relay.py:538-549`, `576-587`.
+1. **Sync-only fallback**: When `asyncio.create_task` cannot be called (no running event loop), hook methods are skipped with a `logger.warning` at `hook_relay.py:664-676`, `702-716`.
 2. **`_current_provider_request_id` stale window**: Between loop boundary (`on_loop_complete` clears it to `None`) and the next `on_llm_response`, tool events have `provider_request_id = None`. This is documented behavior — tool events before the first LLM response are inherently uncorrelated.
 3. **`on_llm_loop_end` not implemented by existing consumers**: All existing `FlowHooks` subclasses continue working since the protocol provides a default no-op. New consumers should implement `on_llm_loop_end` for loop-level observability.
