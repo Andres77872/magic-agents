@@ -11,6 +11,7 @@ These pages are intentionally conservative: they describe what the current docs 
 | [master-field-is-ignored.md](master-field-is-ignored.md) | Documented limitation | The graph-level `master` field can appear in graph data, but the current execution model is reactive and does not execute by walking from that field. |
 | [cycle-behavior-and-doc-drift.md](cycle-behavior-and-doc-drift.md) | Documented limitation / doc drift | Validation docs identify a mismatch between older "cycles abort" wording and the current build path's sorting fallback. |
 | [task-subagent-docs-drift.md](task-subagent-docs-drift.md) | Documentation drift | Task-subagent ownership currently sits across Magic Agents wiring and MagicLLM loading; older import-path docs may be stale. |
+| [nodememory-limitations.md](nodememory-limitations.md) | Documented limitation | NodeMemory has known limitations: OpenAI-only embedding, no Codex trigger integration, no eviction/deletion, no `validate_graph()` runtime dep enforcement, and single-engine embedding. See [docs/nodes/memory.md](../nodes/memory.md) and [docs/JSON_CONTRACT.md](../JSON_CONTRACT.md) for details. |
 
 ## Related docs
 

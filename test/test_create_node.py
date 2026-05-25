@@ -2,7 +2,7 @@
 Unit tests for the create_node() factory function in agt_flow.py.
 
 Tests cover:
-- All 13 node type branches
+- All 14 node type branches (including CODEX)
 - Unsupported type stub
 - Conditional validation stub
 - Inner node recursive build
@@ -15,10 +15,11 @@ import pytest
 from magic_agents.agt_flow import create_node
 from magic_agents.models.factory.Nodes import ModelAgentFlowTypesModel
 from magic_agents.node_system import (
-    NodeChat, NodeLLM, NodeEND, NodeText, NodeConstant, NodeUserInput,
+    NodeChat, NodeCodex, NodeLLM, NodeMemory, NodeEND, NodeText, NodeConstant, NodeUserInput,
     NodeFetch, NodeClientLLM, NodeSendMessage, NodeParser,
     NodeLoop, NodeInner, NodeConditional,
 )
+from magic_agents.vector_storage import InMemoryVectorDB
 
 
 class TestCreateNodeAllTypes:
@@ -38,6 +39,8 @@ class TestCreateNodeAllTypes:
         (ModelAgentFlowTypesModel.LOOP, NodeLoop),
         (ModelAgentFlowTypesModel.INNER, NodeInner),
         (ModelAgentFlowTypesModel.END, NodeEND),
+        (ModelAgentFlowTypesModel.CODEX, NodeCodex),
+        (ModelAgentFlowTypesModel.MEMORY, NodeMemory),
     ])
     def test_create_node_type(self, node_type, expected_class):
         """Each node type returns the correct class."""
@@ -63,6 +66,10 @@ class TestCreateNodeAllTypes:
                     "edges": [{"id": "e1", "source": "ui", "target": "end"}],
                 }
             }
+        elif node_type == ModelAgentFlowTypesModel.CODEX:
+            node_def["data"] = {"codex_entries": [{"triggers": ["help"], "content": "Help"}]}
+        elif node_type == ModelAgentFlowTypesModel.MEMORY:
+            node_def["data"] = {"memory_entries": []}
         elif node_type == ModelAgentFlowTypesModel.CHAT:
             # Chat needs message in data and load_chat
             node_def["data"] = {"message": "hello"}
@@ -77,6 +84,64 @@ class TestCreateNodeAllTypes:
             f"Expected {expected_class.__name__} for type '{node_type}', "
             f"got {node.__class__.__name__}"
         )
+
+    def test_create_node_codex_invalid_uuid(self):
+        """CODEX type with invalid UUID returns NodeEND stub with NodeValidationError."""
+        node_def = {
+            "id": "codex-bad",
+            "type": ModelAgentFlowTypesModel.CODEX,
+            "data": {
+                "codex_entries": [{
+                    "id": "not-a-valid-uuid",
+                    "triggers": ["help"],
+                    "content": "Help",
+                }]
+            },
+        }
+        node = create_node(node_def, load_chat=None)
+        assert isinstance(node, NodeEND)
+        assert hasattr(node, "_error_info")
+        assert node._error_info["error_type"] == "NodeValidationError"
+
+    def test_create_node_memory_with_deps(self):
+        """MEMORY node receives deps injection for vector_db."""
+        mock_db = object()
+        node_def = {
+            "id": "mem-1",
+            "type": ModelAgentFlowTypesModel.MEMORY,
+            "data": {"memory_entries": []},
+        }
+        node = create_node(node_def, load_chat=None, deps={"mem-1": {"vector_db": mock_db}})
+        assert isinstance(node, NodeMemory)
+        assert node._vector_db is mock_db
+
+    def test_create_node_memory_no_deps_auto_creates_vector_db(self):
+        """MEMORY node without deps auto-creates ephemeral InMemoryVectorDB."""
+        node_def = {
+            "id": "mem-auto",
+            "type": ModelAgentFlowTypesModel.MEMORY,
+            "data": {"memory_entries": []},
+        }
+        node = create_node(node_def, load_chat=None)
+        assert isinstance(node, NodeMemory)
+        assert node._vector_db is not None
+        assert isinstance(node._vector_db, InMemoryVectorDB)
+        state = node._capture_internal_state()
+        assert state["vector_db_backend"] == "ephemeral"
+
+    def test_create_node_memory_rejects_manual_id(self):
+        """Memory entry with manual id returns NodeEND stub with NodeValidationError."""
+        node_def = {
+            "id": "mem-bad",
+            "type": ModelAgentFlowTypesModel.MEMORY,
+            "data": {
+                "memory_entries": [{"id": "abc", "content": "x"}],
+            },
+        }
+        node = create_node(node_def, load_chat=None)
+        assert isinstance(node, NodeEND)
+        assert hasattr(node, "_error_info")
+        assert node._error_info["error_type"] == "NodeValidationError"
 
     def test_create_node_chat_with_load_chat(self):
         """CHAT node receives load_chat callable and message."""

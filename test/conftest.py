@@ -7,6 +7,8 @@ across the growing test suite.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import math
 import os
 from copy import deepcopy
 from pathlib import Path
@@ -20,6 +22,11 @@ from magic_agents.execution.event_dispatcher import GraphEventDispatcher, NodeSt
 from magic_agents.execution.input_tracker import NodeInputTracker, InputInfo
 from magic_agents.models.factory.EdgeNodeModel import EdgeNodeModel
 from magic_agents.models.factory.Nodes import ModelAgentFlowTypesModel
+from magic_agents.vector_storage import InMemoryVectorDB
+from magic_llm.model.ModelEmbeddingResponse import (
+    EmbeddingData,
+    ModelEmbeddingResponse,
+)
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -414,9 +421,67 @@ def mock_magic_llm():
 
     mock_llm_engine.async_stream_generate = fake_stream
 
+    # Embedding MUST NOT be called via the CLIENT handle — only via _embedding_client.
+    # Any accidental call fails LOUDLY with NotImplementedError.
+    mock_llm_engine.async_embedding = AsyncMock(
+        side_effect=NotImplementedError(
+            "CLIENT handle should never be used for embedding. Use _embedding_client."
+        )
+    )
+
     mock_client = MagicMock()
     mock_client.llm = mock_llm_engine
     mock_client.model = "mock-model"
 
     with patch("magic_agents.node_system.NodeClientLLM.MagicLLM", return_value=mock_client):
         yield mock_client
+
+
+# ─── NodeMemory / Vector Embedding Fixtures ─────────────────────────────────
+
+@pytest.fixture
+def mock_magic_embedding():
+    """Return a deterministic async embedding function for NodeMemory tests.
+
+    Produces an 8-dimensional unit vector from input text using SHA256.
+    The first 8 bytes of the hash digest are mapped to the range [-1, 1]
+    and normalized to unit length. This guarantees:
+    - Deterministic output: same text → same embedding vector
+    - Reproducible tests: no randomness between runs
+    - Stable similarity: identical texts produce identical vectors
+
+    Returns:
+        Async callable ``_embed(text: str) -> ModelEmbeddingResponse``.
+        The response contains a single ``EmbeddingData`` entry at index 0.
+    """
+    async def _embed(text: str) -> ModelEmbeddingResponse:
+        digest = hashlib.sha256(text.encode()).digest()
+        # Map first 8 bytes from [0, 255] to [-1, 1]
+        vector: list[float] = []
+        for i in range(8):
+            val = (digest[i] / 127.5) - 1.0
+            vector.append(val)
+        # Normalize to unit vector
+        magnitude = math.sqrt(sum(v * v for v in vector))
+        if magnitude > 0:
+            vector = [v / magnitude for v in vector]
+        return ModelEmbeddingResponse(
+            object="list",
+            data=[EmbeddingData(object="embedding", index=0, embedding=vector)],
+            model="mock-embedding-model",
+        )
+    return _embed
+
+
+@pytest.fixture
+def in_memory_vector_db():
+    """Return a fresh InMemoryVectorDB instance for NodeMemory tests.
+
+    Each test gets an empty, isolated vector store — no state leakage
+    between tests. Use together with ``mock_magic_embedding`` for
+    ``rebuild()`` or insert seed entries directly via ``upsert()``.
+
+    Returns:
+        InMemoryVectorDB instance with empty internal state.
+    """
+    return InMemoryVectorDB()

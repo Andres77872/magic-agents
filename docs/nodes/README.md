@@ -21,6 +21,7 @@ One page per current built-in node type. This section is the detailed reference 
 - [hook.md](hook.md)
 - [python_exec.md](python_exec.md)
 - [mcp.md](mcp.md)
+- [memory.md](memory.md)
 
 ## Related guides
 

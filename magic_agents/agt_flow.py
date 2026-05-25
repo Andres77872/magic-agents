@@ -32,6 +32,8 @@ from magic_agents.models.factory.Nodes import (
     McpNodeModel,
     ChatNodeModel,
     HookNodeModel,
+    CodexNodeModel,
+    MemoryNodeModel,
 )
 from magic_agents.models.model_agent_run_log import ModelAgentRunLog
 from magic_agents.node_system import (
@@ -51,6 +53,8 @@ from magic_agents.node_system import (
     NodePythonExec,
     NodeMcp,
     NodeHook,
+    NodeCodex,
+    NodeMemory,
     sort_nodes,
 )
 from magic_agents.execution import (
@@ -237,7 +241,7 @@ def _assign_tool_handles(nodes: list[dict], edges: list[dict]) -> None:
             tool_counters[llm_id] = idx + 1
 
 
-def create_node(node: dict, load_chat: Callable, debug: bool = False) -> Any:
+def create_node(node: dict, load_chat: Callable, debug: bool = False, deps: Optional[dict[str, Any]] = None) -> Any:
     """
     Factory method to create node instances.
     
@@ -248,6 +252,10 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False) -> Any:
         node (dict): Node data from JSON.
         load_chat (Callable): Load chat function.
         debug (bool): Debug mode. Defaults to False.
+        deps (Optional[dict[str, Any]]): Constructor dependency injection.
+            A dict keyed by node ID. When a node ID matches, the value is
+            unpacked as **kwargs into the node constructor. Defaults to None
+            for backward compatibility.
 
     Returns:
         Any: Node instance.
@@ -283,6 +291,8 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False) -> Any:
         ModelAgentFlowTypesModel.PYTHON_EXEC: (NodePythonExec, PythonExecNodeModel),
         ModelAgentFlowTypesModel.MCP: (NodeMcp, McpNodeModel),
         ModelAgentFlowTypesModel.HOOK: (NodeHook, HookNodeModel),
+        ModelAgentFlowTypesModel.CODEX: (NodeCodex, CodexNodeModel),
+        ModelAgentFlowTypesModel.MEMORY: (NodeMemory, MemoryNodeModel),
     }
     
     if node_type not in node_map:
@@ -334,6 +344,22 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False) -> Any:
                 "error_message": str(e),
                 "node_id": node['id'],
                 "node_data": node_data
+            }
+            return stub
+    elif node_type == ModelAgentFlowTypesModel.MEMORY:
+        try:
+            validated = MemoryNodeModel(**node_data)
+            node_deps = (deps or {}).get(node['id'], {})
+            return NodeMemory(**extra, data=validated, **node_deps)
+        except Exception as e:
+            logger.error("Invalid memory node config: %s", e)
+            stub = NodeEND(**extra)
+            stub._error_info = {
+                "error_type": "NodeValidationError",
+                "error_message": str(e),
+                "node_id": node['id'],
+                "node_type": node_type,
+                "node_data": node_data,
             }
             return stub
     elif model_cls:
@@ -615,7 +641,7 @@ def validate_graph(nodes: list[dict], edges: list[dict]) -> dict:
     }
 
 
-def build(agt_data, message: str, images: list[str] = None, load_chat=None, extras: Optional[dict[str, Any]] = None, history_messages: Optional[list[dict[str, Any]]] = None) -> AgentFlowModel:
+def build(agt_data, message: str, images: list[str] = None, load_chat=None, extras: Optional[dict[str, Any]] = None, history_messages: Optional[list[dict[str, Any]]] = None, deps: Optional[dict[str, Any]] = None) -> AgentFlowModel:
     """
     Prepare and build the agent flow graph from input data and message.
     
@@ -633,6 +659,8 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
             through UserInput node to downstream nodes. Defaults to None.
         history_messages (Optional[list[dict[str, Any]]]): Backend-authoritative persisted + runtime
             history messages. Injected into CHAT node data as Slot 1 base. Defaults to None.
+        deps (Optional[dict[str, Any]]): Constructor dependency injection dict
+            keyed by node ID. Forwarded to create_node() for each node. Defaults to None.
 
     Returns:
         AgentFlowModel: Agent flow graph. If validation fails, the graph will contain error information.
@@ -742,7 +770,7 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
             })
     
     nodes: Dict[str, Any] = {
-        node['id']: create_node(node, load_chat, agt_data.get('debug', False)) for node in agt_data['nodes']
+        node['id']: create_node(node, load_chat, agt_data.get('debug', False), deps=deps) for node in agt_data['nodes']
     }
     
     # Build inner graphs for NodeInner nodes
@@ -872,29 +900,59 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
 
 
 async def run_agent(
-    graph: AgentFlowModel,
+    graph: Union[dict, AgentFlowModel],
     id_chat: Optional[Union[int, str]] = None,
     id_thread: Optional[Union[int, str]] = None,
     id_user: Optional[Union[int, str]] = None,
     extras: Optional[dict[str, Any]] = None,
     hooks: Optional[RuntimeConfig] = None,
     debug_callback=None,  # Phase 1: optional async callback for debug events
+    deps: Optional[dict[str, Any]] = None,  # Phase 5: dependency injection
 ) -> AsyncGenerator[ChatCompletionModel, None]:
     """
     Run the agent flow and yield ChatCompletionModel results as they are generated.
 
     Args:
-        graph (AgentFlowModel): Agent flow graph.
+        graph (Union[dict, AgentFlowModel]): Agent flow graph. Can be a raw dict
+            (built internally if deps are provided) or a pre-built AgentFlowModel.
         id_chat (Optional[Union[int, str]]): Chat ID. Defaults to None.
         id_thread (Optional[Union[int, str]]): Thread ID. Defaults to None.
         id_user (Optional[Union[int, str]]): User ID. Defaults to None.
         extras (Optional[dict[str, Any]]): Client-provided contextual data. Defaults to None.
         hooks (Optional[RuntimeConfig]): Optional hook runtime config for global hooks.
         debug_callback: Optional async callback for debug events (Phase 1).
+        deps (Optional[dict[str, Any]]): Constructor dependency injection dict
+            keyed by node ID. Forwarded to build() when graph is a raw dict.
+            Ignored when graph is a pre-built AgentFlowModel. Defaults to None.
 
     Yields:
         AsyncGenerator[ChatCompletionModel, None]: ChatCompletionModel results.
     """
+    # Phase 5: Auto-build from raw dict when deps are provided
+    if deps is not None and isinstance(graph, dict):
+        from magic_agents.agt_flow import build
+
+        # Extract existing message from graph's UserInput node data.text
+        # to preserve graph-defined runtime input semantics (per user clarification).
+        # build() at line 751 overwrites data.text with the message param,
+        # so we must pass the graph's own value instead of an empty string.
+        msg = ""
+        nodes = graph.get("nodes", [])
+        # Handle nested {'content': {...}} wrapper (build() normalizes this too)
+        if not nodes and 'content' in graph and isinstance(graph.get('content'), dict):
+            nodes = graph['content'].get('nodes', [])
+        for node in nodes:
+            if node.get('type') == ModelAgentFlowTypesModel.USER_INPUT:
+                msg = node.get('data', {}).get('text', "")
+                break
+
+        graph = build(graph, message=msg, deps=deps)
+    elif deps is not None:
+        logger.warning(
+            "run_agent: deps provided but graph is already a built "
+            "AgentFlowModel — deps are ignored."
+        )
+
     async for result in execute_graph(
         graph=graph,
         id_chat=id_chat,

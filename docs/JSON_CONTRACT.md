@@ -48,7 +48,7 @@ Each node in `nodes` array must contain:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `id` | `string` | **Required** | Unique non-empty identifier |
-| `type` | `string` | **Required** | Canonical type key (17 types) |
+| `type` | `string` | **Required** | Canonical type key (19 types) |
 | `data` | `object` | **Required** | Node-specific configuration (may be empty `{}`) |
 | `position` | `object` | Optional | Canvas position `{x, y}` (default `{x:0, y:0}`) |
 
@@ -62,7 +62,7 @@ Each node in `nodes` array must contain:
 
 ---
 
-## Canonical Node Types (17 Types)
+## Canonical Node Types (19 Types)
 
 | Type Key | Node Class | Model Class | Description |
 |----------|------------|-------------|-------------|
@@ -82,7 +82,9 @@ Each node in `nodes` array must contain:
 | `conditional` | `NodeConditional` | `ConditionalNodeModel` | Branch routing node |
 | `python_exec` | `NodePythonExec` | `PythonExecNodeModel` | Python execution node |
 | `mcp` | `NodeMcp` | `McpNodeModel` | MCP tool integration node |
+| `memory` | `NodeMemory` | `MemoryNodeModel` | Vector insights node — extraction, embedding, search, and injection of memory context via similarity |
 | `hook` | `NodeHook` | `HookNodeModel` | Python function template for hooks |
+| `codex` | `NodeCodex` | `CodexNodeModel` | Knowledge hub: trigger-based content injection into user messages |
 
 ---
 
@@ -212,6 +214,132 @@ Each `servers` entry requires:
 - For stdio: `command` (string, required)
 - For HTTP: `url` (string, required)
 
+### memory Fields
+
+Uses `MemoryNodeModel` for vector memory configuration. NodeMemory extracts memories from user messages via LLM extraction, stores them with embeddings, and injects relevant past memories as prompt context.
+
+**Data structure**:
+```json
+{
+  "instructions": "Extract key concerns from this message",
+  "memory_entries": [
+    {"content": "User prefers email communication", "trigger": "preference"}
+  ],
+  "top_k": 10
+}
+```
+
+When `top_k` is absent, the default value of `5` is used (Pydantic `Field(default=5)`).
+
+**`MemoryEntry` sub-model fields**:
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `id` | `string` | Optional | Auto-generated 32-char UUID4 hex | **STRICTLY auto-generated. DO NOT provide in JSON — raises `ValidationError`.** Auto-generated as `uuid.uuid4().hex` (32 hex chars). |
+| `source_id` | `string` or `null` | Optional | `null` | Read-back field populated by vector DB search. Contains the scope-aware composite document ID (UUID format) from the vector storage. Distinct from auto-generated `id`. **Not provided in input JSON** — populated by VDB search result reconstruction. `null` when metadata lacks the `doc_id` key (backward-compatible with pre-existing entries). |
+| `content` | `string` | **Required** | — | Memory content text (min 1 character). |
+| `trigger` | `string` | Optional | `""` | Memory tag/category (singular string, unlike CodexEntry's `triggers` list). |
+| `created_at` | `string (ISO 8601)` | Optional | Auto-generated UTC timestamp | Memory creation timestamp. Auto-generated via `datetime.now(UTC)`. |
+
+**`MemoryEntry` validation rules**:
+- `id` MUST NOT be provided manually. If set in JSON, the model raises `ValidationError` with message `"MemoryEntry.id is auto-generated. Do not provide a value for 'id'. Remove the 'id' field from the memory entry JSON."`
+- `source_id` is intentionally unvalidated — it is a read-back field populated by vector DB search. Unlike `id`, there is no `reject_manual_id` validator on `source_id`. Users CAN set `source_id` in input JSON, but it will be overwritten by VDB search results at runtime.
+- `content` MUST be non-empty (min 1 character). Empty content raises `ValidationError`.
+- Extra unknown fields in a `MemoryEntry` are rejected (inherited `extra='forbid'`).
+- `id` and `created_at` are always auto-generated at construction time, never read from JSON input.
+
+**`MemoryNodeModel` fields**:
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `instructions` | `string` | Optional | `null` | LLM extraction prompt template. When `null`, only vector search is performed (no LLM extraction). When set, NodeMemory uses this as the system prompt for the extraction LLM call. |
+| `memory_entries` | `array` | Optional | `[]` | Seed memory entries (array of `MemoryEntry` objects). This is a seed/export snapshot only — the vector DB is the source of truth for runtime search. |
+| `top_k` | `integer` | Optional | `5` | Number of top memory matches to retrieve from vector search. Valid range: 1–50. When absent, Pydantic fills the default (5). |
+
+**Handle contract**:
+
+| Direction | Handle | Purpose | Mandatory |
+|-----------|--------|---------|-----------|
+| Input | `handle_memory_input` | User message input (from upstream Codex or UserInput node) | Yes |
+| Input | `handle-client-provider` | MagicLLM client delivery (from NodeClientLLM) | No — degrades to search-only mode if missing |
+| Output | `handle_memory_output` | Memory-enriched message output (NOT `handle_user_message` — avoids competing-edge race with Codex) | N/A |
+
+**Output handle design**: NodeMemory emits `handle_memory_output` (not `handle_user_message`) to avoid the competing-edge anti-pattern when both NodeCodex and NodeMemory exist in the same graph. If Codex also emits `handle_user_message`, having both emit the same handle causes a non-deterministic race on the downstream Chat node. Graph authors can override the output handle to `handle_user_message` via `handles={"output": "handle_user_message"}` when no Codex coexistence is needed.
+
+**Scope isolation**: Memories are scoped by the compound key `(chat_session_id, node_id)`:
+- Every `search()` call enforces `filter_scope={"session_id": chat_log.id_chat, "node_id": self.node_id}`
+- Two NodeMemory nodes with different `node_id` values produce independent search results within the same chat session
+- The same NodeMemory node across different chat sessions produces independent search results
+
+**`<memory_content>` is prompt text — NOT a security boundary**:
+- The runtime does NOT parse, validate, or escape XML. Memory content and user messages pass through unmodified.
+- Content containing `</memory_content>`, `<script>`, or any tag-like text is inserted verbatim between the hard-coded delimiter tags.
+- The wrapper is a prompt engineering hint for the LLM, not a structural or security boundary — matches the `<codex_content>` policy established by NodeCodex exactly.
+
+**Graph wiring examples**:
+
+1. **Memory alone (no Codex)** — Override output to `handle_user_message` for zero-config downstream:
+```json
+{
+  "nodes": [
+    {"id": "input", "type": "user_input", "data": {}},
+    {"id": "memory-1", "type": "memory", "data": {"memory_entries": []}},
+    {"id": "chat", "type": "chat"},
+    {"id": "end", "type": "end"}
+  ],
+  "edges": [
+    {"source": "input", "target": "memory-1", "sourceHandle": "handle_user_message", "targetHandle": "handle_memory_input"},
+    {"source": "memory-1", "target": "chat", "sourceHandle": "handle_memory_output", "targetHandle": "handle_user_message"},
+    {"source": "chat", "target": "end"}
+  ]
+}
+```
+
+2. **Memory + Codex coexistence** — Distinct handles prevent competing-edge race:
+```json
+{
+  "nodes": [
+    {"id": "input", "type": "user_input", "data": {}},
+    {"id": "codex", "type": "codex", "data": {"codex_entries": []}},
+    {"id": "client", "type": "client", "data": {"engine": "openai"}},
+    {"id": "memory-1", "type": "memory", "data": {"instructions": "Extract key points"}},
+    {"id": "chat", "type": "chat"},
+    {"id": "end", "type": "end"}
+  ],
+  "edges": [
+    {"source": "input", "target": "codex", "sourceHandle": "handle_user_message", "targetHandle": "handle_codex_input"},
+    {"source": "codex", "target": "memory-1", "sourceHandle": "handle_user_message", "targetHandle": "handle_memory_input"},
+    {"source": "client", "target": "memory-1", "sourceHandle": "handle-client-provider", "targetHandle": "handle-client-provider"},
+    {"source": "memory-1", "target": "chat", "sourceHandle": "handle_memory_output", "targetHandle": "handle_user_message"},
+    {"source": "chat", "target": "end"}
+  ]
+}
+```
+
+**Scope-aware composite IDs**: NodeMemory uses a **scope-aware composite** SHA256 hash as the vector DB document ID for upserts:
+
+```
+doc_id = str(uuid.UUID(sha256(content + "|" + session_id + "|" + node_id)[:32]))
+```
+
+This ensures:
+- **Same-scope dedup**: Same content within the same session AND same node produces the same document ID — no duplicates.
+- **Cross-scope isolation**: Different sessions or different nodes produce different document IDs — preventing cross-scope metadata overwrite.
+- **Qdrant compatibility**: 32-hex-char truncation + UUID formatting produces valid Qdrant point IDs.
+- The `MemoryEntry.source_id` field (returned from search) holds this document ID for traceability.
+
+**Constructor runtime deps**: Runtime dependencies (`vector_db`, `embedding_client`) are injected through the `run_agent(deps=...)` public API — not serialized in graph JSON. See [`docs/nodes/memory.md`](nodes/memory.md#dependency-injection-via-run_agentdeps) for usage examples.
+
+**`_capture_internal_state` fields** (debugging):
+| Field | Type | Description |
+|-------|------|-------------|
+| `memory_entry_count` | `int` | Total entries in the runtime memory list |
+| `extracted_count` | `int` | Memories extracted in the last `process()` run |
+| `injected_count` | `int` | Memories injected in the last `process()` run |
+| `top_k` | `int` | Configured number of top matches to retrieve from vector search. Mirrors the `top_k` field from `MemoryNodeModel` (default 5, range 1–50). |
+| `vector_db_available` | `bool` | Always `true` — vector DB is auto-created as ephemeral fallback if none is injected. Retained for backward compatibility. |
+| `vector_db_backend` | `str` | Backend type: `"ephemeral"` (InMemoryVectorDB auto-created or manually passed), `"qdrant"` (QdrantVectorDB), or `"external"` (any other VectorDB-compatible implementation). Diagnostic field — signals configuration, not health. |
+
 ### constant Fields
 
 | Field | Type | Required | Default | Description |
@@ -228,6 +356,71 @@ See [nodes/hook.md](nodes/hook.md) and [hooks/README.md](hooks/README.md) for ru
 | `function_template` | `string` | Optional | `""` | Python function template (def or async def) for hook execution |
 | `timeout_override` | `integer` | Optional | `null` | Per-hook timeout in seconds (global default 30s) |
 | `hook_type` | `string` | Optional | `"custom"` | Lifecycle marker: `"pre"`, `"post"`, `"error"`, `"custom"` |
+
+### codex Fields
+
+Uses `CodexNodeModel` for knowledge configuration. Each codex entry defines a trigger keyword and associated content that is prepended to user messages when triggers match.
+
+**Data structure**:
+```json
+{
+  "codex_entries": [
+    {
+      "id": "550e8400e29b41d4a716446655440000",
+      "triggers": ["help", "ayuda"],
+      "content": "Help resources: /docs/faq"
+    }
+  ]
+}
+```
+
+**`CodexEntry` fields**:
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `id` | `string` | Optional | Auto-generated UUID4 hex | Entry ID. Auto-generated as 32-char UUID4 hex if omitted. If provided, must be a valid UUID4 string — accepts both hyphenated (`550e8400-e29b-41d4-a716-446655440000`) and non-hyphenated (`550e8400e29b41d4a716446655440000`) formats. Invalid UUIDs are rejected with `ValidationError`. |
+| `triggers` | `array[string]` | **Required** | — | Trigger keywords (min 1). Matching is case-insensitive word-boundary (`\b`) using Python `re.search()`. |
+| `content` | `string` | **Required** | — | Content to prepend when triggers match (min 1 char). Wrapped in `<codex_content>...</codex_content>` — this is prompt annotation text, not parsed XML. |
+
+**Trigger matching details**:
+- Case-insensitive: trigger `"HELP"` matches input `"help"`, `"Help"`, `"HELP"`, etc.
+- Word-boundary (`\b`): prevents false positives — trigger `"ai"` does NOT match `"EMAIL"`, `"trains"`, or `"plain"`.
+- Each entry matches at most once (first matching trigger per entry). Multiple entries can all match.
+- **Known limitation**: Triggers containing non-word characters (`c++`, `node.js`, `foo-bar`) may behave unexpectedly with `\b` word-boundary semantics. Graph authors should avoid non-word characters in triggers, or test coverage against Python `re` `\b` behavior.
+
+**`<codex_content>` is prompt text — NOT a security boundary**:
+- The runtime does NOT parse, validate, or escape XML. Content and user messages pass through unmodified.
+- Codex content containing `</codex_content>`, `<script>`, or any tag-like text is inserted verbatim between the hard-coded delimiter tags.
+- The wrapper is a prompt engineering hint for the LLM, not a structural or security boundary.
+- Graph authors who need content sanitization or transformation should place a `NodeParser` downstream.
+
+**⚠️ WARNING — Competing edge anti-pattern**:
+Codex-enabled graphs MUST NOT retain a direct `UserInput.handle_user_message → Chat.handle_user_message` edge alongside the Codex edges. Two competing writes to `Chat.inputs['handle_user_message']` (one from UserInput, one from Codex) causes race behavior where the Codex-transformed message may be silently overwritten.
+
+The Codex output edge MUST replace the direct edge. Correct wiring:
+
+```json
+{
+  "edges": [
+    {"source": "input", "target": "codex",
+     "sourceHandle": "handle_user_message", "targetHandle": "handle_codex_input"},
+    {"source": "codex", "target": "chat",
+     "sourceHandle": "handle_user_message", "targetHandle": "handle_user_message"}
+  ]
+}
+```
+
+Automatic detection or validation of competing edges is **NOT implemented** — graph author responsibility.
+
+**`_capture_internal_state` fields** (debugging):
+| Field | Type | Description |
+|-------|------|-------------|
+| `codex_entry_count` | `int` | Number of configured codex entries |
+| `trigger_count` | `int` | Total number of triggers across all entries |
+| `input_handle` | `string` | Active input handle name |
+| `output_handle` | `string` | Active output handle name |
+
+**NodeCodex is NOT auto-inserted by `build()`** — graph authors MUST explicitly declare the `codex` node in their agent JSON.
 
 ### chat Fields
 
@@ -281,6 +474,8 @@ Each edge in `edges` array must contain:
 | `inner` | `handle_content_stream`, `handle_execution_content`, `handle_execution_extras` |
 | `end` | `handle_end_output` |
 | `hook` | `handle-user-output`, `handle-debug-output`, `handle-feedback-output` |
+| `codex` | `handle_user_message` |
+| `memory` | `handle_memory_output` |
 
 ### Canonical Input Handles
 
@@ -291,7 +486,18 @@ Each edge in `edges` array must contain:
 | `end` | `handle_flow_input` |
 | `parser` | Arbitrary (template references) |
 | `hook` | `handle-hook-context` (receives `HookContext` at runtime) |
-| `send_message` | `handle_send_extra`, `handle_send_content` |
+| `codex` | `handle_codex_input` |
+| `memory` | `handle_memory_input`, `handle-client-provider` |
+
+### Port Cardinality
+
+| Node Type | Handle | Cardinality | Exclusive |
+|-----------|--------|-------------|-----------|
+| `memory` | `handle_memory_input` | `one` | `True` |
+
+Notes:
+- `handle_memory_input` accepts exactly one incoming edge (cardinality `one`, exclusive `True`).
+- `handle-client-provider` does NOT have a cardinality entry — the default behavior allows the edge without additional cardinality enforcement.
 
 ---
 
@@ -385,3 +591,50 @@ Frontend TypeScript interfaces in `magic-ui/src/App/Flow/Types/nodeModels.ts` mi
 - [HANDLES_AND_ROUTING.md](wiki/HANDLES_AND_ROUTING.md) — Handle routing protocol
 - [VALIDATION.md](wiki/VALIDATION.md) — Build-time validation details
 - `spec.md` in `.dev/sdd/changes/node-json-canvas-refactor/` — Full specification
+
+---
+
+## Known Limitations
+
+### 1. OpenAI-Only Embedding
+
+Only OpenAI-compatible engines support `async_embedding()`. Non-OpenAI engines cause `async_embedding()` to return `None`, which makes NodeMemory skip all vector operations (embedding, upsert, and search) while still supporting LLM extraction (Phase 2) when `instructions` is configured.
+
+**Behavior**: When embedding is unavailable, NodeMemory logs a diagnostic warning mentioning the OpenAI-only limitation and yields the original user message unchanged. The graph continues executing — no crash.
+
+**Workaround**: Use an OpenAI-compatible engine for any graph that requires memory enrichment via vector similarity. Non-OpenAI graphs work correctly but output messages without memory context.
+
+### 2. No Codex Trigger Integration
+
+NodeMemory and NodeCodex operate independently. There is no automatic mechanism to convert Codex triggers into memory tags. A `codex_entries` trigger like `"help"` does NOT automatically create a memory entry with `trigger="help"`.
+
+**Workaround**: Graph authors can duplicate trigger values manually in both the `codex_entries` config (for Codex content injection) and the `instructions` prompt text (for memory extraction). This is explicit but requires manual synchronization.
+
+**Follow-up**: Codex-trigger-as-memory-tag integration is deferred to a separate SDD. Any enhancement to NodeCodex compatibility requires a Codex SDD amendment.
+
+### 3. `<memory_content>` Is NOT a Security Boundary
+
+The `<memory_content>` wrapper is pure prompt annotation text. NodeMemory performs no XML parsing, escaping, or sanitization. Content containing `</memory_content>`, `<script>`, or any tag-like sequences passes through unmodified between the delimiters.
+
+This matches the `<codex_content>` policy exactly — see the [codex Fields](#codex-fields) section for the same guarantee.
+
+**Implication**: Downstream nodes (LLM, Chat, SendMessage) receive raw text. Graph authors who need content sanitization or transformation should place a `NodeParser` or other transform node downstream of the Memory node.
+
+### 4. No Hard Validation for Missing Runtime Dependencies
+
+NodeMemory does not enforce hard validation in `validate_graph()` for missing vector DB or MagicLLM client.
+
+- **No vector DB**: An ephemeral `InMemoryVectorDB` is auto-created at construction time. Embedding, upsert, and search proceed normally but all data is lost on process restart. Use `pip install magic-agents[qdrant]` and inject a `QdrantVectorDB` via `deps` for persistent storage. The `vector_db_backend` debug field signals `"ephemeral"` vs `"qdrant"` vs `"external"`.
+- **No client**: Extraction is skipped. Search is skipped. The message passes through unchanged.
+
+This matches the existing pattern: the Codex competing-edge anti-pattern is also documented but not enforced at validation.
+
+### 5. Single-Engine Embedding Only
+
+Vector search depends on embedding quality from a single embedding model. No multi-engine embedding abstraction layer exists. The embedding model is determined by the MagicLLM client's engine configuration.
+
+**Scope isolation** via `filter_scope={"session_id": ..., "node_id": ...}` ensures memory pools are independent across sessions and nodes. However, if the embedding model changes between sessions, the same text may produce different embedding vectors, affecting search relevance. This is expected behavior — no backward-compatibility guarantee across model changes.
+
+### 6. NodeCodex Modifications Are Out of Scope
+
+This documentation covers NodeMemory as a standalone node type. Any modifications to NodeCodex (`NodeCodex.py`, `CodexNodeModel.py`, or Codex touchpoints) for Codex-Memory integration require a separate SDD change. See [No Codex Trigger Integration](#2-no-codex-trigger-integration) above.

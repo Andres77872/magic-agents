@@ -71,6 +71,8 @@ from magic_agents.node_system.NodeText import NodeText
 from magic_agents.node_system.NodeUserInput import NodeUserInput
 from magic_agents.node_system.NodePythonExec import NodePythonExec
 from magic_agents.node_system.NodeHook import NodeHook
+from magic_agents.node_system.NodeCodex import NodeCodex
+from magic_agents.node_system.NodeMemory import NodeMemory
 
 _NodeMcp_class = None
 
@@ -330,6 +332,7 @@ def sort_nodes(nodes: List[Dict], edges: List[Dict]) -> Tuple[List[Dict], List[D
 __all__ = [
     "NodeChat",
     "NodeClientLLM",
+    "NodeCodex",
     "NodeConstant",
     "NodeEND",
     "NodeFetch",
@@ -343,6 +346,7 @@ __all__ = [
     "NodeConditional",
     "NodePythonExec",
     "NodeMcp",
+    "NodeMemory",
     "NodeHook",
     "build_graph",
     "detect_cycles",

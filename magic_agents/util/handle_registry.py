@@ -102,6 +102,14 @@ CANONICAL_OUTPUT_HANDLES: Dict[str, Set[str]] = {
         'handle-debug-output',
         'handle-feedback-output',
     },
+    # Phase 2: NodeCodex output handles
+    ModelAgentFlowTypesModel.CODEX: {
+        'handle_user_message',
+    },
+    # Phase 2: NodeMemory output handles
+    ModelAgentFlowTypesModel.MEMORY: {
+        'handle_memory_output',
+    },
 }
 
 # NEW: Canonical input handles per node type (Phase 1)
@@ -149,6 +157,15 @@ CANONICAL_INPUT_HANDLES: Dict[str, Set[str]] = {
     # Phase 6: NodeHook input handles
     ModelAgentFlowTypesModel.HOOK: {
         'handle-hook-context',
+    },
+    # Phase 2: NodeCodex input handles
+    ModelAgentFlowTypesModel.CODEX: {
+        'handle_codex_input',
+    },
+    # Phase 2: NodeMemory input handles
+    ModelAgentFlowTypesModel.MEMORY: {
+        'handle_memory_input',
+        'handle-client-provider',
     },
 }
 
@@ -215,6 +232,16 @@ PORT_CARDINALITY: Dict[str, Dict[str, CardinalityInfo]] = {
         'handle-hook-context': CardinalityInfo(
             cardinality="one", exclusive=True
         ),
+    },
+    # Phase 2: NodeCodex cardinality
+    ModelAgentFlowTypesModel.CODEX: {
+        'handle_codex_input': CardinalityInfo(cardinality="one", exclusive=True),
+    },
+    # Phase 2: NodeMemory cardinality
+    # NOTE: handle-client-provider does NOT get a PORT_CARDINALITY entry.
+    # Per spec: the default (ambiguous) allows the edge without additional enforcement.
+    ModelAgentFlowTypesModel.MEMORY: {
+        'handle_memory_input': CardinalityInfo(cardinality="one", exclusive=True),
     },
 }
 
