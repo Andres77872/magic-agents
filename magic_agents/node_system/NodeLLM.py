@@ -7,7 +7,7 @@ from typing import Any, Optional, TYPE_CHECKING
 
 from magic_llm import MagicLLM
 from magic_llm.model import ModelChat
-from magic_llm.model.ModelChatStream import ChatCompletionModel, ChoiceModel
+from magic_llm.model.ModelChatStream import ChatCompletionModel, ChoiceModel, DeltaModel
 
 from magic_agents.models.factory.Nodes import LlmNodeModel
 from magic_agents.node_system.Node import Node
@@ -583,7 +583,9 @@ class NodeLLM(Node):
             yield self.yield_static(ChatCompletionModel(
                 id=uuid.uuid4().hex,
                 model=client.llm.model,
-                choices=[ChoiceModel()],
+                choices=[ChoiceModel(
+                    delta=DeltaModel(content=intention.content or '')
+                )],
                 usage=intention.usage),
                 content_type=self.OUTPUT_HANDLE_CONTENT)
         else:

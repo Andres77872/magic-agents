@@ -46,6 +46,7 @@ def _make_mock_graph(nodes_dict: dict, edges_list: list, debug: bool = True) -> 
     graph.nodes = nodes_dict
     graph.edges = edges_list
     graph.debug = debug
+    graph.timeout = 60  # Add timeout attribute to prevent AttributeError
     graph.resolved_debug_config = None  # Disable debug feedback for simpler tests
     graph._validation_errors = []
     graph.type = "graph"

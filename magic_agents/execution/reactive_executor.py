@@ -991,7 +991,7 @@ async def execute_graph_loop_reactive(
                 else:
                     # All other outputs stored using their handle name
                     node.outputs[item_type] = item["content"]
-    
+
     # Track bypassed nodes during static phase
     bypassed_nodes: Set[str] = set()
     
