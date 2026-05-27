@@ -760,6 +760,14 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
                 # NodeChat reads this from data and uses as base_messages
                 if history_messages is not None:
                     node['data']['history_messages'] = history_messages
+        elif node['type'] == ModelAgentFlowTypesModel.LLM:
+            # BACKEND-AUTHORITATIVE: Pass history_messages to LLM node data
+            # for no-CHAT graph path (e.g. playground inline graphs).
+            # NodeLLM reads this in process() when no handle-chat input exists
+            # and injects history before the current user message.
+            if history_messages is not None:
+                node['data'] = node.get('data', {})
+                node['data']['history_messages'] = history_messages
         elif node['type'] == ModelAgentFlowTypesModel.END:
             # END edges also get unique ID
             agt_data['edges'].append({

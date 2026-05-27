@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import model_validator
 
@@ -18,6 +18,7 @@ class LlmNodeModel(BaseNodeModel):
     max_tokens: Optional[int] = None
     max_output_tokens: Optional[int] = None  # alias for max_tokens
     iterate: Optional[bool] = False  # if true, rerun this LLM node on each Loop iteration
+    history_messages: Optional[list[dict[str, Any]]] = None  # Backend-injected history for no-CHAT graph path
 
     @model_validator(mode='after')
     def resolve_aliases(self):

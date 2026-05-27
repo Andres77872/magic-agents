@@ -80,6 +80,9 @@ class NodeLLM(Node):
         self._default_top_p = data.top_p
         self._default_max_tokens = data.max_tokens
         self._base_extra_data = dict(data.extra_data or {})
+        # Backend-injected history_messages for no-CHAT graph path
+        # (playground inline graphs without CHAT nodes)
+        self._history_messages = data.history_messages or []
         # allow re-execution inside Loop when requested
         self.iterate = self._default_iterate
         self.stream = self._default_stream
@@ -380,6 +383,21 @@ class NodeLLM(Node):
                 return
             sys_context = params.get(self.INPUT_HANDLER_SYSTEM_CONTEXT)
             chat = ModelChat(extract_message(sys_context) if sys_context else None)
+            # BACKEND-AUTHORITATIVE: Inject history_messages when no CHAT node provides them
+            # This enables playground inline graphs (user_input -> llm without CHAT node)
+            # to include loaded DB history in the ModelChat construction.
+            if self._history_messages:
+                logger.debug("NodeLLM:%s injecting %d history_messages (no-CHAT graph path)",
+                             self.node_id, len(self._history_messages))
+                for msg in self._history_messages:
+                    role = msg.get('role', 'user')
+                    content = extract_message(msg.get('content', ''))
+                    if role == 'user':
+                        chat.add_user_message(content)
+                    elif role == 'assistant':
+                        chat.add_assistant_message(content)
+                    elif role == 'system':
+                        chat.add_system_message(content)
             if k := params.get(self.INPUT_HANDLER_USER_MESSAGE):
                 chat.add_user_message(extract_message(k))
             else:
