@@ -463,7 +463,7 @@ class HookRelay(AgentHooks):
         context.outputs["iteration"] = iteration
         self._safe_invoke_sync("on_tool_end", context)
 
-        status = "error" if result.is_error else "completed"
+        status = "error" if result.is_error else "success"
         entry: Dict[str, Any] = {
             "role": "tool",
             "tool_call_id": result.tool_call_id or "",

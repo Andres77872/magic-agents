@@ -14,6 +14,75 @@ from magic_agents.util.primitive_coercion import coerce_primitive_by_type, input
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Redaction helper for diagnostic log output
+# ---------------------------------------------------------------------------
+
+_SENSITIVE_KEY_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in [
+        r'api.?key', r'secret', r'token', r'authorization',
+        r'auth', r'password', r'passwd', r'credential',
+        r'access.?key', r'private.?key',
+    ]
+]
+
+
+def _redact_body_preview(body_text: str, max_length: int = 500) -> str:
+    """Truncate and redact sensitive fields from a response body for logging.
+
+    For valid JSON objects at top level, key-based redaction is applied:
+    any key matching a sensitive pattern (api_key, secret, token, etc.)
+    has its value replaced with ``"[REDACTED]"``.  Non‑JSON bodies and
+    JSON arrays/lists receive truncation‑only treatment.
+
+    Args:
+        body_text: Raw response body text.
+        max_length: Maximum character length before truncation (default 500).
+
+    Returns:
+        Redacted body preview string safe for diagnostic log output.
+    """
+    truncated = body_text[:max_length]
+    try:
+        parsed = json.loads(truncated)
+    except json.JSONDecodeError:
+        # Non-JSON body: truncation only, no key-based redaction.
+        return truncated
+
+    if isinstance(parsed, dict):
+        # Depth-1 only: iterate top-level keys.
+        for key in list(parsed.keys()):
+            if any(pattern.search(key) for pattern in _SENSITIVE_KEY_PATTERNS):
+                parsed[key] = "[REDACTED]"
+
+    return json.dumps(parsed)
+
+
+def _json_parse_mapping(value: Any, field_name: str, tool_name: str, allow_none: bool = False) -> dict:
+    """Safely normalize a mapping field that may be a dict, JSON string, None, or invalid."""
+    if value is None:
+        return None if allow_none else {}
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return {} if not allow_none else None
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, dict):
+                return parsed
+            logger.warning(
+                "Tool '%s' %s parsed as JSON but not a dict (type=%s) — ignoring",
+                tool_name, field_name, type(parsed).__name__,
+            )
+        except json.JSONDecodeError:
+            logger.warning(
+                "Tool '%s' %s is invalid JSON — ignoring", tool_name, field_name,
+            )
+    return {} if not allow_none else None
+
 
 class FetchToolCallable:
     """Callable tool that executes HTTP fetches with Jinja2 templating.
@@ -44,6 +113,7 @@ class FetchToolCallable:
         self._tool_name = tool_name
         self._tool_description = tool_description or self._build_description()
         self._tool_parameters = tool_parameters  # Explicit schema params (optional)
+        self._constants: dict = {}  # Literal values from tool_parameters (constant mode)
         self._debug = debug
 
     @property
@@ -80,20 +150,40 @@ class FetchToolCallable:
         Otherwise, auto-generate from Jinja2 template variable extraction.
         """
         if self._tool_parameters:
-            # Use explicit tool_parameters from config
+            # Three-mode auto-detection: explicit schema, Jinja2, or constant
             properties = {}
             required = []
-            for param_name, param_def in self._tool_parameters.items():
-                properties[param_name] = {
-                    "type": param_def.get("type", "string"),
-                    "description": param_def.get("description", f"Parameter '{param_name}'"),
-                }
-                if param_def.get("required", False):
-                    required.append(param_name)
+            constants = {}
+            jinja2_pattern = re.compile(r'\{\{(\w+)\}\}')
 
-            # If no explicit required list, default to all params being required
-            if not required:
-                required = list(self._tool_parameters.keys())
+            for param_name, param_def in self._tool_parameters.items():
+                if isinstance(param_def, dict) and "type" in param_def:
+                    # Mode 3: Explicit schema (backward compat)
+                    properties[param_name] = {
+                        "type": param_def.get("type", "string"),
+                        "description": param_def.get("description", f"Parameter '{param_name}'"),
+                    }
+                    if param_def.get("required", False):
+                        required.append(param_name)
+                elif isinstance(param_def, str) and "{{" in param_def:
+                    # Mode 1: Jinja2 variable extraction
+                    vars_in_value = jinja2_pattern.findall(param_def)
+                    for var in vars_in_value:
+                        properties[var] = {
+                            "type": "string",
+                            "description": f"Template variable '{var}'",
+                        }
+                        required.append(var)
+                else:
+                    # Mode 2: Constant — store literal, do NOT expose as tool parameter
+                    constants[param_name] = param_def
+
+            # Persist constants for execution-time merge in __call__
+            self._constants = constants
+
+            # If no explicit required list and we have properties, default to all being required
+            if not required and properties:
+                required = list(properties.keys())
         else:
             # Auto-generate from Jinja2 template variables
             variables = self._extract_template_variables()
@@ -131,20 +221,77 @@ class FetchToolCallable:
     async def __call__(self, **kwargs: str) -> str:
         """Execute HTTP fetch with provided parameters as template context.
 
+        When ``_tool_parameters`` is set, it IS the request template — its
+        non‑schema entries (Jinja2 variables and literal constants) define
+        the effective request config (URL, method, headers, data, params,
+        and any extra body fields).  Explicit‑schema dicts (``{"type": …}``)
+        are only used for tool schema generation and are NOT applied here.
+
         Args:
             **kwargs: Template variables for URL, headers, body parameters.
 
         Returns:
-            Response body as JSON string, or error string on non-2xx.
+            Response body as JSON string, or error string on non‑2xx.
         """
         try:
-            # Render URL template
-            url_template = Template(resolve_env_placeholders(self._url))
+            # --- Phase 3: build effective request config from _tool_parameters ---
+            # When tool_parameters is set, it IS the request template.
+            # Render all non‑explicit‑schema entries, then use the result as
+            # overrides for the default request fields.
+            effective_url = self._url
+            effective_method = self._method
+            effective_headers = _json_parse_mapping(self._headers, "headers", self._tool_name)
+            effective_data = self._data
+            effective_json_data = self._json_data
+            effective_params = _json_parse_mapping(self._params, "params", self._tool_name, allow_none=True)
+
+            if self._tool_parameters:
+                rendered_config: dict[str, Any] = {}
+                jinja2_pattern = re.compile(r'\{\{(\w+)\}\}')
+                for key, value in self._tool_parameters.items():
+                    if isinstance(value, dict) and "type" in value:
+                        continue  # Mode 3: explicit schema only — skip for request execution
+                    if isinstance(value, str) and "{{" in value:
+                        # Mode 1: Jinja2 template — render with tool call args
+                        rendered_config[key] = Template(
+                            resolve_env_placeholders(value)
+                        ).render(kwargs)
+                    else:
+                        # Mode 2: literal constant — use as‑is
+                        rendered_config[key] = value
+
+                # Apply known request‑field overrides
+                if 'url' in rendered_config:
+                    effective_url = rendered_config['url']
+                if 'method' in rendered_config:
+                    effective_method = rendered_config['method']
+                if 'headers' in rendered_config:
+                    hv = rendered_config['headers']
+                    if isinstance(hv, dict):
+                        effective_headers.update(hv)
+                if 'data' in rendered_config:
+                    effective_data = rendered_config['data']
+                if 'json_data' in rendered_config:
+                    effective_json_data = rendered_config['json_data']
+                if 'params' in rendered_config:
+                    effective_params = rendered_config['params']
+
+                # Unknown entries → merge into JSON body as extra fields
+                known_keys = {'url', 'method', 'headers', 'data', 'json_data', 'params'}
+                extras = {k: v for k, v in rendered_config.items() if k not in known_keys}
+                if extras:
+                    if effective_json_data is None:
+                        effective_json_data = {}
+                    if isinstance(effective_json_data, dict):
+                        effective_json_data.update(extras)
+
+            # --- Render effective config with Jinja2 ---
+            url_template = Template(resolve_env_placeholders(effective_url))
             rendered_url = url_template.render(kwargs)
 
             # Render headers
             rendered_headers = {}
-            for k, v in self._headers.items():
+            for k, v in effective_headers.items():
                 if isinstance(v, str):
                     rendered_headers[k] = Template(resolve_env_placeholders(v)).render(kwargs)
                 else:
@@ -165,14 +312,14 @@ class FetchToolCallable:
                     }
                 return resolved
 
-            rendered_data = _render_template_value(self._data)
-            rendered_json_data = _render_template_value(self._json_data)
-            rendered_params = _render_template_value(self._params)
+            rendered_data = _render_template_value(effective_data)
+            rendered_json_data = _render_template_value(effective_json_data)
+            rendered_params = _render_template_value(effective_params)
 
             async with aiohttp.ClientSession() as session:
                 method_fn = session.request
                 fetch_kwargs: dict[str, Any] = {
-                    'method': self._method,
+                    'method': effective_method,
                     'url': rendered_url,
                     'headers': rendered_headers if isinstance(rendered_headers, dict) else json.loads(rendered_headers),
                 }
@@ -186,12 +333,31 @@ class FetchToolCallable:
                     fetch_kwargs['data'] = rendered_data if isinstance(rendered_data, dict) else json.loads(rendered_data)
 
                 if 'json' not in fetch_kwargs and 'data' not in fetch_kwargs:
-                    if self._method != 'GET':
-                        return json.dumps({"error": f"No body provided for {self._method} request"})
+                    if effective_method != 'GET':
+                        return json.dumps({"error": f"No body provided for {effective_method} request"})
 
                 async with method_fn(**fetch_kwargs) as response:
                     if response.status < 200 or response.status >= 300:
-                        return f"HTTP {response.status}: {response.reason}"
+                        # Read the response body — it is available even on
+                        # non‑2xx responses and must be passed to the agent.
+                        body_text = await response.text()
+                        redacted_preview = _redact_body_preview(body_text)
+
+                        # Safe URL: scheme + netloc + path only (no query/fragment)
+                        parts = urlsplit(rendered_url)
+                        safe_url = f"{parts.scheme}://{parts.netloc}{parts.path}"
+                        logger.warning(
+                            "Tool '%s' %s %s returned HTTP %d %s. Response body: %s",
+                            self._tool_name, effective_method, safe_url,
+                            response.status, response.reason,
+                            redacted_preview,
+                        )
+                        # Return the FULL unredacted body to the agent.
+                        # The redacted preview is ONLY for the log.
+                        return (
+                            f"HTTP {response.status}: {response.reason}"
+                            f"\n\nResponse body:\n{body_text}"
+                        )
                     body = await response.text()
                     # Try to parse as JSON for cleaner output
                     try:
@@ -200,10 +366,22 @@ class FetchToolCallable:
                         return body
 
         except aiohttp.ClientResponseError as e:
+            logger.warning(
+                "Tool '%s' caught aiohttp.ClientResponseError: HTTP %d %s",
+                self._tool_name, e.status, e.message,
+            )
             return f"HTTP {e.status}: {e.message}"
         except aiohttp.ClientError as e:
+            logger.warning(
+                "Tool '%s' caught %s: %s",
+                self._tool_name, type(e).__name__, str(e),
+            )
             return json.dumps({"error": f"Network error: {str(e)}"})
         except Exception as e:
+            logger.warning(
+                "Tool '%s' caught %s: %s",
+                self._tool_name, type(e).__name__, str(e),
+            )
             return json.dumps({"error": f"Unexpected error: {str(e)}"})
 
 

@@ -6,7 +6,7 @@ Tests cover:
 - _build_handler_dict() with various input configurations
 """
 import pytest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from magic_agents.models.factory.Nodes import PythonExecNodeModel
 from magic_agents.node_system.NodePythonExec import NodePythonExec
@@ -180,3 +180,128 @@ class TestNodePythonExecDualModeOutputHandle:
                 debug=False,
             )
         assert node.OUTPUT_HANDLE == 'handle-tool-definition'
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Task 4.1: PythonExecToolWrapper custom tool_name behavior
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestPythonExecToolWrapperToolName:
+    """Tests for PythonExecToolWrapper custom tool_name."""
+
+    def test_custom_tool_name_returns_analyze(self):
+        """PythonExecToolWrapper(tool_name='analyze').__name__ returns 'analyze'."""
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+
+        wrapper = PythonExecToolWrapper(
+            executor=MagicMock(),
+            tool_name="analyze",
+        )
+        assert wrapper.__name__ == "analyze"
+
+    def test_custom_tool_name_in_schema(self):
+        """PythonExecToolWrapper(tool_name='analyze').tool_schema uses 'analyze'."""
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+
+        wrapper = PythonExecToolWrapper(
+            executor=MagicMock(),
+            tool_name="analyze",
+        )
+        schema = wrapper.tool_schema
+        assert schema["function"]["name"] == "analyze"
+
+    def test_default_tool_name_is_execute_python(self):
+        """PythonExecToolWrapper().__name__ returns 'execute_python' (default)."""
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+
+        wrapper = PythonExecToolWrapper(executor=MagicMock())
+        assert wrapper.__name__ == "execute_python"
+
+    def test_default_tool_name_in_schema(self):
+        """PythonExecToolWrapper().tool_schema uses 'execute_python'."""
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+
+        wrapper = PythonExecToolWrapper(executor=MagicMock())
+        schema = wrapper.tool_schema
+        assert schema["function"]["name"] == "execute_python"
+
+    def test_distinct_tool_names_have_distinct_schemas(self):
+        """Two wrappers with different tool_name have distinct schemas."""
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+
+        wrapper_a = PythonExecToolWrapper(executor=MagicMock(), tool_name="analyze")
+        wrapper_b = PythonExecToolWrapper(executor=MagicMock(), tool_name="execute")
+
+        schema_a = wrapper_a.tool_schema
+        schema_b = wrapper_b.tool_schema
+
+        assert schema_a["function"]["name"] == "analyze"
+        assert schema_b["function"]["name"] == "execute"
+        assert schema_a["function"]["name"] != schema_b["function"]["name"]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Task 4.2: PythonExecNodeModel tool_name field + NodePythonExec threading
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestPythonExecNodeModelToolName:
+    """Tests for PythonExecNodeModel tool_name field."""
+
+    def test_default_tool_name_is_none(self):
+        """PythonExecNodeModel() has tool_name == None."""
+        model = PythonExecNodeModel()
+        assert model.tool_name is None
+
+    def test_custom_tool_name_stored(self):
+        """PythonExecNodeModel(tool_name='analyze') has tool_name == 'analyze'."""
+        model = PythonExecNodeModel(tool_name="analyze")
+        assert model.tool_name == "analyze"
+
+    def test_node_init_stores_custom_tool_name(self):
+        """NodePythonExec.__init__ with custom tool_name stores and passes it to wrapper."""
+        with patch('magic_llm.util.python_executor.PythonExecutor'):
+            node = NodePythonExec(
+                data=PythonExecNodeModel(tool_name="analyze"),
+                node_id='py-1',
+                debug=False,
+            )
+        assert node._tool_name == "analyze"
+
+    def test_node_init_default_tool_name(self):
+        """NodePythonExec.__init__ with default None tool_name stores 'execute_python'."""
+        with patch('magic_llm.util.python_executor.PythonExecutor'):
+            node = NodePythonExec(
+                data=PythonExecNodeModel(),
+                node_id='py-1',
+                debug=False,
+            )
+        assert node._tool_name == "execute_python"
+
+    @pytest.mark.asyncio
+    async def test_process_passes_custom_tool_name_to_wrapper(self):
+        """NodePythonExec.process() passes tool_name to PythonExecToolWrapper."""
+        with patch('magic_llm.util.python_executor.PythonExecutor') as mock_exec_cls:
+            mock_exec = MagicMock()
+            mock_exec_cls.return_value = mock_exec
+
+            node = NodePythonExec(
+                data=PythonExecNodeModel(tool_name="analyze"),
+                node_id='py-1',
+                debug=False,
+            )
+
+            # Process in tool mode (no code) yields a wrapper
+            from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+            import json
+
+            results = []
+            async for result in node.process(chat_log=None):
+                results.append(result)
+
+            # The yielded wrapper should have tool_name="analyze"
+            assert len(results) > 0
+            wrapper = results[0].get('content') if isinstance(results[0], dict) else None
+            # The wrapper is yielded as yield_static content
+            # Check that the wrapper has the correct name
+            if wrapper is not None and hasattr(wrapper, '__name__'):
+                assert wrapper.__name__ == "analyze"

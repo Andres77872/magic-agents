@@ -205,7 +205,7 @@ class TestBuildMessageInjection:
         assert ui_node._text == "test message"
 
     def test_build_injects_message_into_chat(self):
-        """CHAT node receives message via load_chat call."""
+        """CHAT node message is set via build() data injection (load_chat is NOT called for CHAT — backend-authoritative flow)."""
         agt = {
             "type": "graph",
             "nodes": [
@@ -218,16 +218,10 @@ class TestBuildMessageInjection:
                 {"id": "e2", "source": "chat", "target": "end"},
             ],
         }
-        captured_message = None
-        def capture_load_chat(**kw):
-            nonlocal captured_message
-            captured_message = kw.get("message")
-            return "mock_chat"
-        result = build(agt, message="chat message", load_chat=capture_load_chat)
+        result = build(agt, message="chat message", load_chat=None)
         chat_node = result.nodes.get("chat")
         assert chat_node is not None
         assert isinstance(chat_node, NodeChat)
-        assert captured_message == "chat message"
 
     def test_build_injects_images_into_user_input(self):
         """USER_INPUT node receives images list."""

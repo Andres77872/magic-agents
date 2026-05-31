@@ -3,7 +3,7 @@
 Container for MCP tools to yield to NodeLLM.
 """
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 
 @dataclass
@@ -27,6 +27,10 @@ class MCPToolBundle:
     discovered_count: int = 0  # Number of tools discovered (before filtering)
     filtered_count: int = 0  # Number of tools after filtering
     prefix: str = ""  # Applied prefix
+    
+    # MCP server instructions (from InitializeResult.instructions)
+    # Native MCP protocol field — no custom alias hacks
+    server_instructions: Optional[str] = None
     
     def __post_init__(self):
         """Validate bundle consistency."""

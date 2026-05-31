@@ -59,7 +59,7 @@ class TestHookRelayToolCollection:
         assert len(results) == 1
         assert results[0]["data"]["role"] == "tool"
         assert results[0]["data"]["tool_call_id"] == "call-abc123"
-        assert results[0]["data"]["status"] == "completed"
+        assert results[0]["data"]["status"] == "success"
         assert results[0]["data"]["execution_time_ms"] == 150.0
 
     def test_on_tool_complete_error_sets_status_and_error(self):
@@ -130,7 +130,7 @@ class TestHookRelayToolCollection:
         # Tool result message shape
         assert events[1]["data"]["role"] == "tool"
         assert events[1]["data"]["tool_call_id"] == "call-1"
-        assert events[1]["data"]["status"] == "completed"
+        assert events[1]["data"]["status"] == "success"
         assert events[1]["data"]["execution_time_ms"] == 120.0
 
     def test_empty_relay_returns_empty_lists(self):

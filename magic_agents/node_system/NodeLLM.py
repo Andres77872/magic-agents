@@ -11,6 +11,7 @@ from magic_llm.model.ModelChatStream import ChatCompletionModel, ChoiceModel, De
 
 from magic_agents.models.factory.Nodes import LlmNodeModel
 from magic_agents.node_system.Node import Node
+from magic_agents.node_system.utils import apply_windowing
 from magic_agents.util.primitive_coercion import coerce_primitive_by_type, input_has_value
 
 if TYPE_CHECKING:
@@ -43,7 +44,9 @@ class NodeLLM(Node):
     # Tool input handle prefix — dynamic collection from tool-prefixed handles
     DEFAULT_INPUT_TOOL_PREFIX = 'handle-tool-'
     # Engines known to NOT support tools via kwargs
-    _UNSUPPORTED_ENGINES = {'google', 'cohere', 'cloudflare'}
+    _UNSUPPORTED_ENGINES = {'cohere', 'cloudflare'}
+    # Default max_messages for no-CHAT fallback path (L2)
+    DEFAULT_MAX_MESSAGES = 30
 
     def __init__(self,
                  data: LlmNodeModel,
@@ -83,6 +86,10 @@ class NodeLLM(Node):
         # Backend-injected history_messages for no-CHAT graph path
         # (playground inline graphs without CHAT nodes)
         self._history_messages = data.history_messages or []
+        # STM windowing fields (no-CHAT fallback path)
+        self._max_messages = data.max_messages
+        self._max_input_tokens = data.max_input_tokens
+        self._truncation_strategy = data.truncation_strategy
         # allow re-execution inside Loop when requested
         self.iterate = self._default_iterate
         self.stream = self._default_stream
@@ -121,13 +128,14 @@ class NodeLLM(Node):
 
         return extra_data
 
-    async def _collect_tools(self) -> tuple[list, dict]:
+    async def _collect_tools(self) -> tuple[list, dict, dict[str, str]]:
         """Collect all tool definitions from tool-prefixed input handles.
 
         Scans self.inputs for keys starting with the tool prefix.
-        Returns a tuple of (tools_schemas, tool_functions):
+        Returns a tuple of (tools_schemas, tool_functions, mcp_instructions):
           - tools_schemas: list of OpenAI-compatible tool definition dicts
           - tool_functions: dict mapping tool name -> callable executor
+          - mcp_instructions: dict mapping MCP server key -> server.instructions text
 
         For objects conforming to the ToolProvider protocol, extracts
         both tool_schema and tool_callable. For plain callables, uses
@@ -137,15 +145,17 @@ class NodeLLM(Node):
         Extended to support MCPToolBundle (multi-tool) inputs from MCP nodes:
           - MCPToolBundle.tool_schemas[] -> extend schema list
           - MCPToolBundle.tool_functions{} -> merge into functions dict
-          - Collision detection raises MCPToolNameCollisionError
-        
+          - Collision detection raises ToolNameCollisionError
+          - MCP server.instructions collected for tool manifest
+
         Task subagents are loaded via MagicLLM.load_subagents() in process(),
         not collected here. magic-llm owns all subagent architecture.
         """
-        from magic_agents.mcp.errors import MCPToolNameCollisionError
+        from magic_agents.mcp.errors import ToolNameCollisionError
         
         tools_schemas = []
         tool_functions = {}
+        mcp_instructions: dict[str, str] = {}
 
         for handle_name, value in sorted(self.inputs.items()):
             if not handle_name.startswith(self.INPUT_TOOL_PREFIX):
@@ -165,7 +175,7 @@ class NodeLLM(Node):
                     if tool_name in tool_functions:
                         # Collision detected - find source nodes
                         existing_source = getattr(tool_functions[tool_name], '_mcp_node_id', None) or 'existing_tool'
-                        raise MCPToolNameCollisionError(
+                        raise ToolNameCollisionError(
                             tool_name=tool_name,
                             source_nodes=[existing_source, bundle_node_id]
                         )
@@ -179,6 +189,11 @@ class NodeLLM(Node):
                     if not hasattr(func, '_mcp_node_id'):
                         func._mcp_node_id = bundle_node_id
                     tool_functions[tool_name] = func
+                
+                # Collect MCP server.instructions for tool manifest
+                if hasattr(value, 'server_instructions') and value.server_instructions:
+                    server_key = getattr(value, 'server_key', '') or bundle_node_id
+                    mcp_instructions[server_key] = value.server_instructions
                 
                 logger.debug(
                     "NodeLLM:%s flattened MCP bundle from node '%s': %d tools (prefix='%s')",
@@ -196,10 +211,13 @@ class NodeLLM(Node):
                     if name:
                         # Collision detection for single tools too
                         if name in tool_functions:
-                            raise MCPToolNameCollisionError(
+                            existing_source = getattr(tool_functions[name], '_source_node_id', None) or 'existing_tool'
+                            raise ToolNameCollisionError(
                                 tool_name=name,
-                                source_nodes=['existing_tool', self.node_id]
+                                source_nodes=[existing_source, self.node_id]
                             )
+                        # Tag with source node ID for collision tracking
+                        value.tool_callable._source_node_id = self.node_id
                         tool_functions[name] = value.tool_callable
             
             # Plain callable: schema auto-extracted by magic-llm
@@ -208,10 +226,13 @@ class NodeLLM(Node):
                 name = getattr(value, '__name__', None)
                 if name:
                     if name in tool_functions:
-                        raise MCPToolNameCollisionError(
+                        existing_source = getattr(tool_functions[name], '_source_node_id', None) or 'existing_tool'
+                        raise ToolNameCollisionError(
                             tool_name=name,
-                            source_nodes=['existing_tool', self.node_id]
+                            source_nodes=[existing_source, self.node_id]
                         )
+                    # Tag with source node ID for collision tracking
+                    value._source_node_id = self.node_id
                     tool_functions[name] = value
             
             # Schema-only dict (no executor)
@@ -222,18 +243,25 @@ class NodeLLM(Node):
         # in process() where the client is available.
         # magic-llm owns ALL subagent architecture — no local registry.
 
-        return tools_schemas, tool_functions
+        return tools_schemas, tool_functions, mcp_instructions
 
     def _warn_unsupported_engine(self, client) -> None:
-        """Log a warning if the configured engine does not support tools."""
+        """Log a warning if the configured engine does not support tools.
+        
+        NOTE: This is a warning ONLY — not a RuntimeError. The system does NOT
+        implement broad strict provider/engine pre-validation based on fragile
+        unsupported lists. If a provider fails at runtime due to tool
+        incompatibility, the real runtime error from the provider API surfaces
+        with context.
+        """
         engine = getattr(client.llm, 'engine_name', '') or getattr(client, 'engine', '')
         engine_lower = (engine or '').lower()
         for unsupported in self._UNSUPPORTED_ENGINES:
             if unsupported in engine_lower:
                 logger.warning(
-                    "NodeLLM:%s engine '%s' does not support tools — "
-                    "tools will be passed but may be ignored by the provider. "
-                    "This is a known limitation (WIP).",
+                    "NodeLLM:%s engine '%s' has no function-calling support based on project records — "
+                    "tools will be passed in the schema but may not be invocable by this provider. "
+                    "If you encounter issues, switch to an OpenAI-compatible provider.",
                     self.node_id, engine
                 )
                 break
@@ -291,6 +319,119 @@ class NodeLLM(Node):
             )
         
         return bundle
+
+    def _build_tool_manifest(
+        self,
+        tools_schemas: list[dict],
+        tool_functions: dict,
+        subagent_bundle: Optional["SubagentBundle"] = None,
+        mcp_instructions: Optional[dict[str, str]] = None,
+    ) -> str:
+        """Generate structured markdown tool manifest for the system prompt.
+
+        Lists all available tools with their actual callable names, descriptions,
+        parameters, and source node IDs. Includes separate sections for subagent
+        tools and MCP usage guidance when available.
+
+        The manifest is informational context for the LLM. It does NOT replace
+        or duplicate the provider API ``tools`` parameter — the ``tools_schemas``
+        list continues to be passed as the provider API parameter.
+
+        Max 4096 characters with warning when truncated.
+
+        Args:
+            tools_schemas: List of OpenAI-compatible tool definition dicts.
+            tool_functions: Dict mapping tool name -> callable executor.
+            subagent_bundle: Optional SubagentBundle with subagent schemas.
+            mcp_instructions: Optional dict mapping MCP server key -> instructions text.
+
+        Returns:
+            Markdown manifest string, max 4096 chars (empty if no tools).
+        """
+        lines = []
+
+        # Section 1: Available Tools (graph tools)
+        has_graph_tools = bool(tools_schemas)
+        if has_graph_tools:
+            lines.append("## Available Tools")
+            lines.append("")
+            for schema in tools_schemas:
+                func = schema.get("function", {})
+                name = func.get("name", "unknown")
+                desc = func.get("description", "")
+                params = func.get("parameters", {})
+
+                # Get source node ID from tool_functions if available
+                callable_obj = tool_functions.get(name)
+                source_id = ""
+                if callable_obj is not None:
+                    source_id = getattr(callable_obj, '_source_node_id', '') or getattr(callable_obj, '_mcp_node_id', '')
+
+                lines.append(f"### Tool: {name}")
+                if desc:
+                    lines.append(f"- **Description**: {desc}")
+                if params:
+                    props = params.get("properties", {})
+                    if props:
+                        param_str = ", ".join(
+                            f"`{pname}` ({pinfo.get('type', 'any')})"
+                            for pname, pinfo in props.items()
+                        )
+                        lines.append(f"- **Parameters**: {param_str}")
+                if source_id:
+                    lines.append(f"- **Source**: `{source_id}`")
+                lines.append("")
+
+        # Section 2: Subagent Tools
+        has_subagent_tools = (
+            subagent_bundle is not None
+            and subagent_bundle.registered_count > 0
+            and subagent_bundle.tool_schemas
+        )
+        if has_subagent_tools:
+            lines.append("## Subagent Tools")
+            lines.append("")
+            for schema in subagent_bundle.tool_schemas:
+                func = schema.get("function", {})
+                name = func.get("name", "unknown")
+                desc = func.get("description", "")
+                params = func.get("parameters", {})
+
+                lines.append(f"- **{name}**")
+                if desc:
+                    lines.append(f"  - Description: {desc}")
+                if params:
+                    props = params.get("properties", {})
+                    if props:
+                        param_str = ", ".join(
+                            f"`{pname}` ({pinfo.get('type', 'any')})"
+                            for pname, pinfo in props.items()
+                        )
+                        lines.append(f"  - Parameters: {param_str}")
+                lines.append("")
+
+        # Section 3: MCP Usage Guidance
+        if mcp_instructions:
+            lines.append("## Usage Guidance")
+            lines.append("")
+            for server_key, instructions_text in mcp_instructions.items():
+                lines.append(f"### MCP Server: {server_key}")
+                lines.append(instructions_text)
+                lines.append("")
+
+        manifest = "\n".join(lines).strip()
+
+        # Truncation at 4096 chars with warning
+        if len(manifest) > 4096:
+            logger.warning(
+                "NodeLLM:%s tool manifest truncated at 4096 characters (was %d chars). "
+                "Consider reducing tool descriptions or parameter definitions.",
+                self.node_id,
+                len(manifest)
+            )
+            manifest = manifest[:4096]
+
+        return manifest
 
     def _create_hook_relay(self, client: Any = None) -> Any:
         """Create a HookRelay for tool call/result collection.
@@ -387,6 +528,25 @@ class NodeLLM(Node):
             # This enables playground inline graphs (user_input -> llm without CHAT node)
             # to include loaded DB history in the ModelChat construction.
             if self._history_messages:
+                # Apply STM windowing (no-CHAT fallback path) (M1)
+                # Default max_messages=30 when not configured (L2)
+                effective_max_messages = (
+                    self._max_messages if self._max_messages is not None
+                    else NodeLLM.DEFAULT_MAX_MESSAGES
+                )
+
+                if effective_max_messages is not None or self._max_input_tokens is not None:
+                    logger.debug(
+                        "NodeLLM:%s applying no-CHAT windowing: max_messages=%s, max_input_tokens=%s",
+                        self.node_id, effective_max_messages, self._max_input_tokens
+                    )
+                    self._history_messages = apply_windowing(
+                        messages=self._history_messages,
+                        max_messages=effective_max_messages,
+                        max_input_tokens=self._max_input_tokens,
+                        truncation_strategy=self._truncation_strategy or 'tail',
+                    )
+
                 logger.debug("NodeLLM:%s injecting %d history_messages (no-CHAT graph path)",
                              self.node_id, len(self._history_messages))
                 for msg in self._history_messages:
@@ -414,7 +574,7 @@ class NodeLLM(Node):
                 return
 
         # Collect tools from tool-prefixed input handles
-        tools_schemas, tool_functions = await self._collect_tools()
+        tools_schemas, tool_functions, mcp_instructions = await self._collect_tools()
         
         # Load task subagents via magic-llm unified API (if feature enabled)
         # magic-llm handles discovery → registration → tool schema injection
@@ -422,6 +582,15 @@ class NodeLLM(Node):
         
         # Extend schemas with subagent tool schemas if any registered
         if subagent_bundle.registered_count > 0:
+            # Collision check: subagent tool names against existing graph tool schemas
+            existing_names = {s.get("function", {}).get("name") for s in tools_schemas if "function" in s}
+            for schema in subagent_bundle.tool_schemas:
+                name = schema.get("function", {}).get("name")
+                if name and name in existing_names:
+                    raise ToolNameCollisionError(
+                        tool_name=name,
+                        source_nodes=["graph_tool", "subagent"]
+                    )
             tools_schemas.extend(subagent_bundle.tool_schemas)
             # NOTE: tool_functions NOT merged — magic-llm routes via TaskExecutor
             # which wraps callables with safeguards (depth, timeout, semaphore)
@@ -440,6 +609,17 @@ class NodeLLM(Node):
                 sys_msg = None
                 if sys_ctx := self.get_input(self.INPUT_HANDLER_SYSTEM_CONTEXT):
                     sys_msg = extract_message(sys_ctx)
+
+                # Inject tool manifest into system prompt when tools exist
+                if tools_schemas or (subagent_bundle and subagent_bundle.registered_count > 0):
+                    manifest = self._build_tool_manifest(
+                        tools_schemas=tools_schemas,
+                        tool_functions=tool_functions,
+                        subagent_bundle=subagent_bundle,
+                        mcp_instructions=mcp_instructions,
+                    )
+                    if manifest:
+                        sys_msg = manifest + "\n\n" + (sys_msg or "")
 
                 if not hasattr(client, 'run_agent_async'):
                     # Fallback: wrap sync run_agent via asyncio.to_thread
@@ -474,6 +654,7 @@ class NodeLLM(Node):
                         tools=tools_schemas,
                         tool_functions=tool_functions,
                         hooks=hook_relay,
+                        task_executor=None,
                         **self.extra_data
                     )
                     await hook_relay.flush_pending_hooks()
@@ -618,6 +799,17 @@ class NodeLLM(Node):
                 if sys_ctx := self.get_input(self.INPUT_HANDLER_SYSTEM_CONTEXT):
                     sys_msg = extract_message(sys_ctx)
 
+                # Inject tool manifest into system prompt when tools exist
+                if tools_schemas or (subagent_bundle and subagent_bundle.registered_count > 0):
+                    manifest = self._build_tool_manifest(
+                        tools_schemas=tools_schemas,
+                        tool_functions=tool_functions,
+                        subagent_bundle=subagent_bundle,
+                        mcp_instructions=mcp_instructions,
+                    )
+                    if manifest:
+                        sys_msg = manifest + "\n\n" + (sys_msg or "")
+
                 if not hasattr(client, 'run_agent_stream_async'):
                     # Fallback: wrap sync run_agent_stream via asyncio.to_thread
                     logger.warning(
@@ -676,7 +868,7 @@ class NodeLLM(Node):
                             tools=tools_schemas,
                             tool_functions=tool_functions,
                             hooks=hook_relay,
-                            task_executor=getattr(subagent_bundle, 'task_executor', None),
+                            task_executor=None,
                             **self.extra_data
                         ):
                             self.generated += chunk.choices[0].delta.content or ''
@@ -909,6 +1101,12 @@ class NodeLLM(Node):
         state['iterate'] = self.iterate
         state['generated'] = self.generated[:500] if len(self.generated) > 500 else self.generated  # Truncate long outputs
         state['extra_data'] = self.extra_data
+        
+        # STM windowing diagnostics (no-CHAT path) (M3)
+        state['max_messages'] = self._max_messages
+        state['max_input_tokens'] = self._max_input_tokens
+        state['truncation_strategy'] = self._truncation_strategy
+        state['history_messages_count'] = len(self._history_messages)
         
         return state
     

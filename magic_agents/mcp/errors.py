@@ -88,11 +88,12 @@ class MCPToolError(Exception):
         )
 
 
-class MCPToolNameCollisionError(Exception):
+class ToolNameCollisionError(Exception):
     """Tool name collision error.
     
-    Raised when multiple MCP nodes expose tools with the same
-    prefixed name, which would cause ambiguity in tool execution.
+    Raised when multiple tools (graph tools, MCP bundles, subagents, callables)
+    expose the same name to the same LLM node, which would cause ambiguity.
+    This is the generic base class for all tool name collisions.
     """
     
     def __init__(
@@ -105,3 +106,14 @@ class MCPToolNameCollisionError(Exception):
         super().__init__(
             f"Tool name collision: '{tool_name}' exposed by nodes {', '.join(source_nodes)}"
         )
+
+
+class MCPToolNameCollisionError(ToolNameCollisionError):
+    """Tool name collision error (MCP-specific subclass).
+    
+    DEPRECATED: Use ToolNameCollisionError for new code.
+    Retained as backward-compatible subclass.
+    
+    Raised when multiple MCP bundles expose tools with the same
+    prefixed name, which would cause ambiguity in tool execution.
+    """

@@ -49,16 +49,18 @@ class PythonExecToolWrapper:
         code_runner: Optional[CodeRunner] = None,
         node_code: Optional[str] = None,
         node_id: Optional[str] = None,
+        tool_name: str = "execute_python",
     ):
         self._executor = executor
         self._code_runner = code_runner
         self._node_code = node_code
         self._node_id = node_id
+        self._tool_name = tool_name
 
     @property
     def __name__(self) -> str:
         """Return the tool name for tool_functions registration."""
-        return "execute_python"
+        return self._tool_name
 
     @property
     def tool_schema(self) -> dict:
@@ -69,7 +71,7 @@ class PythonExecToolWrapper:
         return {
             "type": "function",
             "function": {
-                "name": "execute_python",
+                "name": self._tool_name,
                 "description": "Execute Python code via run(handler) contract",
                 "parameters": {
                     "type": "object",
@@ -175,6 +177,7 @@ class NodePythonExec(Node):
         super().__init__(**kwargs)
         self._code = data.code  # NEW: store code for mode detection
         self._data = data
+        self._tool_name = data.tool_name or "execute_python"
         self._default_safety_mode = getattr(data, 'safety_mode', 'subprocess')
         self._default_timeout = getattr(data, 'timeout', 30.0)
         self._default_max_output_chars = getattr(data, 'max_output_chars', 8000)
@@ -354,6 +357,7 @@ class NodePythonExec(Node):
             code_runner=self._code_runner,
             node_code=self._code,
             node_id=self.node_id,
+            tool_name=self._tool_name,
         )
 
         yield self.yield_static(wrapped_tool, content_type=self.OUTPUT_HANDLE)

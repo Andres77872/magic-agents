@@ -32,7 +32,7 @@ class NodeMcp(Node):
     
     In v1:
     - One MCP server per node (servers list length = 1)
-    - server.instructions ignored (deferred)
+    - server.instructions collected and injected into tool manifest
     - tools/list_changed ignored during run (refresh on next execution)
     """
     
@@ -148,6 +148,16 @@ class NodeMcp(Node):
                 timeout=server_config.tool_timeout
             )
             self._bundle = dispatcher.build_bundle(mapped_tools, self.node_id)
+            
+            # Collect native MCP server.instructions (from InitializeResult)
+            # Native MCP protocol field — no custom alias hacks or override wrappers
+            if self._session and self._session.server_instructions:
+                self._bundle.server_instructions = self._session.server_instructions
+                logger.debug(
+                    "NodeMcp:%s collected server.instructions (%d chars)",
+                    self.node_id,
+                    len(self._session.server_instructions)
+                )
             
             # Step 5: Yield bundle to downstream LLM node
             yield self.yield_static(self._bundle, content_type=self.OUTPUT_HANDLE)

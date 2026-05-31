@@ -12,6 +12,8 @@ from unittest.mock import patch
 
 import pytest
 
+from pydantic import ValidationError
+
 from magic_agents.agt_flow import create_node
 from magic_agents.models.factory.Nodes import ModelAgentFlowTypesModel
 from magic_agents.node_system import (
@@ -77,7 +79,7 @@ class TestCreateNodeAllTypes:
             assert isinstance(node, expected_class)
             return
         elif node_type == ModelAgentFlowTypesModel.LLM:
-            node_def["data"] = {"model": "gpt-4"}
+            node_def["data"] = {"temperature": 0.7}
 
         node = create_node(node_def, load_chat=None)
         assert isinstance(node, expected_class), (
@@ -86,7 +88,7 @@ class TestCreateNodeAllTypes:
         )
 
     def test_create_node_codex_invalid_uuid(self):
-        """CODEX type with invalid UUID returns NodeEND stub with NodeValidationError."""
+        """CODEX type with invalid UUID raises ValidationError (no stub)."""
         node_def = {
             "id": "codex-bad",
             "type": ModelAgentFlowTypesModel.CODEX,
@@ -98,10 +100,8 @@ class TestCreateNodeAllTypes:
                 }]
             },
         }
-        node = create_node(node_def, load_chat=None)
-        assert isinstance(node, NodeEND)
-        assert hasattr(node, "_error_info")
-        assert node._error_info["error_type"] == "NodeValidationError"
+        with pytest.raises(ValidationError):
+            create_node(node_def, load_chat=None)
 
     def test_create_node_memory_with_deps(self):
         """MEMORY node receives deps injection for vector_db."""
@@ -130,7 +130,7 @@ class TestCreateNodeAllTypes:
         assert state["vector_db_backend"] == "ephemeral"
 
     def test_create_node_memory_rejects_manual_id(self):
-        """Memory entry with manual id returns NodeEND stub with NodeValidationError."""
+        """Memory entry with manual id raises ValidationError (no stub)."""
         node_def = {
             "id": "mem-bad",
             "type": ModelAgentFlowTypesModel.MEMORY,
@@ -138,43 +138,31 @@ class TestCreateNodeAllTypes:
                 "memory_entries": [{"id": "abc", "content": "x"}],
             },
         }
-        node = create_node(node_def, load_chat=None)
-        assert isinstance(node, NodeEND)
-        assert hasattr(node, "_error_info")
-        assert node._error_info["error_type"] == "NodeValidationError"
+        with pytest.raises(ValidationError):
+            create_node(node_def, load_chat=None)
 
     def test_create_node_chat_with_load_chat(self):
-        """CHAT node receives load_chat callable and message."""
-        captured = {}
-        def capture_load_chat(**kw):
-            captured.update(kw)
-            return "mock_chat"
+        """CHAT node is created with validated ChatNodeModel (load_chat is NOT called for CHAT — it's only used by NodeInner)."""
         node_def = {
             "id": "chat-1",
             "type": ModelAgentFlowTypesModel.CHAT,
             "data": {"message": "hello chat"},
         }
-        node = create_node(node_def, load_chat=capture_load_chat)
+        node = create_node(node_def, load_chat=None)
         assert isinstance(node, NodeChat)
-        assert captured.get("message") == "hello chat"
 
 
 class TestCreateNodeUnsupportedType:
     """Test create_node() handles unsupported node types."""
 
     def test_create_node_unsupported_type(self):
-        """Unsupported type returns NodeEND stub with _error_info."""
+        """Unsupported type raises ValueError (no stub)."""
         node_def = {
             "id": "bad-node",
             "type": "nonexistent_type",
         }
-        node = create_node(node_def, load_chat=None)
-        assert isinstance(node, NodeEND)
-        assert hasattr(node, "_error_info")
-        assert node._error_info["error_type"] == "UnsupportedNodeType"
-        assert node._error_info["node_id"] == "bad-node"
-        assert "nonexistent_type" in node._error_info["error_message"]
-        assert "available_types" in node._error_info
+        with pytest.raises(ValueError, match="Unsupported node type: nonexistent_type"):
+            create_node(node_def, load_chat=None)
 
 
 class TestCreateNodeConditionalValidation:
@@ -196,7 +184,7 @@ class TestCreateNodeConditionalValidation:
         assert node.merge_strategy == "flat"
 
     def test_create_node_conditional_invalid_config(self):
-        """Invalid conditional config returns NodeEND stub with error."""
+        """Invalid conditional config raises ValidationError (no stub)."""
         node_def = {
             "id": "cond-bad",
             "type": ModelAgentFlowTypesModel.CONDITIONAL,
@@ -205,23 +193,18 @@ class TestCreateNodeConditionalValidation:
                 "merge_strategy": "invalid_strategy",
             },
         }
-        node = create_node(node_def, load_chat=None)
-        assert isinstance(node, NodeEND)
-        assert hasattr(node, "_error_info")
-        assert node._error_info["error_type"] == "ConditionalValidationError"
+        with pytest.raises(ValidationError):
+            create_node(node_def, load_chat=None)
 
     def test_create_node_conditional_empty_condition(self):
-        """Empty condition string returns NodeEND stub."""
+        """Empty condition string raises ValidationError (no stub)."""
         node_def = {
             "id": "cond-empty",
             "type": ModelAgentFlowTypesModel.CONDITIONAL,
             "data": {"condition": ""},
         }
-        node = create_node(node_def, load_chat=None)
-        assert isinstance(node, NodeEND)
-        assert hasattr(node, "_error_info")
-        # Pydantic validates string_too_short for empty condition
-        assert "ConditionalValidationError" in node._error_info["error_type"]
+        with pytest.raises(ValidationError):
+            create_node(node_def, load_chat=None)
 
 
 class TestCreateNodeInnerRecursive:

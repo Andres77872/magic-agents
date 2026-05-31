@@ -237,14 +237,19 @@ class TestImageJsonGraph:
     
     @pytest.fixture
     def image_json_config(self):
-        """Load the image.json config."""
+        """Load the image.json config and strip metadata from node data."""
         import os
         config_path = os.path.join(
             os.path.dirname(__file__), 
             "..", "examples", "json", "image.json"
         )
         with open(config_path, "r") as f:
-            return json.load(f)
+            cfg = json.load(f)
+        # Strip metadata from node data — UserInputNodeModel uses extra='forbid'
+        for node in cfg.get('content', cfg).get('nodes', []):
+            node_data = node.get('data', {})
+            node_data.pop('metadata', None)
+        return cfg
     
     def test_image_json_loads_correctly(self, image_json_config):
         """Test that image.json loads and builds correctly."""

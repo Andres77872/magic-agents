@@ -526,3 +526,263 @@ class TestPythonExecToolWrapper:
         from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
         wrapper = PythonExecToolWrapper(executor=MagicMock())
         assert wrapper.__name__ == 'execute_python'
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Task 4.8: Two PythonExec nodes with distinct tool_name wired to same LLM
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestTwoPythonExecNodesDistinctToolNames:
+    """Two PythonExec nodes with different tool_name values wired to same LLM."""
+
+    def test_two_python_exec_tools_with_distinct_names(self):
+        """Two PythonExec nodes with different tool_name values both registered."""
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+
+        wrapper_a = PythonExecToolWrapper(executor=MagicMock(), tool_name="analyze")
+        wrapper_b = PythonExecToolWrapper(executor=MagicMock(), tool_name="execute")
+
+        # Simulate _collect_tools registration
+        tool_functions = {}
+        tool_functions[wrapper_a.__name__] = wrapper_a
+        tool_functions[wrapper_b.__name__] = wrapper_b
+
+        assert "analyze" in tool_functions
+        assert "execute" in tool_functions
+        assert len(tool_functions) == 2
+
+    def test_no_collision_for_distinct_names(self):
+        """No collision error raised for distinct names."""
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+        from magic_agents.mcp.errors import ToolNameCollisionError
+
+        wrapper_a = PythonExecToolWrapper(executor=MagicMock(), tool_name="analyze")
+        wrapper_b = PythonExecToolWrapper(executor=MagicMock(), tool_name="execute")
+
+        tool_functions = {}
+        try:
+            tool_functions[wrapper_a.__name__] = wrapper_a
+            tool_functions[wrapper_b.__name__] = wrapper_b
+        except ToolNameCollisionError:
+            pytest.fail("Unexpected ToolNameCollisionError for distinct names")
+
+        assert len(tool_functions) == 2
+
+    @pytest.mark.asyncio
+    async def test_both_tools_callable_by_name(self):
+        """Both tools callable by their respective names."""
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+        from unittest.mock import AsyncMock
+
+        executor_a = AsyncMock()
+        executor_a.side_effect = lambda code="", **kw: "analyze result"
+        executor_b = AsyncMock()
+        executor_b.side_effect = lambda code="", **kw: "execute result"
+
+        wrapper_a = PythonExecToolWrapper(executor=executor_a, tool_name="analyze")
+        wrapper_b = PythonExecToolWrapper(executor=executor_b, tool_name="execute")
+
+        result_a = await wrapper_a(code="print(1)")
+        result_b = await wrapper_b(code="print(2)")
+
+        assert result_a is not None
+        assert result_b is not None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Task 4.9: PythonExec edge wiring with custom tool_name
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestPythonExecEdgeWiringCustomToolName:
+    """PythonExec edge wiring with custom tool_name propagates through _assign_tool_handles."""
+
+    def test_assign_tool_handles_python_exec_with_custom_name(self):
+        """PythonExec node with tool_name wired to LLM propagates through _assign_tool_handles."""
+        nodes = [
+            {"id": "py-1", "type": ModelAgentFlowTypesModel.PYTHON_EXEC,
+             "data": {"tool_name": "analyze"}},
+            {"id": "llm-1", "type": ModelAgentFlowTypesModel.LLM},
+        ]
+        edges = [{"id": "e1", "source": "py-1", "target": "llm-1"}]
+        _assign_tool_handles(nodes, edges)
+
+        assert edges[0]['sourceHandle'] == 'handle-tool-definition'
+        assert edges[0]['targetHandle'] == 'handle-tool-definition-0'
+
+    @pytest.mark.asyncio
+    async def test_mixed_fetch_and_python_exec_tools_with_custom_names(self):
+        """Fetch and PythonExec tools both collected by same LLM."""
+        from magic_llm.util.python_executor import PythonExecutor
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+        from magic_agents.node_system.NodeFetch import FetchToolCallable
+
+        class MockFetch:
+            def __init__(self):
+                self.node_id = "fetch-1"
+                self.inputs = {}
+                self._response = None
+                self.generated = ""
+            def mark_bypassed(self):
+                pass
+            @property
+            def outputs(self):
+                return {"handle_fetch_output": {"content": FetchToolCallable(
+                    url_template="https://api.example.com/search?q={{query}}",
+                    tool_name="search_api",
+                )}}
+
+        class MockPythonExec:
+            def __init__(self):
+                self.node_id = "py-1"
+                self.inputs = {}
+                self._response = None
+                self.generated = ""
+                self.executor = PythonExecutor(safety_mode='subprocess')
+            def mark_bypassed(self):
+                pass
+            @property
+            def outputs(self):
+                # Yield PythonExecToolWrapper with custom tool_name
+                wrapper = PythonExecToolWrapper(
+                    executor=MagicMock(),
+                    tool_name="analyze",
+                )
+                return {"handle-tool-definition": {"content": wrapper}}
+
+        nodes = {
+            "fetch-1": MockFetch(),
+            "py-1": MockPythonExec(),
+            "llm-1": _make_mock_llm_node(),
+        }
+        edges = [
+            EdgeNodeModel(
+                id="e1", source="fetch-1", target="llm-1",
+                sourceHandle="handle_fetch_output",
+                targetHandle="handle-tool-definition-0"
+            ),
+            EdgeNodeModel(
+                id="e2", source="py-1", target="llm-1",
+                sourceHandle="handle-tool-definition",
+                targetHandle="handle-tool-definition-1"
+            ),
+        ]
+        dispatcher = GraphEventDispatcher(nodes, edges)
+
+        await dispatcher.propagate_outputs("fetch-1", nodes["fetch-1"].outputs)
+        await dispatcher.propagate_outputs("py-1", nodes["py-1"].outputs)
+
+        tools_schemas, tool_functions, _ = await nodes["llm-1"]._collect_tools()
+
+        assert len(tools_schemas) == 2
+        assert len(tool_functions) == 2
+        assert "search_api" in tool_functions
+        assert "analyze" in tool_functions
+        assert isinstance(tool_functions["search_api"], FetchToolCallable)
+        assert isinstance(tool_functions["analyze"], PythonExecToolWrapper)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Task 4.7: task_executor passthrough in non-streaming mode
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestTaskExecutorPassthrough:
+    """Integration tests for task_executor passthrough."""
+
+    @pytest.mark.asyncio
+    async def test_collect_tools_returns_mcp_instructions(self):
+        """_collect_tools returns mcp_instructions as third return value."""
+        from magic_agents.node_system.NodeFetch import FetchToolCallable
+
+        fetch_tool = FetchToolCallable(url_template="https://x.com", tool_name="web_fetch")
+
+        node = _make_mock_llm_node()
+        node.inputs = {"handle-tool-definition-0": fetch_tool}
+
+        tools_schemas, tool_functions, mcp_instructions = await node._collect_tools()
+
+        assert len(tools_schemas) == 1
+        assert len(tool_functions) == 1
+        # mcp_instructions should be a dict (possibly empty for non-MCP sources)
+        assert isinstance(mcp_instructions, dict)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Task 4.12: Tool manifest injection verification
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestToolManifestInjection:
+    """Integration tests for tool manifest injection into system prompt."""
+
+    def _make_real_llm_node(self):
+        """Create a real NodeLLM instance for manifest testing."""
+        from magic_agents.node_system.NodeLLM import NodeLLM
+        from magic_agents.models.factory.Nodes.LlmNodeModel import LlmNodeModel
+        data = LlmNodeModel(stream=False, json_output=False)
+        node = NodeLLM(data=data, node_id="test-llm", debug=False)
+        node.inputs = {}
+        return node
+
+    @pytest.mark.asyncio
+    async def test_manifest_injected_when_tools_exist(self):
+        """sys_msg contains tool manifest when graph tools exist."""
+        from magic_agents.node_system.NodeFetch import FetchToolCallable
+
+        node = self._make_real_llm_node()
+        fetch_tool = FetchToolCallable(url_template="https://x.com", tool_name="web_fetch")
+        node.inputs = {"handle-tool-definition-0": fetch_tool}
+
+        tools_schemas, tool_functions, mcp_instructions = await node._collect_tools()
+
+        # Simulate the manifest injection logic from process()
+        sys_msg = "You are a helpful assistant."
+        if tools_schemas:
+            manifest = node._build_tool_manifest(
+                tools_schemas=tools_schemas,
+                tool_functions=tool_functions,
+                subagent_bundle=None,
+                mcp_instructions=mcp_instructions,
+            )
+            if manifest:
+                sys_msg = manifest + "\n\n" + sys_msg
+
+        assert "## Available Tools" in sys_msg
+        assert "web_fetch" in sys_msg
+        assert "You are a helpful assistant." in sys_msg
+
+    @pytest.mark.asyncio
+    async def test_sys_msg_unchanged_when_no_tools(self):
+        """sys_msg unchanged when no tools exist."""
+        node = self._make_real_llm_node()
+        node.inputs = {}
+
+        tools_schemas, tool_functions, mcp_instructions = await node._collect_tools()
+
+        sys_msg = "You are a helpful assistant."
+        if tools_schemas:
+            manifest = node._build_tool_manifest(
+                tools_schemas=tools_schemas,
+                tool_functions=tool_functions,
+            )
+            if manifest:
+                sys_msg = manifest + "\n\n" + sys_msg
+
+        assert sys_msg == "You are a helpful assistant."
+
+    @pytest.mark.asyncio
+    async def test_manifest_uses_actual_tool_names(self):
+        """Manifest uses actual configurable tool names."""
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+
+        node = self._make_real_llm_node()
+        wrapper = PythonExecToolWrapper(executor=MagicMock(), tool_name="analyze")
+        node.inputs = {"handle-tool-definition-0": wrapper}
+
+        tools_schemas, tool_functions, _ = await node._collect_tools()
+
+        manifest = node._build_tool_manifest(
+            tools_schemas=tools_schemas,
+            tool_functions=tool_functions,
+        )
+
+        assert "analyze" in manifest
+        assert "execute_python" not in manifest

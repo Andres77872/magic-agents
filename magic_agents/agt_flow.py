@@ -298,86 +298,31 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False, deps: Opti
     if node_type not in node_map:
         error_msg = f"Unsupported node type: {node_type}"
         logger.error("create_node: %s (node_id=%s)", error_msg, node['id'])
-        # Return a stub node that yields an error when executed
-        stub = NodeEND(**extra)
-        stub._error_info = {
-            "error_type": "UnsupportedNodeType",
-            "error_message": error_msg,
-            "node_id": node['id'],
-            "attempted_type": node_type,
-            "available_types": list(node_map.keys())
-        }
-        return stub
+        # Hard-fail: unknown node types must not silently become stubs.
+        raise ValueError(error_msg)
     
     constructor, model_cls = node_map[node_type]
     
     if node_type == ModelAgentFlowTypesModel.CONDITIONAL:
         # Validate conditional config using Pydantic model
-        try:
-            validated = ConditionalNodeModel(**node_data)
-            # Pass validated data to constructor
-            return constructor(**extra, **validated.model_dump(exclude_none=True))
-        except Exception as e:
-            logger.error("Invalid conditional node config: %s", e)
-            # Return a stub node that reports the validation error
-            stub = NodeEND(**extra)
-            stub._error_info = {
-                "error_type": "ConditionalValidationError",
-                "error_message": str(e),
-                "node_id": node['id'],
-                "node_data": node_data
-            }
-            return stub
+        validated = ConditionalNodeModel(**node_data)
+        # Pass validated data to constructor
+        return constructor(**extra, **validated.model_dump(exclude_none=True))
     elif node_type == ModelAgentFlowTypesModel.LOOP:
         # Loop node uses handles for routing configuration
         return constructor(**extra, **node_data)
     elif node_type == ModelAgentFlowTypesModel.INNER:
         # Validate inner config using Pydantic model
-        try:
-            validated = InnerNodeModel(**node_data)
-            return constructor(load_chat=load_chat, **extra, data=validated)
-        except Exception as e:
-            logger.error("Invalid inner node config: %s", e)
-            stub = NodeEND(**extra)
-            stub._error_info = {
-                "error_type": "InnerNodeValidationError",
-                "error_message": str(e),
-                "node_id": node['id'],
-                "node_data": node_data
-            }
-            return stub
+        validated = InnerNodeModel(**node_data)
+        return constructor(load_chat=load_chat, **extra, data=validated)
     elif node_type == ModelAgentFlowTypesModel.MEMORY:
-        try:
-            validated = MemoryNodeModel(**node_data)
-            node_deps = (deps or {}).get(node['id'], {})
-            return NodeMemory(**extra, data=validated, **node_deps)
-        except Exception as e:
-            logger.error("Invalid memory node config: %s", e)
-            stub = NodeEND(**extra)
-            stub._error_info = {
-                "error_type": "NodeValidationError",
-                "error_message": str(e),
-                "node_id": node['id'],
-                "node_type": node_type,
-                "node_data": node_data,
-            }
-            return stub
+        validated = MemoryNodeModel(**node_data)
+        node_deps = (deps or {}).get(node['id'], {})
+        return NodeMemory(**extra, data=validated, **node_deps)
     elif model_cls:
         # Validate node config using Pydantic model (strict validation)
-        try:
-            validated = model_cls(**node_data)
-            return constructor(**extra, data=validated)
-        except Exception as e:
-            logger.error("Invalid node config for %s: %s", node_type, e)
-            stub = NodeEND(**extra)
-            stub._error_info = {
-                "error_type": "NodeValidationError",
-                "error_message": str(e),
-                "node_id": node['id'],
-                "node_type": node_type,
-                "node_data": node_data
-            }
-            return stub
+        validated = model_cls(**node_data)
+        return constructor(**extra, data=validated)
     else:
         return constructor(**extra)
 

@@ -29,6 +29,7 @@ _LAZY_MODULES = {
     "MCPTransportError": "magic_agents.mcp.errors",
     "MCPToolError": "magic_agents.mcp.errors",
     "MCPToolNameCollisionError": "magic_agents.mcp.errors",
+    "ToolNameCollisionError": "magic_agents.mcp.errors",
 }
 
 _LOADED_MODULES: dict = {}
@@ -63,4 +64,5 @@ __all__ = [
     "MCPTransportError",
     "MCPToolError",
     "MCPToolNameCollisionError",
+    "ToolNameCollisionError",
 ]

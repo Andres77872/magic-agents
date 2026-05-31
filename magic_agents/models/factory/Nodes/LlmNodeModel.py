@@ -1,6 +1,6 @@
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 
 from magic_agents.models.factory.Nodes.BaseNodeModel import BaseNodeModel
 
@@ -19,6 +19,31 @@ class LlmNodeModel(BaseNodeModel):
     max_output_tokens: Optional[int] = None  # alias for max_tokens
     iterate: Optional[bool] = False  # if true, rerun this LLM node on each Loop iteration
     history_messages: Optional[list[dict[str, Any]]] = None  # Backend-injected history for no-CHAT graph path
+
+    # STM windowing fields (no-CHAT fallback path parity)
+    max_messages: Optional[int] = Field(
+        default=None, ge=1,
+        description="Maximum non-system conversation messages to keep. "
+                    "System messages are always preserved. "
+                    "Default 30 applied at runtime in no-CHAT fallback path."
+    )
+    max_input_tokens: Optional[int] = Field(
+        default=None, ge=1,
+        description="Maximum estimated tokens for the assembled chat. "
+                    "No legacy fallback on LlmNodeModel."
+    )
+    truncation_strategy: Literal['tail', 'token_budget'] = Field(
+        default='tail',
+        description="Windowing strategy: 'tail' (keep newest N), "
+                    "'token_budget' (token-aware selection)."
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description="Model name for usage/logging tracking. "
+                    "Does NOT affect STM windowing token estimation, "
+                    "which uses a hardcoded GPT-5 tokenizer. "
+                    "Optional — purely informational."
+    )
 
     @model_validator(mode='after')
     def resolve_aliases(self):

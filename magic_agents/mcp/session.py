@@ -51,6 +51,7 @@ class MCPSessionManager:
         self._server_info: Optional[dict] = None
         self._capabilities: Optional[dict] = None
         self._protocol_version: Optional[str] = None
+        self._server_instructions: Optional[str] = None
         
         # Transport context for cleanup
         self._transport_context: Optional[Any] = None
@@ -81,6 +82,17 @@ class MCPSessionManager:
     def capabilities(self) -> Optional[dict]:
         """Server capabilities from initialize response."""
         return self._capabilities
+    
+    @property
+    def server_instructions(self) -> Optional[str]:
+        """Server instructions from initialize response.
+        
+        Native MCP protocol field — provides instructions for using
+        the server and its tools. Available when the MCP server
+        includes an `instructions` field in its InitializeResult.
+        Returns None when the server does not provide instructions.
+        """
+        return self._server_instructions
     
     @property
     def session_id(self) -> Optional[str]:
@@ -212,10 +224,17 @@ class MCPSessionManager:
             timeout=self._config.init_timeout
         )
         
-        # Extract server info and capabilities
+        # Extract server info, capabilities, and instructions
         self._server_info = init_result.serverInfo if hasattr(init_result, 'serverInfo') else {}
         self._capabilities = init_result.capabilities if hasattr(init_result, 'capabilities') else {}
         self._protocol_version = init_result.protocolVersion if hasattr(init_result, 'protocolVersion') else MCP_PROTOCOL_VERSION
+        self._server_instructions = getattr(init_result, 'instructions', None)
+        if self._server_instructions:
+            logger.debug(
+                "MCPSessionManager:%s server provides instructions (%d chars)",
+                self._node_id,
+                len(self._server_instructions)
+            )
         
         # HTTP Mcp-Session-Id ownership contract (recommendation B):
         # The MCP SDK's StreamableHTTPTransport owns session-id capture+reuse:

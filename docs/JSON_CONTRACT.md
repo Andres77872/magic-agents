@@ -424,7 +424,82 @@ Automatic detection or validation of competing edges is **NOT implemented** — 
 
 ### chat Fields
 
-Uses `ChatNodeModel` for chat configuration, including model-provided history fields such as `history_messages`.
+Uses `ChatNodeModel` for chat configuration, including session management, message history assembly via the 5-slot merge pipeline, and STM windowing controls.
+
+#### Field Table
+
+| Field | Type | Required | Default | Constraints | Description |
+|-------|------|----------|---------|-------------|-------------|
+| `session_id` | `string` or `null` | No | `null` | — | Unique thread/conversation ID for persistence. Maps to backend session storage for message continuity across turns. |
+| `session_required` | `boolean` | No | `false` | — | If `true`, enforce session presence with auto-create fallback. When `false`, the node operates without session persistence. |
+| `history_messages` | `array` or `null` | No | `null` | — | **Backend-authoritative** message history. Populated by backend at build time — NOT read from JSON config. Injected as **Slot 1** of the 5-slot merge pipeline. Each element is a message dict with `role`, `content`, and optional metadata. |
+| `custom_messages` | `array` or `null` | No | `null` | — | Pre-user context messages injected as **Slot 3** of the 5-slot merge pipeline. Useful for injecting static instructions, few-shot examples, or system-style context before the current user message. Each element is a message dict. |
+| `messages_append_mode` | `boolean` | No | `false` | — | Message append mode. `false` = legacy **REPLACE** mode (runtime input messages replace `history_messages`). `true` = **APPEND** mode (runtime messages appended to `history_messages` in Slot 2). |
+| `message` | `string` or `null` | No | `null` | — | Legacy inline message field. Kept for backward compatibility. NOT the primary user-message input path — user messages enter via the `handle_user_message` runtime handle (Slot 5). |
+| `memory` | `object` or `null` | No | `null` | — | Legacy configuration dict. **DEPRECATED** — only `memory.max_input_tokens` is consumed. When `max_input_tokens` is `null` AND `memory.max_input_tokens` is set, the legacy value is used as fallback with a runtime deprecation warning. The legacy `stm` key is deprecated and ignored: when present, NodeChat logs a deprecation warning at init. Use `max_messages` instead. Other keys (`ltm`, etc.) are ignored. |
+| `handles` | `object` or `null` | No | `null` | — | Handle name overrides for custom edge wiring. Maps handle types to custom handle names, e.g. `{"input": "handle_custom_input", "output": "handle_user_message"}`. |
+| `max_messages` | `int` or `null` | No | `null` | `>= 1` | Maximum non-system conversation messages to keep after windowing. **System messages are always preserved and NOT counted** against this limit. The last user message (current turn) is also always preserved. Applied after the 5-slot merge, before the message list is yielded to downstream. Older messages are dropped (newest kept). When `null`, no message-count limit is enforced. |
+| `max_input_tokens` | `int` or `null` | No | `null` | `>= 1` | Maximum estimated tokens for the assembled chat context. Applied AFTER `max_messages` truncation when `truncation_strategy='tail'`, or independently when `truncation_strategy='token_budget'`. Falls back to legacy `memory.max_input_tokens` if that dict key is present (with deprecation warning). Token estimation uses a hardcoded GPT-5 tokenizer (not configurable via `model`). When `null`, no token-budget limit is enforced. |
+| `truncation_strategy` | `string` | No | `"tail"` | `"tail"` or `"token_budget"` | Windowing algorithm. `"tail"` = keep the newest N non-system messages (oldest dropped first). `"token_budget"` = skip message-count truncation entirely and rely solely on token-budget enforcement via `max_input_tokens`. Any other string value is rejected by Pydantic validation (`Literal['tail', 'token_budget']`). |
+| `model` | `string` or `null` | No | `null` | — | Model name for usage/logging tracking only. Does **NOT** affect STM windowing token estimation, which uses a hardcoded GPT-5 tokenizer. Optional — purely informational. |
+
+#### Windowing Semantics (STM)
+
+Windowing is recomputed fresh every `process()` execution over the **accumulated** message list after all 5 merge slots complete:
+
+1. **System message preservation**: All `role='system'` messages are always preserved and excluded from the `max_messages` count. They survive truncation unchanged.
+2. **Last user preservation**: The most recent `role='user'` message (current turn) is always preserved and never dropped, regardless of truncation aggressiveness.
+3. **Tool-call atomicity**: Tool-call chains (an `assistant` message with `tool_calls` + consecutive `tool` role results) are treated as atomic units. A chain is either fully kept or fully dropped — never split. Windowing cuts only at chain boundaries.
+4. **Windowing timing**: Applied after the 5-slot merge (post-Slot 5, pre-yield) on every `process()` turn. This means windowing operates over the full accumulated message history, not just the current turn.
+5. **Two-layer defense**:
+   - **Layer 1 (PRIMARY)**: `NodeChat.process()` applies `apply_windowing()` with `max_messages` + `max_input_tokens` post-merge.
+   - **Layer 2 (SAFETY NET)**: `ModelChat.__init__(max_input_tokens=...)` retains existing provider-level token truncation. Layer 1 is the primary control; Layer 2 is a fallback.
+6. **Hardcoded GPT-5 token estimation**: Token estimation for STM windowing uses a hardcoded GPT-5 tokenizer (`tiktoken.encoding_for_model("gpt-5")`). The `model` field on the node does NOT affect token estimation; if the model is used, it is for usage/logging tracking only. If GPT-5 is unknown to tiktoken, the encoding silently falls back to `cl100k_base`.
+
+#### NodeLLM No-CHAT Relation
+
+When a graph connects `user_input → llm` **without** a `chat` node (the no-CHAT fallback path), `NodeLLM` applies its own windowing on `history_messages` using the same `apply_windowing()` utility. In this path, when no `max_messages` is explicitly configured, a runtime default of **30** (`NodeLLM.DEFAULT_MAX_MESSAGES`) is applied to protect against unbounded context. This default does NOT apply when a `chat` node is present — NodeChat owns windowing in that case.
+
+#### Legacy Compatibility Notes
+
+- **`max_input_tokens` first-class field wins**: When both `max_input_tokens` and `memory.max_input_tokens` are set, the first-class field takes precedence and NO deprecation warning is logged.
+- **`memory` field NOT removed**: The `memory` dict remains for backward compatibility but is formally DEPRECATED. Only the `max_input_tokens` key is consumed; other keys pass through unmodified. Removal is deferred to the next major version.
+- **Additive defaults**: All new STM fields (`max_messages`, `max_input_tokens`, `truncation_strategy`, `model`) are `null`/`"tail"` by default. Existing graphs without these fields work identically — no windowing is applied unless explicitly configured.
+- **Zero values are rejected**: Pydantic `ge=1` validation rejects `max_messages=0` and `max_input_tokens=0` at model construction time with `ValidationError`.
+
+#### Example JSON
+
+```json
+{
+  "id": "chat-1",
+  "type": "chat",
+  "data": {
+    "session_id": "thread-abc-123",
+    "session_required": true,
+    "history_messages": [
+      {"role": "user", "content": "Hello"},
+      {"role": "assistant", "content": "Hi there!"}
+    ],
+    "custom_messages": [
+      {"role": "system", "content": "You are a helpful assistant."}
+    ],
+    "messages_append_mode": true,
+    "max_messages": 50,
+    "max_input_tokens": 128000,
+    "truncation_strategy": "tail",
+    "model": "gpt-4o"
+  }
+}
+```
+
+**Minimal configuration** (no windowing, all defaults):
+```json
+{
+  "id": "chat-1",
+  "type": "chat",
+  "data": {}
+}
+```
 
 ### void Fields
 

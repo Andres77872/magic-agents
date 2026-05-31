@@ -6,6 +6,7 @@ from magic_llm.model import ModelChat
 
 from magic_agents.models.factory.Nodes.ChatNodeModel import ChatNodeModel
 from magic_agents.node_system.Node import Node
+from magic_agents.node_system.utils import apply_windowing
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,36 @@ class NodeChat(Node):
         
         # Legacy fields (backward compatibility)
         self._memory = data.memory or {}
-        
+        if 'stm' in self._memory:
+            logger.warning(
+                "NodeChat:%s: 'memory.stm' is deprecated and ignored. "
+                "Use 'max_messages' instead.", self.node_id
+            )
+
+        # STM windowing fields
+        self._max_messages = data.max_messages
+        self._truncation_strategy = data.truncation_strategy
+
+        # Resolve max_input_tokens with precedence (C2):
+        # 1. New first-class field
+        # 2. Legacy memory dict fallback + deprecation warning
+        # 3. None
+        if data.max_input_tokens is not None:
+            self._max_input_tokens = data.max_input_tokens
+        elif data.memory and 'max_input_tokens' in data.memory:
+            self._max_input_tokens = data.memory['max_input_tokens']
+            logger.warning(
+                "NodeChat:%s: 'memory.max_input_tokens' is deprecated. "
+                "Use 'max_input_tokens' directly.", self.node_id
+            )
+        else:
+            self._max_input_tokens = None
+
+        # Windowing diagnostics counters
+        self._messages_before_windowing = 0
+        self._messages_discarded = 0
+        self._total_tokens_estimated = None
+
         # Handle name overrides from validated model
         handles = data.handles or {}
         self.INPUT_HANDLER_SYSTEM_CONTEXT = handles.get('system_context', handles.get('system', self.DEFAULT_INPUT_SYSTEM_CONTEXT))
@@ -69,7 +99,8 @@ class NodeChat(Node):
         self.OUTPUT_HANDLE = handles.get('output', handles.get('chat', self.DEFAULT_OUTPUT_HANDLE))
         
         # Initialize empty ModelChat - backend loads history via chat_log.id_chat
-        self.chat = ModelChat(max_input_tokens=self._memory.get('max_input_tokens'))
+        # Uses resolved self._max_input_tokens (Layer 2 safety net)
+        self.chat = ModelChat(max_input_tokens=self._max_input_tokens)
 
     async def process(self, chat_log):
         """
@@ -159,6 +190,17 @@ class NodeChat(Node):
                 logger.debug("NodeChat:%s adding user message", self.node_id)
                 self.chat.add_user_message(c)
         
+        # Post-merge windowing (Layer 1 - PRIMARY)
+        if self._max_messages is not None or self._max_input_tokens is not None:
+            self._messages_before_windowing = len(self.chat.messages)
+            self.chat.messages = apply_windowing(
+                messages=self.chat.messages,
+                max_messages=self._max_messages,
+                max_input_tokens=self._max_input_tokens,
+                truncation_strategy=self._truncation_strategy,
+            )
+            self._messages_discarded = self._messages_before_windowing - len(self.chat.messages)
+
         logger.info("NodeChat:%s chat prepared with %d messages (session=%s, append_mode=%s)", 
                    self.node_id, len(self.chat.messages), session_id, self._messages_append_mode)
         yield self.yield_static(self.chat, content_type=self.OUTPUT_HANDLE)
@@ -184,5 +226,17 @@ class NodeChat(Node):
         
         # Capture memory configuration
         state['memory'] = self._memory
+        
+        # STM windowing diagnostics (N3)
+        state['max_messages'] = self._max_messages
+        state['max_input_tokens'] = self._max_input_tokens
+        state['truncation_strategy'] = self._truncation_strategy
+        state['messages_before_windowing'] = self._messages_before_windowing
+        state['messages_after_windowing'] = len(self.chat.messages) if self.chat else 0
+        state['messages_discarded'] = self._messages_discarded
+        state['total_tokens_estimated'] = self._total_tokens_estimated
+        state['windowing_applied'] = (
+            self._max_messages is not None or self._max_input_tokens is not None
+        )
         
         return state

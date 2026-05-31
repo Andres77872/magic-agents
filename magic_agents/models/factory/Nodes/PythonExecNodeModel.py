@@ -24,6 +24,12 @@ class PythonExecNodeModel(BaseNodeModel):
                     "When omitted (None), the node provides PythonExecutor as an LLM tool."
     )
 
+    # NEW: Custom tool name for tool mode (defaults to 'execute_python' when None)
+    tool_name: Optional[str] = Field(
+        default=None,
+        description="Custom tool name for tool mode. Defaults to 'execute_python' when None."
+    )
+
     # NEW: Handle name overrides (standard pattern, see ChatNodeModel)
     handles: Optional[dict[str, str]] = Field(
         default=None,
