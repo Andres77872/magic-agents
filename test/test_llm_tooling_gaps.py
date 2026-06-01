@@ -19,6 +19,112 @@ from magic_agents.node_system.NodeFetch import FetchToolCallable, NodeFetch
 from magic_agents.node_system.NodeLLM import NodeLLM
 
 
+def schema_tool(name: str = "client_lookup") -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": "Client-executed lookup",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+
+def make_llm_node(stream: bool = False) -> NodeLLM:
+    mock_data = MagicMock()
+    mock_data.stream = stream
+    mock_data.json_output = False
+    mock_data.extra_data = {}
+    mock_data.temperature = None
+    mock_data.top_p = None
+    mock_data.max_tokens = None
+    mock_data.history_messages = []
+    mock_data.max_messages = None
+    mock_data.max_input_tokens = None
+    mock_data.truncation_strategy = None
+    return NodeLLM(data=mock_data, node_id="llm-1")
+
+
+class TestSchemaOnlyNodeToolEnvelope:
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_schema_only_uses_async_generate_and_client_envelope(self):
+        tool_call = {"id": "call_1", "type": "function", "function": {"name": "client_lookup", "arguments": "{}"}}
+        response = MagicMock()
+        response.content = ""
+        response.tool_calls = [tool_call]
+        response.usage = None
+        response.model = "mock-model"
+        response.id = "resp-1"
+
+        mock_client = MagicMock()
+        mock_client.llm.model = "mock-model"
+        mock_client.llm.async_generate = AsyncMock(return_value=response)
+        mock_client.run_agent_async = AsyncMock()
+
+        node = make_llm_node(stream=False)
+        node.inputs = {
+            "handle-client-provider": mock_client,
+            "handle_user_message": "hello",
+            "handle-tool-definition-0": schema_tool("client_lookup"),
+        }
+
+        outputs = [event async for event in node.process([])]
+
+        mock_client.llm.async_generate.assert_awaited_once()
+        mock_client.run_agent_async.assert_not_called()
+        tool_output = next(event for event in outputs if event["type"] == "handle-tool-calls")
+        assert tool_output["content"]["content"] == {
+            "execution": "client",
+            "source": "schema_only",
+            "tool_calls": [tool_call],
+        }
+        assert any(
+            event["type"] == "debug" and event["content"].get("event_type") == "TOOL_CALL"
+            and event["content"].get("data", {}).get("execution") == "client"
+            for event in outputs
+        )
+        assert not any(event["type"] == "debug" and event["content"].get("event_type") == "TOOL_RESULT" for event in outputs)
+
+    @pytest.mark.asyncio
+    async def test_streaming_choice_tool_calls_fallback_uses_same_envelope_once(self):
+        tool_call = {"id": "call_2", "type": "function", "function": {"name": "client_lookup", "arguments": "{}"}}
+        chunk = MagicMock()
+        chunk.choices = [MagicMock()]
+        chunk.choices[0].delta.content = ""
+        chunk.choices[0].delta.tool_calls = None
+        chunk.choices[0].tool_calls = [tool_call]
+        chunk.usage = None
+        chunk.model = "mock-model"
+        chunk.id = "chunk-1"
+
+        async def stream(*args, **kwargs):
+            yield chunk
+
+        mock_client = MagicMock()
+        mock_client.llm.model = "mock-model"
+        mock_client.llm.async_stream_generate = stream
+        mock_client.run_agent_stream_async = AsyncMock()
+
+        node = make_llm_node(stream=True)
+        node.inputs = {
+            "handle-client-provider": mock_client,
+            "handle_user_message": "hello",
+            "handle-tool-definition-0": schema_tool("client_lookup"),
+        }
+
+        outputs = [event async for event in node.process([])]
+
+        mock_client.run_agent_stream_async.assert_not_called()
+        tool_outputs = [event for event in outputs if event["type"] == "handle-tool-calls"]
+        assert len(tool_outputs) == 1
+        assert tool_outputs[0]["content"]["content"] == {
+            "execution": "client",
+            "source": "schema_only",
+            "tool_calls": [tool_call],
+        }
+
+
 # ─── Gap 1: FetchToolCallable __name__ for tool_functions registration ───────
 
 class TestFetchToolCallableName:
@@ -39,7 +145,8 @@ class TestFetchToolCallableName:
         )
         assert callable_tool.__name__ == "fetch"
 
-    def test_collect_tools_registers_fetch_by_name(self):
+    @pytest.mark.asyncio
+    async def test_collect_tools_registers_fetch_by_name(self):
         """NodeLLM._collect_tools registers FetchToolCallable in tool_functions."""
         callable_tool = FetchToolCallable(
             url_template="https://api.example.com/search?q={{query}}",
@@ -55,7 +162,7 @@ class TestFetchToolCallableName:
         }
 
         # Call the real _collect_tools method bound to our mock
-        tools_schemas, tool_functions = NodeLLM._collect_tools(node)
+        tools_schemas, tool_functions, _ = await NodeLLM._collect_tools(node)
 
         assert len(tools_schemas) == 1
         assert "search_api" in tool_functions
@@ -154,6 +261,10 @@ class TestHandleToolCalls:
         mock_data.temperature = None
         mock_data.top_p = None
         mock_data.max_tokens = None
+        mock_data.history_messages = []
+        mock_data.max_messages = None
+        mock_data.max_input_tokens = None
+        mock_data.truncation_strategy = None
 
         node = NodeLLM(
             data=mock_data,
@@ -171,6 +282,10 @@ class TestHandleToolCalls:
         mock_data.temperature = None
         mock_data.top_p = None
         mock_data.max_tokens = None
+        mock_data.history_messages = []
+        mock_data.max_messages = None
+        mock_data.max_input_tokens = None
+        mock_data.truncation_strategy = None
 
         node = NodeLLM(data=mock_data, node_id="llm-1")
         assert node.OUTPUT_HANDLE_TOOL_CALLS == 'handle-tool-calls'
@@ -211,14 +326,18 @@ class TestSyncFallback:
         mock_data.temperature = None
         mock_data.top_p = None
         mock_data.max_tokens = None
+        mock_data.history_messages = []
+        mock_data.max_messages = None
+        mock_data.max_input_tokens = None
+        mock_data.truncation_strategy = None
 
         node = NodeLLM(data=mock_data, node_id="llm-1")
         node.inputs = {
             'handle-client-provider': mock_client,
             'handle_user_message': 'hello',
-            'handle-tool-definition-0': MagicMock(
-                tool_schema={"type": "function", "function": {"name": "test", "description": "test", "parameters": {}}},
-                tool_callable=MagicMock(__name__="test"),
+            'handle-tool-definition-0': FetchToolCallable(
+                url_template="https://api.example.com?q={{query}}",
+                tool_name="test",
             ),
         }
 
@@ -396,7 +515,7 @@ class TestAssignToolHandlesToolMode:
         assert edges[0].get('sourceHandle') is None
 
     def test_sourceHandle_not_overwritten_if_already_set(self):
-        """If edge already has sourceHandle, it is not overwritten."""
+        """Tool-capable edges use backend-authoritative sourceHandle."""
         nodes = [
             {"id": "f1", "type": ModelAgentFlowTypesModel.FETCH,
              "data": {"tool_mode": True, "url": "https://api.example.com"}},
@@ -407,8 +526,7 @@ class TestAssignToolHandlesToolMode:
         ]
         _assign_tool_handles(nodes, edges)
 
-        # sourceHandle should remain as preset (setdefault behavior)
-        assert edges[0]['sourceHandle'] == 'handle-preset'
+        assert edges[0]['sourceHandle'] == 'handle_fetch_output'
         assert edges[0]['targetHandle'] == 'handle-tool-definition-0'
 
     # ─── Slice 7: explicit targetHandle + missing sourceHandle backfill ──────
@@ -447,7 +565,7 @@ class TestAssignToolHandlesToolMode:
         assert edges[0]['sourceHandle'] == 'handle-custom-fetch'
 
     def test_sourceHandle_preserved_when_both_handles_explicit_fetch(self):
-        """Fetch edge with both targetHandle AND sourceHandle explicit: neither is overwritten."""
+        """Fetch edge keeps explicit targetHandle but normalizes sourceHandle."""
         nodes = [
             {"id": "f1", "type": ModelAgentFlowTypesModel.FETCH,
              "data": {"tool_mode": True, "url": "https://api.example.com"}},
@@ -460,7 +578,7 @@ class TestAssignToolHandlesToolMode:
         _assign_tool_handles(nodes, edges)
 
         assert edges[0]['targetHandle'] == 'handle-custom-target'
-        assert edges[0]['sourceHandle'] == 'handle-custom-source'
+        assert edges[0]['sourceHandle'] == 'handle_fetch_output'
 
     def test_sourceHandle_not_backfilled_for_tool_mode_false_with_explicit_target(self):
         """Plain fetch (tool_mode=false) with explicit targetHandle gets NO sourceHandle backfill."""
@@ -510,7 +628,7 @@ class TestAssignToolHandlesPythonExec:
         assert edges[0]['sourceHandle'] == 'handle-custom-exec'
 
     def test_sourceHandle_not_overwritten_if_already_set_python_exec(self):
-        """If python_exec edge already has sourceHandle, it is not overwritten."""
+        """Python exec tool edge uses backend-authoritative sourceHandle."""
         nodes = [
             {"id": "py1", "type": "python_exec", "data": {}},
             {"id": "llm-1", "type": ModelAgentFlowTypesModel.LLM},
@@ -520,7 +638,7 @@ class TestAssignToolHandlesPythonExec:
         ]
         _assign_tool_handles(nodes, edges)
 
-        assert edges[0]['sourceHandle'] == 'handle-preset'
+        assert edges[0]['sourceHandle'] == 'handle-tool-definition'
         assert edges[0]['targetHandle'] == 'handle-tool-definition-0'
 
     # ─── Slice 7: explicit targetHandle + missing sourceHandle backfill ──────
@@ -557,7 +675,7 @@ class TestAssignToolHandlesPythonExec:
         assert edges[0]['sourceHandle'] == 'handle-custom-exec'
 
     def test_sourceHandle_preserved_when_both_handles_explicit_python_exec(self):
-        """python_exec edge with both handles explicit: neither is overwritten."""
+        """Python exec keeps explicit targetHandle but normalizes sourceHandle."""
         nodes = [
             {"id": "py1", "type": "python_exec", "data": {}},
             {"id": "llm-1", "type": ModelAgentFlowTypesModel.LLM},
@@ -569,7 +687,7 @@ class TestAssignToolHandlesPythonExec:
         _assign_tool_handles(nodes, edges)
 
         assert edges[0]['targetHandle'] == 'handle-custom-target'
-        assert edges[0]['sourceHandle'] == 'handle-custom-source'
+        assert edges[0]['sourceHandle'] == 'handle-tool-definition'
 
     # ─── Node-mode python_exec: skip tool handle assignment ──────────────
 

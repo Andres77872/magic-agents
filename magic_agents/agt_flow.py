@@ -30,6 +30,7 @@ from magic_agents.models.factory.Nodes import (
     ConditionalNodeModel,
     PythonExecNodeModel,
     McpNodeModel,
+    ToolNodeModel,
     ChatNodeModel,
     HookNodeModel,
     CodexNodeModel,
@@ -52,6 +53,7 @@ from magic_agents.node_system import (
     NodeConditional,
     NodePythonExec,
     NodeMcp,
+    NodeTool,
     NodeHook,
     NodeCodex,
     NodeMemory,
@@ -79,7 +81,12 @@ from magic_agents.models.factory.AgentFlowModel import (
 logger = logging.getLogger(__name__)
 
 # Node types that can provide tools to LLM nodes
-_TOOL_CAPABLE_TYPES = {ModelAgentFlowTypesModel.FETCH, ModelAgentFlowTypesModel.PYTHON_EXEC, ModelAgentFlowTypesModel.MCP}
+_TOOL_CAPABLE_TYPES = {
+    ModelAgentFlowTypesModel.FETCH,
+    ModelAgentFlowTypesModel.PYTHON_EXEC,
+    ModelAgentFlowTypesModel.MCP,
+    ModelAgentFlowTypesModel.TOOL,
+}
 
 
 # ─── Phase 0 Execution Tree Persistence Callback ────────────────────────────
@@ -228,6 +235,8 @@ def _assign_tool_handles(nodes: list[dict], edges: list[dict]) -> None:
         elif source_type == ModelAgentFlowTypesModel.MCP:
             # MCP: output → default (handle-tool-definition)
             resolved_handle = handles.get('output', 'handle-tool-definition')
+        elif source_type == ModelAgentFlowTypesModel.TOOL:
+            resolved_handle = handles.get('output', 'handle-tool-definition')
         else:
             # python_exec: output → default
             resolved_handle = handles.get('output', 'handle-tool-definition')
@@ -290,6 +299,7 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False, deps: Opti
         ModelAgentFlowTypesModel.VOID: (NodeEND, None),
         ModelAgentFlowTypesModel.PYTHON_EXEC: (NodePythonExec, PythonExecNodeModel),
         ModelAgentFlowTypesModel.MCP: (NodeMcp, McpNodeModel),
+        ModelAgentFlowTypesModel.TOOL: (NodeTool, ToolNodeModel),
         ModelAgentFlowTypesModel.HOOK: (NodeHook, HookNodeModel),
         ModelAgentFlowTypesModel.CODEX: (NodeCodex, CodexNodeModel),
         ModelAgentFlowTypesModel.MEMORY: (NodeMemory, MemoryNodeModel),
@@ -861,9 +871,9 @@ async def run_agent(
     hooks: Optional[RuntimeConfig] = None,
     debug_callback=None,  # Phase 1: optional async callback for debug events
     deps: Optional[dict[str, Any]] = None,  # Phase 5: dependency injection
-) -> AsyncGenerator[ChatCompletionModel, None]:
+) -> AsyncGenerator[Dict[str, Any], None]:
     """
-    Run the agent flow and yield ChatCompletionModel results as they are generated.
+    Run the agent flow and yield dictionary runtime events as they are generated.
 
     Args:
         graph (Union[dict, AgentFlowModel]): Agent flow graph. Can be a raw dict
@@ -879,7 +889,9 @@ async def run_agent(
             Ignored when graph is a pre-built AgentFlowModel. Defaults to None.
 
     Yields:
-        AsyncGenerator[ChatCompletionModel, None]: ChatCompletionModel results.
+        AsyncGenerator[Dict[str, Any], None]: Dict events with a ``type`` key.
+            Streaming ChatCompletionModel chunks are nested under
+            ``event["content"]`` when ``event["type"] == "content"``.
     """
     # Phase 5: Auto-build from raw dict when deps are provided
     if deps is not None and isinstance(graph, dict):

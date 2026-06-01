@@ -17,6 +17,7 @@ from magic_agents.models.factory.EdgeNodeModel import EdgeNodeModel
 from magic_agents.models.factory.Nodes import ModelAgentFlowTypesModel
 from magic_agents.node_system.NodeFetch import FetchToolCallable
 from magic_agents.node_system.NodeLLM import NodeLLM
+from magic_agents.node_system.NodeTool import NodeTool
 
 
 def _make_mock_llm_node(node_id: str = "llm-1"):
@@ -63,6 +64,38 @@ def _make_mock_fetch_node(node_id: str = "fetch-1", tool_mode: bool = True,
     return MockFetch()
 
 
+def _node_tool_graph(two_tools: bool = False):
+    nodes = [
+        {"id": "input", "type": "user_input", "data": {}},
+        {"id": "client", "type": "client", "data": {"model": "mock-model", "engine": "openai", "api_info": {"api_key": "test"}}},
+        {"id": "tool-1", "type": "node_tool", "data": {"tool": {
+            "type": "function",
+            "function": {
+                "name": "client_lookup",
+                "description": "Ask the client to look up data.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }}},
+        {"id": "llm-1", "type": "llm", "data": {"stream": False, "json_output": False}},
+    ]
+    edges = [
+        {"id": "e-input", "source": "input", "target": "llm-1", "sourceHandle": "handle_user_message", "targetHandle": "handle_user_message"},
+        {"id": "e-client", "source": "client", "target": "llm-1", "sourceHandle": "handle-client-provider", "targetHandle": "handle-client-provider"},
+        {"id": "e-tool", "source": "tool-1", "target": "llm-1"},
+    ]
+    if two_tools:
+        nodes.append({"id": "tool-2", "type": "node_tool", "data": {"tool": {
+            "type": "function",
+            "function": {
+                "name": "client_search",
+                "description": "Ask the client to search data.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }}})
+        edges.append({"id": "e-tool-2", "source": "tool-2", "target": "llm-1"})
+    return {"nodes": nodes, "edges": edges}
+
+
 class TestEndToEndToolCollection:
     """Slice 4: Full path from graph build to NodeLLM._collect_tools."""
 
@@ -96,7 +129,33 @@ class TestEndToEndToolCollection:
             await dispatcher.propagate_outputs("fetch-1", outputs)
             assert "handle-tool-definition-0" in nodes["llm-1"].inputs
 
-        asyncio.get_event_loop().run_until_complete(_test())
+        asyncio.run(_test())
+
+
+class TestNodeToolGraphWiring:
+
+    def test_assign_node_tool_handles_uses_schema_output_and_variadic_target(self):
+        graph = _node_tool_graph()
+        _assign_tool_handles(graph["nodes"], graph["edges"])
+
+        tool_edge = next(edge for edge in graph["edges"] if edge["source"] == "tool-1")
+        assert tool_edge["sourceHandle"] == "handle-tool-definition"
+        assert tool_edge["targetHandle"] == "handle-tool-definition-0"
+
+    def test_build_instantiates_node_tool(self):
+        graph = build(_node_tool_graph(), message="hello")
+
+        assert isinstance(graph.nodes["tool-1"], NodeTool)
+
+    def test_multiple_node_tools_fan_into_one_llm(self):
+        graph_data = _node_tool_graph(two_tools=True)
+        _assign_tool_handles(graph_data["nodes"], graph_data["edges"])
+
+        tool_edges = [edge for edge in graph_data["edges"] if edge["source"].startswith("tool-")]
+        assert [edge["targetHandle"] for edge in tool_edges] == [
+            "handle-tool-definition-0",
+            "handle-tool-definition-1",
+        ]
 
     def test_collect_tools_returns_schema_and_callable(self):
         """After propagation, _collect_tools returns tool schema and callable."""
@@ -114,7 +173,7 @@ class TestEndToEndToolCollection:
             outputs = nodes["fetch-1"].outputs
             await dispatcher.propagate_outputs("fetch-1", outputs)
 
-            tools_schemas, tool_functions = nodes["llm-1"]._collect_tools()
+            tools_schemas, tool_functions, _ = await nodes["llm-1"]._collect_tools()
 
             assert len(tools_schemas) == 1
             assert tools_schemas[0]["type"] == "function"
@@ -122,7 +181,7 @@ class TestEndToEndToolCollection:
             assert "search_api" in tool_functions
             assert isinstance(tool_functions["search_api"], FetchToolCallable)
 
-        asyncio.get_event_loop().run_until_complete(_test())
+        asyncio.run(_test())
 
 
 class TestCustomFetchOutputHandle:
@@ -173,13 +232,13 @@ class TestCustomFetchOutputHandle:
             outputs = nodes["fetch-1"].outputs
             await dispatcher.propagate_outputs("fetch-1", outputs)
 
-            tools_schemas, tool_functions = nodes["llm-1"]._collect_tools()
+            tools_schemas, tool_functions, _ = await nodes["llm-1"]._collect_tools()
 
             assert len(tools_schemas) == 1
             assert "custom_fetch" in tool_functions
             assert isinstance(tool_functions["custom_fetch"], FetchToolCallable)
 
-        asyncio.get_event_loop().run_until_complete(_test())
+        asyncio.run(_test())
 
 
 class TestMultipleToolInputs:
@@ -261,7 +320,7 @@ class TestMultipleToolInputs:
             await dispatcher.propagate_outputs("fetch-1", nodes["fetch-1"].outputs)
             await dispatcher.propagate_outputs("fetch-2", nodes["fetch-2"].outputs)
 
-            tools_schemas, tool_functions = nodes["llm-1"]._collect_tools()
+            tools_schemas, tool_functions, _ = await nodes["llm-1"]._collect_tools()
 
             assert len(tools_schemas) == 2
             assert len(tool_functions) == 2
@@ -270,7 +329,7 @@ class TestMultipleToolInputs:
             assert isinstance(tool_functions["search_api"], FetchToolCallable)
             assert isinstance(tool_functions["weather_api"], FetchToolCallable)
 
-        asyncio.get_event_loop().run_until_complete(_test())
+        asyncio.run(_test())
 
     def test_mixed_fetch_and_python_exec_tools(self):
         """A fetch tool and a python_exec tool both collected by the same LLM."""
@@ -327,14 +386,14 @@ class TestMultipleToolInputs:
             await dispatcher.propagate_outputs("fetch-1", nodes["fetch-1"].outputs)
             await dispatcher.propagate_outputs("py-1", nodes["py-1"].outputs)
 
-            tools_schemas, tool_functions = nodes["llm-1"]._collect_tools()
+            tools_schemas, tool_functions, _ = await nodes["llm-1"]._collect_tools()
 
             assert len(tools_schemas) == 2
             assert len(tool_functions) == 2
             assert "search_api" in tool_functions
             assert "execute_python" in tool_functions
 
-        asyncio.get_event_loop().run_until_complete(_test())
+        asyncio.run(_test())
 
 
 class TestAssignToolHandlesOverwritesWrongValues:
@@ -427,7 +486,7 @@ class TestAssignToolHandlesOverwritesWrongValues:
 
             assert "handle-tool-definition-0" in mock_nodes["llm-1"].inputs
 
-        asyncio.get_event_loop().run_until_complete(_test())
+        asyncio.run(_test())
 
 
 # ─── PythonExecToolWrapper: Dual-param tool schema ───────────────────

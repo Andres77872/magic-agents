@@ -70,6 +70,7 @@ from magic_agents.node_system.NodeSendMessage import NodeSendMessage
 from magic_agents.node_system.NodeText import NodeText
 from magic_agents.node_system.NodeUserInput import NodeUserInput
 from magic_agents.node_system.NodePythonExec import NodePythonExec
+from magic_agents.node_system.NodeTool import NodeTool
 from magic_agents.node_system.NodeHook import NodeHook
 from magic_agents.node_system.NodeCodex import NodeCodex
 from magic_agents.node_system.NodeMemory import NodeMemory

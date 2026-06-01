@@ -48,7 +48,7 @@ Each node in `nodes` array must contain:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `id` | `string` | **Required** | Unique non-empty identifier |
-| `type` | `string` | **Required** | Canonical type key (19 types) |
+| `type` | `string` | **Required** | Canonical type key (20 types) |
 | `data` | `object` | **Required** | Node-specific configuration (may be empty `{}`) |
 | `position` | `object` | Optional | Canvas position `{x, y}` (default `{x:0, y:0}`) |
 
@@ -62,7 +62,7 @@ Each node in `nodes` array must contain:
 
 ---
 
-## Canonical Node Types (19 Types)
+## Canonical Node Types (20 Types)
 
 | Type Key | Node Class | Model Class | Description |
 |----------|------------|-------------|-------------|
@@ -82,6 +82,7 @@ Each node in `nodes` array must contain:
 | `conditional` | `NodeConditional` | `ConditionalNodeModel` | Branch routing node |
 | `python_exec` | `NodePythonExec` | `PythonExecNodeModel` | Python execution node |
 | `mcp` | `NodeMcp` | `McpNodeModel` | MCP tool integration node |
+| `node_tool` | `NodeTool` | `ToolNodeModel` | Schema-only OpenAI-compatible function tool for client execution |
 | `memory` | `NodeMemory` | `MemoryNodeModel` | Vector insights node — extraction, embedding, search, and injection of memory context via similarity |
 | `hook` | `NodeHook` | `HookNodeModel` | Python function template for hooks |
 | `codex` | `NodeCodex` | `CodexNodeModel` | Knowledge hub: trigger-based content injection into user messages |
@@ -155,6 +156,34 @@ All node types inherit base fields:
 | `tool_mode` | `boolean` | Optional | `false` | - |
 | `tool_name` | `string` | Optional | `null` | - |
 | `tool_parameters` | `object` | Optional | `null` | - |
+
+### node_tool Fields
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `tool` | `object` | **Required** | - | Raw OpenAI-compatible function tool object |
+
+Strict validation applies before provider execution:
+
+- `tool.type` must be `"function"`
+- `tool.function` must be an object
+- `tool.function.name` must match `^[a-zA-Z0-9_-]{1,64}$`
+- `tool.function.description` must be present and non-empty
+- `tool.function.parameters` must be an object JSON Schema with `type: "object"`
+
+`node_tool` emits the validated raw object on `handle-tool-definition`. The backend never executes this function server-side; clients execute provider tool calls emitted by `NodeLLM`.
+
+Schema-only NodeTool calls on `llm.handle-tool-calls` use this envelope:
+
+```json
+{
+  "execution": "client",
+  "source": "schema_only",
+  "tool_calls": []
+}
+```
+
+Do not mix `node_tool` schemas with callable server tools on the same LLM node in v1. Frontend/UI rollout is external to this backend repository and must add compatible node data, edge validation, save/load, and client execution handling before public UI use.
 
 ### send_message Fields
 

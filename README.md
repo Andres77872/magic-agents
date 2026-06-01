@@ -69,9 +69,9 @@ This example uses the OpenAI client configuration, so set `OPENAI_API_KEY` befor
 
 ## Built-in nodes
 
-The current runtime supports 19 built-in node types:
+The current runtime supports 20 built-in node types:
 
-`user_input`, `text`, `constant`, `parser`, `fetch`, `client`, `llm`, `chat`, `send_message`, `loop`, `conditional`, `inner`, `end`, `void`, `hook`, `python_exec`, `mcp`, `memory`, `codex`
+`user_input`, `text`, `constant`, `parser`, `fetch`, `client`, `llm`, `chat`, `send_message`, `loop`, `conditional`, `inner`, `end`, `void`, `hook`, `python_exec`, `mcp`, `memory`, `codex`, `node_tool`
 
 Use the docs for current per-node behavior and routing details: [docs/nodes/README.md](docs/nodes/README.md) for per-node pages and [docs/wiki/NODE_REFERENCE.md](docs/wiki/NODE_REFERENCE.md) for the wiki-level node index.
 

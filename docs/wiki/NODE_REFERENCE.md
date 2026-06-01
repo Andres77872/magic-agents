@@ -22,6 +22,7 @@ This wiki page is the conceptual node index used while reading the guide pages. 
 | `void` | Internal sink node | [../nodes/void.md](../nodes/void.md) |
 | `python_exec` | Expose a Python execution tool | [../nodes/python_exec.md](../nodes/python_exec.md) |
 | `mcp` | Discover MCP tools and expose an `MCPToolBundle` | [../nodes/mcp.md](../nodes/mcp.md) |
+| `node_tool` | Provide a raw schema-only OpenAI function tool for client-side execution | [../nodes/tool.md](../nodes/tool.md) |
 | `memory` | Extract memories via LLM, store with embeddings, and inject relevant context via vector similarity | [../nodes/memory.md](../nodes/memory.md) |
 | `hook` | Execute a Python hook template with `HookContext` input/output handles | [../nodes/hook.md](../nodes/hook.md) |
 

@@ -13,6 +13,7 @@ from magic_agents.models.factory.Nodes import LlmNodeModel
 from magic_agents.node_system.Node import Node
 from magic_agents.node_system.utils import apply_windowing
 from magic_agents.util.primitive_coercion import coerce_primitive_by_type, input_has_value
+from magic_agents.mcp.errors import ToolNameCollisionError
 
 if TYPE_CHECKING:
     from magic_llm.agent import TaskManifest, SubagentBundle
@@ -151,11 +152,29 @@ class NodeLLM(Node):
         Task subagents are loaded via MagicLLM.load_subagents() in process(),
         not collected here. magic-llm owns all subagent architecture.
         """
-        from magic_agents.mcp.errors import ToolNameCollisionError
-        
         tools_schemas = []
         tool_functions = {}
         mcp_instructions: dict[str, str] = {}
+        seen_tool_names: dict[str, str] = {}
+        schema_only_names: set[str] = set()
+        callable_names: set[str] = set()
+
+        def schema_name(schema: Any) -> str | None:
+            if isinstance(schema, dict):
+                function = schema.get("function")
+                if isinstance(function, dict):
+                    name = function.get("name")
+                    if isinstance(name, str) and name:
+                        return name
+            return None
+
+        def register_name(name: str | None, source: str) -> None:
+            if not name:
+                return
+            existing = seen_tool_names.get(name)
+            if existing and existing != source:
+                raise ToolNameCollisionError(tool_name=name, source_nodes=[existing, source])
+            seen_tool_names[name] = source
 
         for handle_name, value in sorted(self.inputs.items()):
             if not handle_name.startswith(self.INPUT_TOOL_PREFIX):
@@ -170,22 +189,19 @@ class NodeLLM(Node):
                 bundle_prefix = getattr(value, 'prefix', '')
                 bundle_count = len(value.tool_schemas)
                 
-                # Collision detection: check for duplicates before merging
-                for tool_name in value.tool_functions.keys():
-                    if tool_name in tool_functions:
-                        # Collision detected - find source nodes
-                        existing_source = getattr(tool_functions[tool_name], '_mcp_node_id', None) or 'existing_tool'
-                        raise ToolNameCollisionError(
-                            tool_name=tool_name,
-                            source_nodes=[existing_source, bundle_node_id]
-                        )
+                for schema in value.tool_schemas:
+                    name = schema_name(schema)
+                    register_name(name, bundle_node_id)
+                    if name:
+                        callable_names.add(name)
                 
                 # Extend schemas and merge functions
                 tools_schemas.extend(value.tool_schemas)
                 
                 # Tag functions with their source node_id for collision tracking
                 for tool_name, func in value.tool_functions.items():
-                    # Add source metadata for collision detection
+                    register_name(tool_name, bundle_node_id)
+                    callable_names.add(tool_name)
                     if not hasattr(func, '_mcp_node_id'):
                         func._mcp_node_id = bundle_node_id
                     tool_functions[tool_name] = func
@@ -205,19 +221,19 @@ class NodeLLM(Node):
             
             # Single-tool path: existing ToolProvider (FetchToolCallable, PythonExecutor)
             elif hasattr(value, 'tool_schema') and hasattr(value, 'tool_callable'):
+                name = schema_name(value.tool_schema)
+                if value.tool_callable is not None:
+                    name = name or getattr(value.tool_callable, '__name__', None)
+                    source = getattr(value.tool_callable, '_source_node_id', None) or handle_name
+                    register_name(name, source)
+                    if name:
+                        callable_names.add(name)
                 tools_schemas.append(value.tool_schema)
                 if value.tool_callable is not None:
                     name = getattr(value.tool_callable, '__name__', None)
                     if name:
-                        # Collision detection for single tools too
-                        if name in tool_functions:
-                            existing_source = getattr(tool_functions[name], '_source_node_id', None) or 'existing_tool'
-                            raise ToolNameCollisionError(
-                                tool_name=name,
-                                source_nodes=[existing_source, self.node_id]
-                            )
-                        # Tag with source node ID for collision tracking
-                        value.tool_callable._source_node_id = self.node_id
+                        if not hasattr(value.tool_callable, '_source_node_id'):
+                            value.tool_callable._source_node_id = handle_name
                         tool_functions[name] = value.tool_callable
             
             # Plain callable: schema auto-extracted by magic-llm
@@ -225,25 +241,95 @@ class NodeLLM(Node):
                 tools_schemas.append(value)
                 name = getattr(value, '__name__', None)
                 if name:
-                    if name in tool_functions:
-                        existing_source = getattr(tool_functions[name], '_source_node_id', None) or 'existing_tool'
-                        raise ToolNameCollisionError(
-                            tool_name=name,
-                            source_nodes=[existing_source, self.node_id]
-                        )
-                    # Tag with source node ID for collision tracking
+                    register_name(name, self.node_id or 'callable_tool')
+                    callable_names.add(name)
                     value._source_node_id = self.node_id
                     tool_functions[name] = value
             
             # Schema-only dict (no executor)
             elif isinstance(value, dict):
+                name = schema_name(value)
+                register_name(name, f"schema_only:{handle_name}")
+                if name:
+                    schema_only_names.add(name)
                 tools_schemas.append(value)
+
+        if schema_only_names and callable_names:
+            raise ValueError(
+                f"NodeLLM:{self.node_id} does not support mixed callable and schema-only tools in v1. "
+                "Move node_tool schemas to a separate LLM node or remove callable tools from this LLM."
+            )
 
         # NOTE: Task subagents are loaded via MagicLLM.load_subagents() 
         # in process() where the client is available.
         # magic-llm owns ALL subagent architecture — no local registry.
 
         return tools_schemas, tool_functions, mcp_instructions
+
+    def _has_schema_only_tools(self, tools_schemas: list, tool_functions: dict) -> bool:
+        callable_names = set(tool_functions.keys())
+        for schema in tools_schemas:
+            if not isinstance(schema, dict):
+                continue
+            name = self._extract_tool_name(schema)
+            if name and name not in callable_names:
+                return True
+        return False
+
+    def _extract_tool_name(self, schema: Any) -> str | None:
+        if not isinstance(schema, dict):
+            return None
+        function = schema.get("function")
+        if not isinstance(function, dict):
+            return None
+        name = function.get("name")
+        return name if isinstance(name, str) and name else None
+
+    def _to_provider_payload(self, value: Any) -> Any:
+        if hasattr(value, "model_dump"):
+            return value.model_dump(exclude_none=True)
+        if isinstance(value, dict):
+            return value
+        return value
+
+    def _normalize_non_stream_tool_calls(self, intention: Any) -> list:
+        calls = getattr(intention, 'tool_calls', None)
+        if calls:
+            return [self._to_provider_payload(call) for call in calls]
+        for choice in getattr(intention, 'choices', []) or []:
+            message = getattr(choice, 'message', None)
+            calls = getattr(message, 'tool_calls', None) if message is not None else None
+            if calls:
+                return [self._to_provider_payload(call) for call in calls]
+        return []
+
+    def _normalize_stream_tool_calls(self, chunk: Any) -> list:
+        choices = getattr(chunk, 'choices', None) or []
+        if not choices:
+            return []
+        choice = choices[0]
+        delta = getattr(choice, 'delta', None)
+        calls = getattr(delta, 'tool_calls', None) if delta is not None else None
+        if not calls:
+            calls = getattr(choice, 'tool_calls', None)
+        return [self._to_provider_payload(call) for call in (calls or [])]
+
+    def _schema_only_tool_call_envelope(self, tool_calls: list) -> dict:
+        return {
+            "execution": "client",
+            "source": "schema_only",
+            "tool_calls": tool_calls,
+        }
+
+    def _emit_schema_only_tool_call_debug(self, envelope: dict) -> dict:
+        return {
+            'type': 'debug',
+            'content': {
+                'event_type': 'TOOL_CALL',
+                'node_id': self.node_id,
+                'data': envelope,
+            },
+        }
 
     def _warn_unsupported_engine(self, client) -> None:
         """Log a warning if the configured engine does not support tools.
@@ -575,6 +661,7 @@ class NodeLLM(Node):
 
         # Collect tools from tool-prefixed input handles
         tools_schemas, tool_functions, mcp_instructions = await self._collect_tools()
+        schema_only_tools_present = self._has_schema_only_tools(tools_schemas, tool_functions)
         
         # Load task subagents via magic-llm unified API (if feature enabled)
         # magic-llm handles discovery → registration → tool schema injection
@@ -582,6 +669,11 @@ class NodeLLM(Node):
         
         # Extend schemas with subagent tool schemas if any registered
         if subagent_bundle.registered_count > 0:
+            if schema_only_tools_present:
+                raise ValueError(
+                    f"NodeLLM:{self.node_id} does not support mixed callable and schema-only tools in v1. "
+                    "Move node_tool schemas to a separate LLM node or remove callable tools from this LLM."
+                )
             # Collision check: subagent tool names against existing graph tool schemas
             existing_names = {s.get("function", {}).get("name") for s in tools_schemas if "function" in s}
             for schema in subagent_bundle.tool_schemas:
@@ -727,7 +819,7 @@ class NodeLLM(Node):
                     await self._hooks.invoke("on_llm_loop_end", _llm_ctx)
 
                 self.generated = intention.content
-                final_tool_calls = getattr(intention, 'tool_calls', []) or []
+                final_tool_calls = self._normalize_non_stream_tool_calls(intention)
                 # Phase 0: emit LLM_GENERATION for execution tree persistence
                 # TODO: verify on_llm_end carries cached/reasoning/audio token fields
                 # before removing _emit_llm_generation fallback (P1-NEW)
@@ -943,6 +1035,7 @@ class NodeLLM(Node):
                         await self._hooks.invoke("on_llm_loop_end", _llm_ctx)
 
                     final_tool_calls = getattr(last_chunk.choices[0].delta, 'tool_calls', []) or []
+                    final_tool_calls = self._normalize_stream_tool_calls(last_chunk)
                     # Phase 0: emit LLM_GENERATION for execution tree persistence
                     # TODO: verify on_llm_end carries cached/reasoning/audio token fields
                     # before removing _emit_llm_generation fallback (P1-NEW)
@@ -1052,6 +1145,10 @@ class NodeLLM(Node):
                 return
         # Yield tool calls on dedicated handle ONLY when tools are present (zero-regression for no-tool graphs)
         if tools_schemas or tool_functions:
+            if schema_only_tools_present:
+                final_tool_calls = self._schema_only_tool_call_envelope(final_tool_calls)
+                if final_tool_calls["tool_calls"]:
+                    yield self._emit_schema_only_tool_call_debug(final_tool_calls)
             yield self.yield_static(final_tool_calls, content_type=self.OUTPUT_HANDLE_TOOL_CALLS)
         # Yield on the configured output handle
         yield self.yield_static(self.generated, content_type=self.OUTPUT_HANDLE_GENERATED)

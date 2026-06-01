@@ -43,13 +43,16 @@ The runtime also supports input handles that can override selected generation se
 - supports streaming and non-streaming execution
 - supports `json_output` with code-block extraction before JSON parsing
 - supports `iterate: true` so the node re-runs on each loop iteration
-- collects tools from `fetch`, `python_exec`, `mcp`, and task-subagent bundles
+- collects tools from `fetch`, `python_exec`, `mcp`, task-subagent bundles, and schema-only `node_tool` definitions
+- passes schema-only `node_tool` definitions directly through provider `tools=` and emits client-executable `handle-tool-calls` envelopes
+- rejects mixed callable/server tools plus schema-only `node_tool` inputs on the same LLM node in v1
 - warns for engines known to have weak/no tool support
 
 ## Gotchas
 
 - if debug is enabled, consumers must handle non-content debug events too
 - `handle-tool-calls` is only emitted when tools are present
+- schema-only `node_tool` calls use `{execution: "client", source: "schema_only", tool_calls: [...]}`; clients execute them
 
 ## Example
 
