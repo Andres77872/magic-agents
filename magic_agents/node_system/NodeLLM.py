@@ -818,7 +818,7 @@ class NodeLLM(Node):
                     _llm_ctx.outputs["total_iterations"] = 1
                     await self._hooks.invoke("on_llm_loop_end", _llm_ctx)
 
-                self.generated = intention.content
+                self.generated = intention.content or ""
                 final_tool_calls = self._normalize_non_stream_tool_calls(intention)
                 # Phase 0: emit LLM_GENERATION for execution tree persistence
                 # TODO: verify on_llm_end carries cached/reasoning/audio token fields
@@ -1196,7 +1196,8 @@ class NodeLLM(Node):
         state['stream'] = self.stream
         state['json_output'] = self.json_output
         state['iterate'] = self.iterate
-        state['generated'] = self.generated[:500] if len(self.generated) > 500 else self.generated  # Truncate long outputs
+        generated = "" if self.generated is None else self.generated
+        state['generated'] = generated[:500] if len(generated) > 500 else generated  # Truncate long outputs
         state['extra_data'] = self.extra_data
         
         # STM windowing diagnostics (no-CHAT path) (M3)
