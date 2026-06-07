@@ -49,9 +49,9 @@ See [EXECUTION_MODEL.md](EXECUTION_MODEL.md).
 
 ## Built-in node surface
 
-The current runtime accepts 17 built-in node types:
+The current runtime accepts 20 built-in node types:
 
-`user_input`, `text`, `constant`, `parser`, `fetch`, `client`, `llm`, `chat`, `send_message`, `loop`, `conditional`, `inner`, `end`, `void`, `python_exec`, `mcp`, `hook`
+`user_input`, `text`, `constant`, `parser`, `fetch`, `client`, `llm`, `chat`, `send_message`, `loop`, `conditional`, `inner`, `end`, `void`, `hook`, `python_exec`, `mcp`, `memory`, `codex`, `node_tool`
 
 See [NODE_REFERENCE.md](NODE_REFERENCE.md) and [../nodes/README.md](../nodes/README.md).
 

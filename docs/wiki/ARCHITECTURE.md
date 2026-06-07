@@ -61,14 +61,14 @@ Those are only the first-pass structural checks. After node/edge instantiation, 
 
 ### 4. Tool-edge backfilling
 
-Before node creation, `_assign_tool_handles()` inspects edges from tool-capable nodes (`fetch` in `tool_mode`, `python_exec`, `mcp`) into `llm` nodes.
+Before node creation, `_assign_tool_handles()` inspects edges from tool-capable nodes (`fetch` in `tool_mode`, tool-mode `python_exec`, `mcp`, and `node_tool`) into `llm` nodes.
 
 It auto-fills:
 
 - `sourceHandle` based on the provider node
 - `targetHandle` as `handle-tool-definition-N` when missing
 
-Exception: `python_exec` has two modes. When its node data includes `code`, it runs as a normal graph node and `_assign_tool_handles()` intentionally skips automatic tool-handle assignment (`agt_flow.py:210-216`). In that node-mode case, existing handles are preserved so the result can route through graph edges instead of being treated as an LLM tool definition. Omit `data.code` only when you want `python_exec` to behave as a tool provider for an LLM.
+Exception: `python_exec` has two modes. When its node data includes `code`, it runs as a normal graph node and `_assign_tool_handles()` intentionally skips automatic tool-handle assignment. In that node-mode case, existing handles are preserved so the result can route through graph edges instead of being treated as an LLM tool definition. Omit `data.code` only when you want `python_exec` to behave as a tool provider for an LLM.
 
 ### 5. Sorting and positioning
 
@@ -91,7 +91,7 @@ Build always appends an internal `void` node and rewrites edges targeting `handl
 
 This is also where aliases such as `json_mode -> json_output` or `provider -> engine` get normalized through node models.
 
-The runtime factory currently maps **17** node types, including `constant` and `hook`, which were missing from older wiki pages.
+The runtime factory currently maps **20** node types, including `codex`, `memory`, and `node_tool`, which were missing from older wiki pages.
 
 ### 8. Recursive inner graphs
 

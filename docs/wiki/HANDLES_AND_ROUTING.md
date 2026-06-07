@@ -34,7 +34,7 @@ flowchart LR
 | `text` | `handle_text_output` |
 | `constant` | `handle_constant_output` |
 | `parser` | `handle_parser_output` |
-| `fetch` | `handle_fetch_output` or tool definition handle in tool mode |
+| `fetch` | `handle_fetch_output` (tool mode emits `FetchToolCallable` on this output unless overridden) |
 | `client` | `handle-client-provider` |
 | `llm` | `handle_streaming_content`, `handle_generated_content`, `handle-tool-calls` |
 | `chat` | `handle_chat_output` |
@@ -43,9 +43,13 @@ flowchart LR
 | `conditional` | dynamic output handle chosen by the condition |
 | `inner` | `handle_content_stream`, `handle_execution_content`, `handle_execution_extras` |
 | `end` | `handle_end_output` |
-| `python_exec` | `handle-tool-definition` |
+| `void` | no user-facing outputs |
+| `python_exec` | tool mode: `handle-tool-definition`; node mode: `handle-python_exec-result` |
 | `mcp` | `handle-tool-definition` |
+| `node_tool` | `handle-tool-definition` |
 | `hook` | `handle-user-output`, `handle-debug-output`, `handle-feedback-output` |
+| `codex` | `handle_user_message` |
+| `memory` | `handle_memory_output` |
 
 ## Legacy handle migration
 
@@ -83,7 +87,8 @@ Example:
 Tool-capable nodes routed into an `llm` use special handle assignment.
 
 - `fetch` in `tool_mode` uses its configured output handle
-- `python_exec` and `mcp` use `handle-tool-definition`
+- `python_exec` in tool mode, `mcp`, and `node_tool` use `handle-tool-definition`
+- `python_exec` with `data.code` is node mode; it emits `handle-python_exec-result` and is skipped by automatic LLM tool-handle assignment
 - `build()` can auto-fill missing `targetHandle` values as `handle-tool-definition-0`, `handle-tool-definition-1`, and so on
 
 That auto-fill behavior is specific to tool-capable nodes routed into `llm`; it is not a generic missing-handle rule for the whole graph.

@@ -49,5 +49,5 @@ Use this page as the navigation hub. The wiki explains concepts and execution be
 ## Source of truth policy
 
 - Runtime behavior is documented from the current codebase, not from stale prose.
-- If code and older docs disagree, the new docs here win until the runtime changes.
+- If code and docs disagree, update the docs from the current runtime behavior.
 - Unresolved mismatches are tracked under [docs/issues/](issues/README.md).

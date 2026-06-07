@@ -168,11 +168,17 @@ Many nodes let you override default input/output handle names.
 
 Examples:
 
+- `user_input.content` and `user_input.message` alias `text`
+- `text.content` aliases `text`
+- `parser.content` and `parser.template` alias `text`
 - `client.provider` aliases `engine`
 - `client.model_name` aliases `model`
 - `fetch.endpoint` aliases `url`
 - `fetch.query` aliases `params`
 - `llm.json_mode` aliases `json_output`
+- `llm.max_output_tokens` aliases `max_tokens`
+- `send_message.content` aliases `message`
+- `send_message.extras` aliases `json_extras`
 - `inner.flow`, `inner.graph`, and `inner.subgraph` alias `magic_flow`
 
 ### Hook-related graph fields are partial by design

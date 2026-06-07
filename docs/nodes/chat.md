@@ -256,9 +256,9 @@ The following fields are exposed via `NodeChat._capture_internal_state()`:
   "edges": [
     {"source": "input", "target": "codex", "sourceHandle": "handle_user_message", "targetHandle": "handle_codex_input"},
     {"source": "codex", "target": "chat", "sourceHandle": "handle_user_message", "targetHandle": "handle_user_message"},
-    {"source": "client", "target": "chat", "sourceHandle": "handle-client-provider", "targetHandle": "handle-system-context"},
+    {"source": "client", "target": "answer", "sourceHandle": "handle-client-provider", "targetHandle": "handle-client-provider"},
     {"source": "chat", "target": "answer", "sourceHandle": "handle_chat_output", "targetHandle": "handle-chat"},
-    {"source": "answer", "target": "end"}
+    {"source": "answer", "target": "end", "sourceHandle": "handle_generated_content", "targetHandle": "handle_flow_input"}
   ]
 }
 ```
@@ -276,9 +276,9 @@ The following fields are exposed via `NodeChat._capture_internal_state()`:
   ],
   "edges": [
     {"source": "input", "target": "chat", "sourceHandle": "handle_user_message", "targetHandle": "handle_user_message"},
-    {"source": "client", "target": "chat", "sourceHandle": "handle-client-provider", "targetHandle": "handle-system-context"},
+    {"source": "client", "target": "answer", "sourceHandle": "handle-client-provider", "targetHandle": "handle-client-provider"},
     {"source": "chat", "target": "answer", "sourceHandle": "handle_chat_output", "targetHandle": "handle-chat"},
-    {"source": "answer", "target": "end"}
+    {"source": "answer", "target": "end", "sourceHandle": "handle_generated_content", "targetHandle": "handle_flow_input"}
   ]
 }
 ```
@@ -298,10 +298,10 @@ The following fields are exposed via `NodeChat._capture_internal_state()`:
   "edges": [
     {"source": "input", "target": "memory-1", "sourceHandle": "handle_user_message", "targetHandle": "handle_memory_input"},
     {"source": "memory-1", "target": "chat", "sourceHandle": "handle_memory_output", "targetHandle": "handle_user_message"},
-    {"source": "client", "target": "chat", "sourceHandle": "handle-client-provider", "targetHandle": "handle-system-context"},
+    {"source": "client", "target": "answer", "sourceHandle": "handle-client-provider", "targetHandle": "handle-client-provider"},
     {"source": "client", "target": "memory-1", "sourceHandle": "handle-client-provider", "targetHandle": "handle-client-provider"},
     {"source": "chat", "target": "answer", "sourceHandle": "handle_chat_output", "targetHandle": "handle-chat"},
-    {"source": "answer", "target": "end"}
+    {"source": "answer", "target": "end", "sourceHandle": "handle_generated_content", "targetHandle": "handle_flow_input"}
   ]
 }
 ```
@@ -323,9 +323,9 @@ The following fields are exposed via `NodeChat._capture_internal_state()`:
   ],
   "edges": [
     {"source": "input", "target": "chat", "sourceHandle": "handle_user_message", "targetHandle": "handle_user_message"},
-    {"source": "client", "target": "chat", "sourceHandle": "handle-client-provider", "targetHandle": "handle-system-context"},
+    {"source": "client", "target": "answer", "sourceHandle": "handle-client-provider", "targetHandle": "handle-client-provider"},
     {"source": "chat", "target": "answer", "sourceHandle": "handle_chat_output", "targetHandle": "handle-chat"},
-    {"source": "answer", "target": "end"}
+    {"source": "answer", "target": "end", "sourceHandle": "handle_generated_content", "targetHandle": "handle_flow_input"}
   ]
 }
 ```

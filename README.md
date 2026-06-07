@@ -19,8 +19,8 @@ Start with:
 ## Installation
 
 ```bash
-git clone https://github.com/your/repo/magic_agents.git
-cd magic_agents
+git clone https://github.com/Andres77872/magic-agents.git
+cd magic-agents
 pip install -e .
 ```
 

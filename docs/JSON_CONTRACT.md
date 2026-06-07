@@ -43,13 +43,13 @@ Optional fields:
 
 ## Node JSON Structure
 
-Each node in `nodes` array must contain:
+Each node in `nodes` array must contain an `id` and `type`; `data` and `position` are optional:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `id` | `string` | **Required** | Unique non-empty identifier |
 | `type` | `string` | **Required** | Canonical type key (20 types) |
-| `data` | `object` | **Required** | Node-specific configuration (may be empty `{}`) |
+| `data` | `object` | Optional | Node-specific configuration. Omitted `data` is treated as `{}` by `build()`. |
 | `position` | `object` | Optional | Canvas position `{x, y}` (default `{x:0, y:0}`) |
 
 ### Validation Rules
@@ -67,7 +67,7 @@ Each node in `nodes` array must contain:
 | Type Key | Node Class | Model Class | Description |
 |----------|------------|-------------|-------------|
 | `user_input` | `NodeUserInput` | `UserInputNodeModel` | User message/file/image input |
-| `end` | `NodeEND` | `EndNodeModel` | Terminal output node |
+| `end` | `NodeEND` | `None` | Terminal output node |
 | `parser` | `NodeParser` | `ParserNodeModel` | Jinja2 template renderer |
 | `client` | `NodeClientLLM` | `ClientNodeModel` | LLM client configuration |
 | `llm` | `NodeLLM` | `LlmNodeModel` | LLM generation node |
@@ -109,12 +109,12 @@ All node types inherit base fields:
 | `files` | `array` | Optional | `null` | - |
 | `images` | `array` | Optional | `null` | - |
 | `extras` | `object` | Optional | `null` | - |
+| `session_id` | `string` | Optional | `null` | - |
+| `session_required` | `boolean` | Optional | `false` | - |
 
 ### end Fields
 
-| Field | Type | Required | Default |
-|-------|------|----------|---------|
-| `end` | `string` | Optional | `null` |
+`end` is instantiated without a dedicated Pydantic model in the runtime factory. Its `data` object is optional and not interpreted by `NodeEND`.
 
 ### parser Fields
 
@@ -142,6 +142,13 @@ All node types inherit base fields:
 | `temperature` | `number` | Optional | `null` | - |
 | `max_tokens` | `integer` | Optional | `null` | `max_output_tokens` |
 | `iterate` | `boolean` | Optional | `false` | - |
+| `history_messages` | `array` | Optional | `null` | - |
+| `max_messages` | `integer` | Optional | `null` | - |
+| `max_input_tokens` | `integer` | Optional | `null` | - |
+| `truncation_strategy` | `string` | Optional | `"tail"` | - |
+| `model` | `string` | Optional | `null` | - |
+
+`history_messages` is backend-injected for no-CHAT graph paths. `max_messages`, `max_input_tokens`, `truncation_strategy`, and `model` mirror the no-CHAT STM fallback controls documented on the `llm` node page and `LlmNodeModel`.
 
 ### fetch Fields
 
@@ -228,24 +235,41 @@ No additional fields beyond base.
 | `safety_mode` | `string` | Optional | `"subprocess"` | Execution mode |
 | `timeout` | `number` | Optional | `30.0` | Max execution seconds |
 | `max_output_chars` | `integer` | Optional | `8000` | Max output length |
+| `code` | `string` or `null` | Optional | `null` | When set, runs as a graph node via `run(handler)` and emits `handle-python_exec-result` |
+| `tool_name` | `string` or `null` | Optional | `null` | Tool-mode name; defaults to `execute_python` when omitted |
+| `handles` | `object` or `null` | Optional | `null` | Handle overrides for config inputs and output |
 
 ### mcp Fields
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `servers` | `array` | **Required** | - | MCP server configs (min 1) |
+
+Each `servers` entry accepts:
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `transport` | `"stdio"` or `"http"` | Optional | `"stdio"` | Transport selector |
+| `command` | `string` or `null` | Required for `stdio` | `null` | Stdio command |
+| `args` | `array[string]` or `null` | Optional | `null` | Stdio args |
+| `env` | `object` or `null` | Optional | `null` | Stdio environment |
+| `cwd` | `string` or `null` | Optional | `null` | Stdio working directory |
+| `url` | `string` or `null` | Required for `http` | `null` | HTTP endpoint URL |
+| `headers` | `object` or `null` | Optional | `null` | HTTP headers |
 | `init_timeout` | `number` | Optional | `10.0` | Server init timeout (1-120s) |
 | `tool_timeout` | `number` | Optional | `30.0` | Tool call timeout (1-300s) |
 | `discovery_timeout` | `number` | Optional | `30.0` | Tool discovery timeout (5-120s) |
+| `prefix` | `string` or `null` | Optional | `null` | Tool name prefix; defaults to node ID when omitted |
+| `tool_allowlist` | `array[string]` or `null` | Optional | `null` | Allow only listed tools |
+| `tool_denylist` | `array[string]` or `null` | Optional | `null` | Deny listed tools |
 
-Each `servers` entry requires:
-- `transport`: `"stdio"` or `"http"` (required)
-- For stdio: `command` (string, required)
-- For HTTP: `url` (string, required)
+The config model allows one or more server configs, but the runtime currently requires exactly one server per MCP node in v1.
 
 ### memory Fields
 
 Uses `MemoryNodeModel` for vector memory configuration. NodeMemory extracts memories from user messages via LLM extraction, stores them with embeddings, and injects relevant past memories as prompt context.
+
+Extraction/upsert is currently fire-and-forget. Vector search and injection run synchronously for the current invocation; newly extracted memories become available on later invocations.
 
 **Data structure**:
 ```json
@@ -254,7 +278,8 @@ Uses `MemoryNodeModel` for vector memory configuration. NodeMemory extracts memo
   "memory_entries": [
     {"content": "User prefers email communication", "trigger": "preference"}
   ],
-  "top_k": 10
+  "top_k": 10,
+  "context_messages_count": 5
 }
 ```
 
@@ -265,17 +290,18 @@ When `top_k` is absent, the default value of `5` is used (Pydantic `Field(defaul
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `id` | `string` | Optional | Auto-generated 32-char UUID4 hex | **STRICTLY auto-generated. DO NOT provide in JSON — raises `ValidationError`.** Auto-generated as `uuid.uuid4().hex` (32 hex chars). |
-| `source_id` | `string` or `null` | Optional | `null` | Read-back field populated by vector DB search. Contains the scope-aware composite document ID (UUID format) from the vector storage. Distinct from auto-generated `id`. **Not provided in input JSON** — populated by VDB search result reconstruction. `null` when metadata lacks the `doc_id` key (backward-compatible with pre-existing entries). |
+| `source_id` | `string` or `null` | Optional | `null` | Read-back field populated by vector DB search from metadata `doc_id`. Distinct from auto-generated `id`. Usually omitted in input JSON and populated by VDB search result reconstruction. `null` when metadata lacks the `doc_id` key. |
 | `content` | `string` | **Required** | — | Memory content text (min 1 character). |
 | `trigger` | `string` | Optional | `""` | Memory tag/category (singular string, unlike CodexEntry's `triggers` list). |
-| `created_at` | `string (ISO 8601)` | Optional | Auto-generated UTC timestamp | Memory creation timestamp. Auto-generated via `datetime.now(UTC)`. |
+| `created_at` | `string (ISO 8601)` | Optional | Auto-generated UTC timestamp when omitted | Memory creation timestamp. |
 
 **`MemoryEntry` validation rules**:
 - `id` MUST NOT be provided manually. If set in JSON, the model raises `ValidationError` with message `"MemoryEntry.id is auto-generated. Do not provide a value for 'id'. Remove the 'id' field from the memory entry JSON."`
 - `source_id` is intentionally unvalidated — it is a read-back field populated by vector DB search. Unlike `id`, there is no `reject_manual_id` validator on `source_id`. Users CAN set `source_id` in input JSON, but it will be overwritten by VDB search results at runtime.
 - `content` MUST be non-empty (min 1 character). Empty content raises `ValidationError`.
 - Extra unknown fields in a `MemoryEntry` are rejected (inherited `extra='forbid'`).
-- `id` and `created_at` are always auto-generated at construction time, never read from JSON input.
+- `id` is always auto-generated at construction time and never read from JSON input.
+- `created_at` is auto-generated when omitted; a provided parseable datetime is accepted by Pydantic.
 
 **`MemoryNodeModel` fields**:
 
@@ -284,13 +310,14 @@ When `top_k` is absent, the default value of `5` is used (Pydantic `Field(defaul
 | `instructions` | `string` | Optional | `null` | LLM extraction prompt template. When `null`, only vector search is performed (no LLM extraction). When set, NodeMemory uses this as the system prompt for the extraction LLM call. |
 | `memory_entries` | `array` | Optional | `[]` | Seed memory entries (array of `MemoryEntry` objects). This is a seed/export snapshot only — the vector DB is the source of truth for runtime search. |
 | `top_k` | `integer` | Optional | `5` | Number of top memory matches to retrieve from vector search. Valid range: 1–50. When absent, Pydantic fills the default (5). |
+| `context_messages_count` | `integer` | Optional | `5` | Previous history messages to include in the extraction prompt. Valid range: 0-100. |
 
 **Handle contract**:
 
 | Direction | Handle | Purpose | Mandatory |
 |-----------|--------|---------|-----------|
 | Input | `handle_memory_input` | User message input (from upstream Codex or UserInput node) | Yes |
-| Input | `handle-client-provider` | MagicLLM client delivery (from NodeClientLLM) | No — degrades to search-only mode if missing |
+| Input | `handle-client-provider` | MagicLLM client delivery for optional extraction (from NodeClientLLM) | No — extraction is skipped if missing |
 | Output | `handle_memory_output` | Memory-enriched message output (NOT `handle_user_message` — avoids competing-edge race with Codex) | N/A |
 
 **Output handle design**: NodeMemory emits `handle_memory_output` (not `handle_user_message`) to avoid the competing-edge anti-pattern when both NodeCodex and NodeMemory exist in the same graph. If Codex also emits `handle_user_message`, having both emit the same handle causes a non-deterministic race on the downstream Chat node. Graph authors can override the output handle to `handle_user_message` via `handles={"output": "handle_user_message"}` when no Codex coexistence is needed.
@@ -319,7 +346,7 @@ When `top_k` is absent, the default value of `5` is used (Pydantic `Field(defaul
   "edges": [
     {"source": "input", "target": "memory-1", "sourceHandle": "handle_user_message", "targetHandle": "handle_memory_input"},
     {"source": "memory-1", "target": "chat", "sourceHandle": "handle_memory_output", "targetHandle": "handle_user_message"},
-    {"source": "chat", "target": "end"}
+    {"source": "chat", "target": "end", "sourceHandle": "handle_chat_output", "targetHandle": "handle_flow_input"}
   ]
 }
 ```
@@ -340,32 +367,32 @@ When `top_k` is absent, the default value of `5` is used (Pydantic `Field(defaul
     {"source": "codex", "target": "memory-1", "sourceHandle": "handle_user_message", "targetHandle": "handle_memory_input"},
     {"source": "client", "target": "memory-1", "sourceHandle": "handle-client-provider", "targetHandle": "handle-client-provider"},
     {"source": "memory-1", "target": "chat", "sourceHandle": "handle_memory_output", "targetHandle": "handle_user_message"},
-    {"source": "chat", "target": "end"}
+    {"source": "chat", "target": "end", "sourceHandle": "handle_chat_output", "targetHandle": "handle_flow_input"}
   ]
 }
 ```
 
-**Scope-aware composite IDs**: NodeMemory uses a **scope-aware composite** SHA256 hash as the vector DB document ID for upserts:
+**Vector document IDs**: The current background upsert path creates a fresh UUID4 string for each vector document:
 
 ```
-doc_id = str(uuid.UUID(sha256(content + "|" + session_id + "|" + node_id)[:32]))
+doc_id = str(uuid.uuid4())
 ```
 
-This ensures:
-- **Same-scope dedup**: Same content within the same session AND same node produces the same document ID — no duplicates.
-- **Cross-scope isolation**: Different sessions or different nodes produce different document IDs — preventing cross-scope metadata overwrite.
-- **Qdrant compatibility**: 32-hex-char truncation + UUID formatting produces valid Qdrant point IDs.
-- The `MemoryEntry.source_id` field (returned from search) holds this document ID for traceability.
+That UUID is used as the vector DB point ID and stored in metadata under `"doc_id"`. Search result reconstruction copies that metadata value into `MemoryEntry.source_id` for traceability. Scope isolation is enforced by search filters, not by deterministic document IDs or content hashing.
 
-**Constructor runtime deps**: Runtime dependencies (`vector_db`, `embedding_client`) are injected through the `run_agent(deps=...)` public API — not serialized in graph JSON. See [`docs/nodes/memory.md`](nodes/memory.md#dependency-injection-via-run_agentdeps) for usage examples.
+**Constructor runtime deps**: Runtime dependencies (`vector_db`, `embedding_client`, and optional `history_messages`) are not serialized in graph JSON. Inject them with `build(..., deps=...)` or with `run_agent(raw_graph_dict, deps=...)`. When `run_agent()` receives an already built `AgentFlowModel`, new `deps` are ignored because node instances have already been constructed. See [`docs/nodes/memory.md`](nodes/memory.md#dependency-injection-via-run_agentdeps) for usage examples.
+
+Embedding operations require an injected `embedding_client` with `llm.async_embedding(...)`. The MagicLLM client on `handle-client-provider` is used for extraction, not vector search/upsert.
 
 **`_capture_internal_state` fields** (debugging):
 | Field | Type | Description |
 |-------|------|-------------|
 | `memory_entry_count` | `int` | Total entries in the runtime memory list |
-| `extracted_count` | `int` | Memories extracted in the last `process()` run |
+| `extracted_count` | `int` | Reserved extraction counter. Current background extraction path resets it to `0` and does not update it before yielding. |
 | `injected_count` | `int` | Memories injected in the last `process()` run |
 | `top_k` | `int` | Configured number of top matches to retrieve from vector search. Mirrors the `top_k` field from `MemoryNodeModel` (default 5, range 1–50). |
+| `_context_messages_count` | `int` | Configured number of history messages used for extraction context. |
+| `_history_messages_count` | `int` | Count of constructor-injected history messages available to extraction. |
 | `vector_db_available` | `bool` | Always `true` — vector DB is auto-created as ephemeral fallback if none is injected. Retained for backward compatibility. |
 | `vector_db_backend` | `str` | Backend type: `"ephemeral"` (InMemoryVectorDB auto-created or manually passed), `"qdrant"` (QdrantVectorDB), or `"external"` (any other VectorDB-compatible implementation). Diagnostic field — signals configuration, not health. |
 
@@ -554,13 +581,13 @@ Each edge in `edges` array must contain:
 
 1. **`source` must reference existing node**
 2. **`target` must reference existing node**
-3. **Handles must be valid** — unknown handles rejected
+3. **Handles are validated** — legacy handles are rejected; unknown/opaque target handles usually warn in `warn`/`shadow` modes and are stricter only in deferred `strict` paths
 
 ---
 
 ## Handle Naming Convention
 
-### Canonical Output Handles
+### Default Output Handles
 
 | Node Type | Output Handles |
 |-----------|----------------|
@@ -568,7 +595,7 @@ Each edge in `edges` array must contain:
 | `text` | `handle_text_output` |
 | `constant` | `handle_constant_output` |
 | `parser` | `handle_parser_output` |
-| `fetch` | `handle_fetch_output` (or tool handle in tool mode) |
+| `fetch` | `handle_fetch_output` (tool mode emits `FetchToolCallable` on this output unless overridden) |
 | `client` | `handle-client-provider` |
 | `llm` | `handle_streaming_content`, `handle_generated_content`, `handle-tool-calls` |
 | `chat` | `handle_chat_output` |
@@ -577,31 +604,68 @@ Each edge in `edges` array must contain:
 | `conditional` | Dynamic (from `output_handles` or condition result) |
 | `inner` | `handle_content_stream`, `handle_execution_content`, `handle_execution_extras` |
 | `end` | `handle_end_output` |
+| `void` | None |
+| `python_exec` | Tool mode: `handle-tool-definition`; node mode: `handle-python_exec-result` |
+| `mcp` | `handle-tool-definition` |
+| `node_tool` | `handle-tool-definition` |
 | `hook` | `handle-user-output`, `handle-debug-output`, `handle-feedback-output` |
 | `codex` | `handle_user_message` |
 | `memory` | `handle_memory_output` |
 
-### Canonical Input Handles
+### Default / Runtime Input Handles
 
 | Node Type | Input Handles |
 |-----------|---------------|
+| `user_input` | None (source node) |
+| `text` | Registry includes `handle_flow_input`, but current `NodeText` ignores inputs and emits configured static text |
 | `constant` | None (source node) |
+| `parser` | Arbitrary template variables; `handle_parser_input_*` is the common dynamic pattern |
+| `fetch` | `handle-url`, `handle-fetch-method`, `handle-fetch-data`, `handle-fetch-json_data`, `handle-fetch-headers`, `handle_fetch_input` |
+| `client` | Runtime overrides: `handle-client-engine`, `handle-client-model` |
 | `llm` | `handle-client-provider`, `handle-chat`, `handle-system-context`, `handle_user_message`, tool handles; runtime-overridable generation handles: `handle-llm-temperature`, `handle-llm-top_p`, `handle-llm-max_tokens`, `handle-llm-stream`, `handle-llm-iterate`, `handle-llm-json_output` |
+| `chat` | `handle-system-context`, `handle_user_message`, `handle_messages`, `handle_user_files`, `handle_user_images` |
+| `send_message` | `handle_send_extra` |
+| `loop` | `handle_list`, `handle_loop` |
+| `conditional` | `handle_input` plus custom merge input handles |
+| `inner` | `handle_user_message`, `handle_client_extras` |
 | `end` | `handle_flow_input` |
-| `parser` | Arbitrary (template references) |
+| `void` | Internal sink; accepts rewritten `handle-void` targets |
+| `python_exec` | Config inputs: `handle-python_exec-safety_mode`, `handle-python_exec-timeout`, `handle-python_exec-max_output_chars`; in node mode, other incoming handles populate `run(handler)` |
+| `mcp` | None |
+| `node_tool` | None |
 | `hook` | `handle-hook-context` (receives `HookContext` at runtime) |
 | `codex` | `handle_codex_input` |
 | `memory` | `handle_memory_input`, `handle-client-provider` |
+
+Some runtime-consumed input handles are accepted through warn-mode opaque-handle behavior even when the static registry has not promoted them to strict canonical inputs yet.
 
 ### Port Cardinality
 
 | Node Type | Handle | Cardinality | Exclusive |
 |-----------|--------|-------------|-----------|
+| `llm` | `handle_user_message` | `one` | `True` |
+| `llm` | `handle-client-provider` | `one` | `True` |
+| `llm` | `handle-tool-definition` / `handle-tool-definition-*` | `many` | `False` |
+| `llm` | `handle-chat` | `one` | `True` |
+| `llm` | `handle-system-context` | `one` | `True` |
+| `text` | `handle_flow_input` | `one` | `True` |
+| `parser` | `handle_parser_input` / `handle_parser_input_*` | `many` | `False` |
+| `end` | `handle_flow_input` | `many` | `False` |
+| `conditional` | `handle_input` | `many` | `False` |
+| `loop` | `handle_list` | `one` | `True` |
+| `loop` | `handle_loop` | `many` | `False` |
+| `inner` | `handle_user_message` | `one` | `True` |
+| `inner` | `handle_client_extras` | `one` | `True` |
+| `send_message` | `handle_send_extra` | `one` | `True` |
+| `fetch` | request component handles | `one` | `True` |
+| `hook` | `handle-hook-context` | `one` | `True` |
+| `codex` | `handle_codex_input` | `one` | `True` |
 | `memory` | `handle_memory_input` | `one` | `True` |
 
 Notes:
 - `handle_memory_input` accepts exactly one incoming edge (cardinality `one`, exclusive `True`).
-- `handle-client-provider` does NOT have a cardinality entry — the default behavior allows the edge without additional cardinality enforcement.
+- `memory.handle-client-provider` does NOT have a cardinality entry — the default behavior allows the edge without additional cardinality enforcement.
+- Ports not listed here default to ambiguous/warn-mode behavior in the current registry.
 
 ---
 
@@ -700,13 +764,13 @@ Frontend TypeScript interfaces in `magic-ui/src/App/Flow/Types/nodeModels.ts` mi
 
 ## Known Limitations
 
-### 1. OpenAI-Only Embedding
+### 1. Embedding Client Required
 
-Only OpenAI-compatible engines support `async_embedding()`. Non-OpenAI engines cause `async_embedding()` to return `None`, which makes NodeMemory skip all vector operations (embedding, upsert, and search) while still supporting LLM extraction (Phase 2) when `instructions` is configured.
+NodeMemory does not use the `handle-client-provider` MagicLLM client for embedding. Vector search and background upsert require an injected `embedding_client` whose `llm` object implements `async_embedding(...)`.
 
-**Behavior**: When embedding is unavailable, NodeMemory logs a diagnostic warning mentioning the OpenAI-only limitation and yields the original user message unchanged. The graph continues executing — no crash.
+**Behavior**: When `embedding_client` is unavailable or embedding fails, NodeMemory logs a diagnostic warning and yields the original user message unchanged. The graph continues executing.
 
-**Workaround**: Use an OpenAI-compatible engine for any graph that requires memory enrichment via vector similarity. Non-OpenAI graphs work correctly but output messages without memory context.
+**Workaround**: Inject a compatible embedding client through `deps`. An OpenAI-compatible MagicLLM client is one option, but any test/custom client with `llm.async_embedding(...)` can satisfy the runtime contract.
 
 ### 2. No Codex Trigger Integration
 
@@ -726,16 +790,17 @@ This matches the `<codex_content>` policy exactly — see the [codex Fields](#co
 
 ### 4. No Hard Validation for Missing Runtime Dependencies
 
-NodeMemory does not enforce hard validation in `validate_graph()` for missing vector DB or MagicLLM client.
+NodeMemory does not enforce hard validation in `validate_graph()` for missing vector DB, MagicLLM client, or embedding client.
 
-- **No vector DB**: An ephemeral `InMemoryVectorDB` is auto-created at construction time. Embedding, upsert, and search proceed normally but all data is lost on process restart. Use `pip install magic-agents[qdrant]` and inject a `QdrantVectorDB` via `deps` for persistent storage. The `vector_db_backend` debug field signals `"ephemeral"` vs `"qdrant"` vs `"external"`.
-- **No client**: Extraction is skipped. Search is skipped. The message passes through unchanged.
+- **No vector DB**: An ephemeral `InMemoryVectorDB` is auto-created at construction time. With an injected embedding client, upsert and search can still run, but all data is lost on process restart. Use `pip install magic-agents[qdrant]` and inject a `QdrantVectorDB` via `deps` for persistent storage. The `vector_db_backend` debug field signals `"ephemeral"` vs `"qdrant"` vs `"external"`.
+- **No MagicLLM client**: Extraction is skipped.
+- **No embedding client**: Vector search/upsert is skipped. The message passes through unchanged.
 
 This matches the existing pattern: the Codex competing-edge anti-pattern is also documented but not enforced at validation.
 
-### 5. Single-Engine Embedding Only
+### 5. Single Embedding Client Only
 
-Vector search depends on embedding quality from a single embedding model. No multi-engine embedding abstraction layer exists. The embedding model is determined by the MagicLLM client's engine configuration.
+Vector search depends on embedding quality from one injected embedding client. No multi-engine embedding abstraction layer exists.
 
 **Scope isolation** via `filter_scope={"session_id": ..., "node_id": ...}` ensures memory pools are independent across sessions and nodes. However, if the embedding model changes between sessions, the same text may produce different embedding vectors, affecting search relevance. This is expected behavior — no backward-compatibility guarantee across model changes.
 

@@ -13,9 +13,15 @@ Construct and yield a `MagicLLM` client instance.
 
 - `handle-client-provider`
 
+## Runtime-overridable inputs
+
+- `handle-client-engine`
+- `handle-client-model`
+
 ## Important behavior
 
 - aliases `provider -> engine`, `config/credentials -> api_info`, `model_name -> model`
+- runtime input handles can override `engine` and `model` before client creation/yield
 - resolves `{{env.NAME}}` in API info and extra data
 - maps `api_key` to `private_key` when needed for MagicLLM
 - yields a debug configuration error instead of crashing on client init failure

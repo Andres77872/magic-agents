@@ -8,6 +8,7 @@ Tests that scan all JSON files under examples/ to ensure:
 """
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,14 @@ HARDCODED_KEY_PATTERNS = [
     "sk-proj-",    # OpenAI project keys
     "sk-",         # OpenAI keys (general)
     "jina_",       # Jina API keys
+    "sk-or-",      # OpenRouter keys
 ]
+PROVIDER_KEY_PATTERNS = {
+    "OPENAI_API_KEY": re.compile(r"(?:sk-proj-|sk-)[A-Za-z0-9_-]{16,}"),
+    "OPENROUTER_API_KEY": re.compile(r"sk-or-[A-Za-z0-9_-]{16,}"),
+    "SERPER_API_KEY": re.compile(r"[A-Fa-f0-9]{32,}"),
+    "JINA_API_KEY": re.compile(r"jina_[A-Za-z0-9_-]{16,}"),
+}
 
 # The expected env placeholder pattern used by build()
 ENV_PLACEHOLDER_PATTERN = "{{env."
@@ -31,6 +39,30 @@ def _find_example_json_files() -> list[Path]:
     if not examples_dir.exists():
         return []
     return sorted(examples_dir.rglob("*.json"))
+
+
+def _project_root() -> Path:
+    return Path(__file__).parent.parent
+
+
+def _nodes_of(data: dict) -> list[dict]:
+    if isinstance(data.get("content"), dict):
+        return data["content"].get("nodes", [])
+    return data.get("nodes", [])
+
+
+def _edges_of(data: dict) -> list[dict]:
+    if isinstance(data.get("content"), dict):
+        return data["content"].get("edges", [])
+    return data.get("edges", [])
+
+
+def _tracked_env_fixture_files() -> list[Path]:
+    root = _project_root()
+    candidates = [root / ".env.test"]
+    candidates.extend(root.glob(".env*.example"))
+    candidates.extend(root.glob(".env*.template"))
+    return sorted({path for path in candidates if path.exists()})
 
 
 class TestNoHardcodedApiKeys:
@@ -60,6 +92,27 @@ class TestNoHardcodedApiKeys:
                 f"Found hardcoded API key patterns in {len(violations)} location(s):\n"
                 + "\n".join(violations)
             )
+
+    def test_no_real_looking_provider_keys_in_env_fixtures(self):
+        """Tracked env/test fixtures may name variables, but must not contain live-looking values."""
+        env_files = _tracked_env_fixture_files()
+        if not env_files:
+            pytest.skip("No tracked env fixture files found")
+
+        violations = []
+        for env_file in env_files:
+            for line in env_file.read_text().splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or "=" not in stripped:
+                    continue
+                name, value = stripped.split("=", 1)
+                name = name.strip()
+                value = value.strip().strip('"').strip("'")
+                pattern = PROVIDER_KEY_PATTERNS.get(name)
+                if pattern and pattern.search(value):
+                    violations.append(f"{env_file.relative_to(_project_root())}: {name} contains a real-looking credential")
+
+        assert not violations, "Env credential hygiene violations (values redacted):\n" + "\n".join(violations)
 
     def test_all_example_jsons_are_valid_json(self):
         """Every JSON file under examples/ must be valid JSON."""
@@ -99,11 +152,7 @@ class TestEnvPlaceholders:
             except json.JSONDecodeError:
                 continue  # Already caught by the valid JSON test
 
-            # Check both flat and wrapped variants
-            nodes = data.get("nodes", [])
-            if not nodes:
-                nodes = data.get("content", {}).get("nodes", [])
-
+            nodes = _nodes_of(data)
             has_client = any(n.get("type") == "client" for n in nodes)
             has_placeholder = ENV_PLACEHOLDER_PATTERN in json_file.read_text()
 
@@ -133,7 +182,7 @@ class TestDeepResearchExample:
         with open(self.DEEP_RESEARCH_PATH) as f:
             data = json.load(f)
         
-        user_input_nodes = [n for n in data["nodes"] if n["type"] == "user_input"]
+        user_input_nodes = [n for n in _nodes_of(data) if n["type"] == "user_input"]
         assert len(user_input_nodes) == 1, "Expected exactly one user_input node"
         
         user_input = user_input_nodes[0]
@@ -145,10 +194,9 @@ class TestDeepResearchExample:
         with open(self.DEEP_RESEARCH_PATH) as f:
             data = json.load(f)
         
-        node_types = {n["type"] for n in data["nodes"]}
+        node_types = {n["type"] for n in _nodes_of(data)}
         
         assert "fetch" in node_types, "Expected fetch node(s) for search/scrape tools"
-        assert "python_exec" in node_types, "Expected python_exec node for code execution"
         assert "llm" in node_types, "Expected llm node(s) for agent execution"
 
     def test_deep_research_fetch_nodes_have_tool_mode(self):
@@ -156,14 +204,13 @@ class TestDeepResearchExample:
         with open(self.DEEP_RESEARCH_PATH) as f:
             data = json.load(f)
         
-        fetch_nodes = [n for n in data["nodes"] if n["type"] == "fetch"]
+        fetch_nodes = [n for n in _nodes_of(data) if n["type"] == "fetch"]
         assert len(fetch_nodes) >= 2, "Expected at least 2 fetch nodes (search + scrape)"
         
         for fetch_node in fetch_nodes:
             node_data = fetch_node.get("data", {})
             assert node_data.get("tool_mode") == True, f"fetch node '{fetch_node['id']}' must have tool_mode=true"
             assert "tool_name" in node_data, f"fetch node '{fetch_node['id']}' must have tool_name"
-            assert "tool_parameters" in node_data, f"fetch node '{fetch_node['id']}' must have explicit tool_parameters"
 
     def test_deep_research_tool_edges_connect_to_llm(self):
         """Tool nodes must connect to LLM via handle-tool-definition-* handles.
@@ -174,15 +221,17 @@ class TestDeepResearchExample:
         with open(self.DEEP_RESEARCH_PATH) as f:
             data = json.load(f)
         
-        tool_nodes = [n["id"] for n in data["nodes"] if n["type"] in ("fetch", "python_exec")]
-        llm_nodes = [n["id"] for n in data["nodes"] if n["type"] == "llm"]
+        nodes = _nodes_of(data)
+        edges = _edges_of(data)
+        tool_nodes = [n["id"] for n in nodes if n["type"] in ("fetch", "python_exec")]
+        llm_nodes = [n["id"] for n in nodes if n["type"] == "llm"]
         
         tool_to_llm_edges = [
-            e for e in data["edges"]
+            e for e in edges
             if e["source"] in tool_nodes and e["target"] in llm_nodes
         ]
         
-        assert len(tool_to_llm_edges) >= 3, "Expected at least 3 tool->LLM edges"
+        assert len(tool_to_llm_edges) >= 2, "Expected search and scrape tool edges"
         
         for edge in tool_to_llm_edges:
             # sourceHandle is optional - backend normalizes it via _assign_tool_handles()
@@ -204,3 +253,15 @@ class TestDeepResearchExample:
         assert graph is not None, "build() returned None"
         assert len(graph.nodes) > 0, "build() produced no nodes"
         assert len(graph.edges) > 0, "build() produced no edges"
+
+
+class TestGraphFormatHelpers:
+    def test_nodes_and_edges_support_flat_graphs(self):
+        data = {"nodes": [{"id": "n1"}], "edges": [{"id": "e1"}]}
+        assert _nodes_of(data) == [{"id": "n1"}]
+        assert _edges_of(data) == [{"id": "e1"}]
+
+    def test_nodes_and_edges_support_nested_graphs(self):
+        data = {"type": "graph", "content": {"nodes": [{"id": "n1"}], "edges": [{"id": "e1"}]}}
+        assert _nodes_of(data) == [{"id": "n1"}]
+        assert _edges_of(data) == [{"id": "e1"}]

@@ -128,7 +128,12 @@ CANONICAL_INPUT_HANDLES: Dict[str, Set[str]] = {
         'handle_parser_input',  # Primary input (templates may have multiple)
     },
     ModelAgentFlowTypesModel.FETCH: {
-        'handle_fetch_input',
+        'handle-url',
+        'handle-fetch-data',
+        'handle-fetch-json_data',
+        'handle-fetch-method',
+        'handle-fetch-headers',
+        'handle_fetch_input',  # documented template-context alias for existing browsing examples
     },
     ModelAgentFlowTypesModel.CLIENT: set(),  # No inputs (provides client to LLM)
     ModelAgentFlowTypesModel.LLM: {
@@ -143,13 +148,15 @@ CANONICAL_INPUT_HANDLES: Dict[str, Set[str]] = {
         'handle_send_extra',  # Extra context input
     },
     ModelAgentFlowTypesModel.LOOP: {
-        'handle_loop_input',  # Primary input for iteration
+        'handle_list',  # Primary input for iteration
+        'handle_loop',  # Per-iteration result aggregation input
     },
     ModelAgentFlowTypesModel.CONDITIONAL: {
-        'handle_context',  # Context input for evaluation
+        'handle_input',  # Primary context input for evaluation
     },
     ModelAgentFlowTypesModel.INNER: {
-        'handle_inner_input',  # Primary input for inner graph
+        'handle_user_message',  # Primary input for inner graph
+        'handle_client_extras',  # Optional parent/client extras input
     },
     ModelAgentFlowTypesModel.END: {
         'handle_flow_input',  # Standard input for END nodes
@@ -198,28 +205,40 @@ PORT_CARDINALITY: Dict[str, Dict[str, CardinalityInfo]] = {
     ModelAgentFlowTypesModel.PARSER: {
         'handle_parser_input': CardinalityInfo(cardinality="many", exclusive=False, multi_compatible=True),
     },
-    # END node: single input
+    # END node: multiple alternate terminal paths may converge here
     ModelAgentFlowTypesModel.END: {
-        'handle_flow_input': CardinalityInfo(cardinality="one", exclusive=True),
+        'handle_flow_input': CardinalityInfo(
+            cardinality="many",
+            exclusive=False,
+            multi_compatible=True,
+            merge_policy="collect",
+        ),
     },
-    # Conditional: single context input
+    # Conditional: primary context input; additional custom merge handles are runtime-supported.
     ModelAgentFlowTypesModel.CONDITIONAL: {
-        'handle_context': CardinalityInfo(cardinality="one", exclusive=True),
+        'handle_input': CardinalityInfo(cardinality="many", exclusive=False, multi_compatible=True, merge_policy="merge"),
     },
-    # Loop: single input for iteration
+    # Loop: list input plus many-compatible feedback aggregation input
     ModelAgentFlowTypesModel.LOOP: {
-        'handle_loop_input': CardinalityInfo(cardinality="one", exclusive=True),
+        'handle_list': CardinalityInfo(cardinality="one", exclusive=True),
+        'handle_loop': CardinalityInfo(cardinality="many", exclusive=False, multi_compatible=True, merge_policy="collect"),
     },
-    # Inner: single input
+    # Inner: user message plus optional extras
     ModelAgentFlowTypesModel.INNER: {
-        'handle_inner_input': CardinalityInfo(cardinality="one", exclusive=True),
+        'handle_user_message': CardinalityInfo(cardinality="one", exclusive=True),
+        'handle_client_extras': CardinalityInfo(cardinality="one", exclusive=True),
     },
     # Send message: single extra input
     ModelAgentFlowTypesModel.SEND_MESSAGE: {
         'handle_send_extra': CardinalityInfo(cardinality="one", exclusive=True),
     },
-    # Fetch: single input
+    # Fetch: runtime-supported request component inputs
     ModelAgentFlowTypesModel.FETCH: {
+        'handle-url': CardinalityInfo(cardinality="one", exclusive=True),
+        'handle-fetch-data': CardinalityInfo(cardinality="one", exclusive=True),
+        'handle-fetch-json_data': CardinalityInfo(cardinality="one", exclusive=True),
+        'handle-fetch-method': CardinalityInfo(cardinality="one", exclusive=True),
+        'handle-fetch-headers': CardinalityInfo(cardinality="one", exclusive=True),
         'handle_fetch_input': CardinalityInfo(cardinality="one", exclusive=True),
     },
     # VOID: sink node, no cardinality restrictions
@@ -459,6 +478,11 @@ def is_valid_target_handle(
     # Rule 1: Dynamic pattern handles pass
     if is_dynamic_handle(target_handle):
         return True, "Dynamic pattern handle"
+
+    # Conditional nodes support documented custom merge input handles in addition
+    # to the primary handle_input port. Runtime merges all populated inputs.
+    if target_node_type == ModelAgentFlowTypesModel.CONDITIONAL and target_handle:
+        return True, "Conditional custom merge input handle"
     
     # Rule 2: Check against instance handles if provided
     if target_node_instance_handles is not None:

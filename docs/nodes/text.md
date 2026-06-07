@@ -17,6 +17,7 @@ Emit a static text payload into the graph.
 
 - resolves content from `text` or `content`
 - yields exactly one static output
+- ignores runtime inputs; use `parser` if the output must depend on upstream data
 
 ## Example
 

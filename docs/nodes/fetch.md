@@ -13,6 +13,15 @@ Perform an HTTP request, or expose an HTTP request as a callable tool.
 
 - `handle_fetch_output`
 
+## Runtime-overridable inputs
+
+- `handle-url`
+- `handle-fetch-method`
+- `handle-fetch-data`
+- `handle-fetch-json_data`
+- `handle-fetch-headers`
+- `handle_fetch_input` — template context only; exposed to Jinja rendering and does not override a request field
+
 ## Important behavior
 
 - supports `url`/`endpoint`, `params`/`query`, `data`/`body`, `json_data`/`json_body`

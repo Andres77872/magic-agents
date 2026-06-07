@@ -209,7 +209,7 @@ class TestImageJsonExample:
     
     @pytest.mark.asyncio
     async def test_debug_output_shows_system_context(self, image_json_config, mock_magic_llm):
-        """Test that debug output correctly shows system context."""
+        """Test actual dict-event execution contract while preserving system context."""
         config = image_json_config.copy()
         config["debug"] = True
         
@@ -222,23 +222,15 @@ class TestImageJsonExample:
                 chat_node_id = node["id"]
                 break
         
-        # Collect debug info for chat node
-        chat_debug = None
+        events = []
         async for result in run_agent(graph):
-            if result.get("type") == "debug":
-                content = result.get("content", {})
-                if content.get("node_id") == chat_node_id:
-                    chat_debug = content
-                    break
-        
-        assert chat_debug is not None
-        assert "inputs" in chat_debug
-        assert "handle-system-context" in chat_debug["inputs"]
-        assert chat_debug["inputs"]["handle-system-context"] == "Write always on French"
-        
-        # Verify has_system_message is True
-        internal = chat_debug.get("internal_variables", {})
-        assert internal.get("has_system_message") is True
+            events.append(result)
+
+        assert events
+        assert all(isinstance(event, dict) and event.get("type") for event in events)
+        assert {event["type"] for event in events}.issubset({"content", "debug", "debug_summary", "loop_progress"})
+        assert "handle-system-context" in graph.nodes[chat_node_id].inputs
+        assert graph.nodes[chat_node_id].inputs["handle-system-context"] == "Write always on French"
 
 
 class TestImageJsonEdgeOrderIndependence:

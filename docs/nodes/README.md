@@ -4,6 +4,8 @@ One page per current built-in node type. This section is the detailed reference 
 
 ## Built-in nodes
 
+Current runtime node count: 20.
+
 - [user_input.md](user_input.md)
 - [text.md](text.md)
 - [constant.md](constant.md)
@@ -23,6 +25,7 @@ One page per current built-in node type. This section is the detailed reference 
 - [mcp.md](mcp.md)
 - [tool.md](tool.md)
 - [memory.md](memory.md)
+- [codex.md](codex.md)
 
 ## Related guides
 

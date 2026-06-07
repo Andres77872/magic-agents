@@ -9,6 +9,22 @@ Run LLM generation in batch or streaming mode, optionally with tools or JSON par
 - `NodeLLM`
 - model: `LlmNodeModel`
 
+## Config fields
+
+| Field | Default | Notes |
+|-------|---------|-------|
+| `stream` | `false` | Streaming mode. |
+| `json_output` | `false` | `json_mode` aliases this field. |
+| `temperature` | `null` | Can be overridden at runtime. |
+| `top_p` | `null` | Can be overridden at runtime. |
+| `max_tokens` | `null` | `max_output_tokens` aliases this field. |
+| `iterate` | `false` | Re-run inside loop iterations when true. |
+| `history_messages` | `null` | Backend-injected no-CHAT fallback history. |
+| `max_messages` | `null` | No-CHAT STM fallback control; defaults to 30 at runtime when no CHAT node is used and this is unset. |
+| `max_input_tokens` | `null` | No-CHAT token budget control. |
+| `truncation_strategy` | `"tail"` | `"tail"` or `"token_budget"`. |
+| `model` | `null` | Usage/logging only. |
+
 ## Default inputs
 
 - `handle-client-provider`

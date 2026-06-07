@@ -4,6 +4,8 @@ This wiki page is the conceptual node index used while reading the guide pages. 
 
 ## Built-in node types
 
+Current runtime node count: 20.
+
 | Type | Purpose | Detail page |
 | --- | --- | --- |
 | `user_input` | Inject user text/files/images and create chat/thread IDs | [../nodes/user_input.md](../nodes/user_input.md) |
@@ -20,11 +22,12 @@ This wiki page is the conceptual node index used while reading the guide pages. 
 | `inner` | Execute a nested graph | [../nodes/inner.md](../nodes/inner.md) |
 | `end` | Terminal completion node | [../nodes/end.md](../nodes/end.md) |
 | `void` | Internal sink node | [../nodes/void.md](../nodes/void.md) |
-| `python_exec` | Expose a Python execution tool | [../nodes/python_exec.md](../nodes/python_exec.md) |
+| `python_exec` | Expose a Python execution tool or run `data.code` as a graph node | [../nodes/python_exec.md](../nodes/python_exec.md) |
 | `mcp` | Discover MCP tools and expose an `MCPToolBundle` | [../nodes/mcp.md](../nodes/mcp.md) |
 | `node_tool` | Provide a raw schema-only OpenAI function tool for client-side execution | [../nodes/tool.md](../nodes/tool.md) |
-| `memory` | Extract memories via LLM, store with embeddings, and inject relevant context via vector similarity | [../nodes/memory.md](../nodes/memory.md) |
+| `memory` | Background-extract memories, store embeddings, and inject relevant context via vector similarity | [../nodes/memory.md](../nodes/memory.md) |
 | `hook` | Execute a Python hook template with `HookContext` input/output handles | [../nodes/hook.md](../nodes/hook.md) |
+| `codex` | Prepend trigger-matched context to user-message-compatible content | [../nodes/codex.md](../nodes/codex.md) |
 
 ## Cross-cutting reads
 

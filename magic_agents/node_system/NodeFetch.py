@@ -397,6 +397,7 @@ class NodeFetch(Node):
     DEFAULT_INPUT_DATA = 'handle-fetch-data'
     DEFAULT_INPUT_JSON_DATA = 'handle-fetch-json_data'
     DEFAULT_INPUT_HEADERS = 'handle-fetch-headers'
+    DEFAULT_INPUT_TEMPLATE_CONTEXT = 'handle_fetch_input'
 
     def __init__(self,
                  data: FetchNodeModel,
@@ -425,6 +426,9 @@ class NodeFetch(Node):
         self.INPUT_HANDLE_DATA = handles.get('data', self.DEFAULT_INPUT_DATA)
         self.INPUT_HANDLE_JSON_DATA = handles.get('json_data', self.DEFAULT_INPUT_JSON_DATA)
         self.INPUT_HANDLE_HEADERS = handles.get('headers', self.DEFAULT_INPUT_HEADERS)
+        # Backward-compatible template-context input used by existing browsing examples.
+        # It does not override request fields; it is exposed to Jinja templates via self.inputs.
+        self.INPUT_HANDLE_TEMPLATE_CONTEXT = handles.get('input', self.DEFAULT_INPUT_TEMPLATE_CONTEXT)
         self.OUTPUT_HANDLE = handles.get('output', handles.get('response', self.DEFAULT_OUTPUT_HANDLE))
         # Tool mode configuration
         self.tool_mode = getattr(data, 'tool_mode', False)
