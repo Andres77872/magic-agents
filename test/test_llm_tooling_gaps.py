@@ -77,6 +77,7 @@ class TestSchemaOnlyNodeToolEnvelope:
         assert tool_output["content"]["content"] == {
             "execution": "client",
             "source": "schema_only",
+            "node_id": "llm-1",
             "tool_calls": [tool_call],
         }
         assert any(
@@ -121,7 +122,70 @@ class TestSchemaOnlyNodeToolEnvelope:
         assert tool_outputs[0]["content"]["content"] == {
             "execution": "client",
             "source": "schema_only",
+            "node_id": "llm-1",
             "tool_calls": [tool_call],
+        }
+
+    @pytest.mark.asyncio
+    async def test_streaming_schema_only_accumulates_tool_call_deltas_across_chunks(self):
+        def chunk(tool_calls=None, *, finish_reason=None):
+            stream_chunk = MagicMock()
+            stream_chunk.choices = [MagicMock()]
+            stream_chunk.choices[0].delta.content = ""
+            stream_chunk.choices[0].delta.tool_calls = tool_calls
+            stream_chunk.choices[0].tool_calls = None
+            stream_chunk.choices[0].finish_reason = finish_reason
+            stream_chunk.usage = None
+            stream_chunk.model = "mock-model"
+            stream_chunk.id = "chunk-1"
+            return stream_chunk
+
+        chunks = [
+            chunk([
+                {
+                    "index": 0,
+                    "id": "call_fragmented",
+                    "type": "function",
+                    "function": {"name": "client_lookup", "arguments": ""},
+                }
+            ]),
+            chunk([{"index": 0, "function": {"arguments": "{\"query\":"}}]),
+            chunk([{"index": 0, "function": {"arguments": "\"value\"}"}}]),
+            chunk(None, finish_reason="tool_calls"),
+        ]
+
+        async def stream(*args, **kwargs):
+            for item in chunks:
+                yield item
+
+        mock_client = MagicMock()
+        mock_client.llm.model = "mock-model"
+        mock_client.llm.async_stream_generate = stream
+        mock_client.run_agent_stream_async = AsyncMock()
+
+        node = make_llm_node(stream=True)
+        node.inputs = {
+            "handle-client-provider": mock_client,
+            "handle_user_message": "hello",
+            "handle-tool-definition-0": schema_tool("client_lookup"),
+        }
+
+        outputs = [event async for event in node.process([])]
+
+        tool_outputs = [event for event in outputs if event["type"] == "handle-tool-calls"]
+        assert len(tool_outputs) == 1
+        assert tool_outputs[0]["content"]["content"] == {
+            "execution": "client",
+            "source": "schema_only",
+            "node_id": "llm-1",
+            "tool_calls": [
+                {
+                    "index": 0,
+                    "id": "call_fragmented",
+                    "type": "function",
+                    "function": {"name": "client_lookup", "arguments": "{\"query\":\"value\"}"},
+                }
+            ],
         }
 
 

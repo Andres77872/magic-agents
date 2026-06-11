@@ -314,10 +314,63 @@ class NodeLLM(Node):
             calls = getattr(choice, 'tool_calls', None)
         return [self._to_provider_payload(call) for call in (calls or [])]
 
+    def _accumulate_stream_tool_calls(self, accumulator: dict[int, dict], chunk: Any) -> None:
+        """Merge OpenAI-compatible streaming tool-call deltas by index."""
+        for fallback_index, raw_call in enumerate(self._normalize_stream_tool_calls(chunk)):
+            if not isinstance(raw_call, dict):
+                continue
+
+            raw_index = raw_call.get("index")
+            try:
+                call_index = int(raw_index) if raw_index is not None else fallback_index
+            except (TypeError, ValueError):
+                call_index = fallback_index
+
+            call = accumulator.setdefault(call_index, {})
+            if raw_index is not None:
+                call["index"] = call_index
+
+            for key in ("id", "type"):
+                value = raw_call.get(key)
+                if value is not None:
+                    call[key] = value
+
+            for key, value in raw_call.items():
+                if key in {"index", "id", "type", "function"} or value is None:
+                    continue
+                call[key] = value
+
+            raw_function = raw_call.get("function")
+            if not isinstance(raw_function, dict):
+                continue
+
+            function = call.setdefault("function", {})
+            for key, value in raw_function.items():
+                if value is None:
+                    continue
+                if key == "arguments":
+                    if isinstance(value, str):
+                        function["arguments"] = f"{function.get('arguments', '')}{value}"
+                    else:
+                        function["arguments"] = value
+                else:
+                    function[key] = value
+
+    def _finalize_stream_tool_calls(self, accumulator: dict[int, dict]) -> list:
+        tool_calls: list[dict] = []
+        for call_index in sorted(accumulator):
+            call = accumulator[call_index]
+            function = call.get("function") if isinstance(call.get("function"), dict) else {}
+            has_payload = bool(call.get("id") or function.get("name") or function.get("arguments") is not None)
+            if has_payload:
+                tool_calls.append(call)
+        return tool_calls
+
     def _schema_only_tool_call_envelope(self, tool_calls: list) -> dict:
         return {
             "execution": "client",
             "source": "schema_only",
+            "node_id": self.node_id,
             "tool_calls": tool_calls,
         }
 
@@ -569,6 +622,96 @@ class NodeLLM(Node):
             llm_config=llm_config,
         )
 
+    @staticmethod
+    def _first_not_none(*values: Any) -> Any:
+        for value in values:
+            if value is not None:
+                return value
+        return None
+
+    def _usage_to_plain_dict(self, usage: Any) -> dict[str, Any]:
+        if usage is None:
+            return {}
+        if isinstance(usage, dict):
+            return dict(usage)
+        if hasattr(usage, 'model_dump'):
+            dumped = usage.model_dump()
+            return dict(dumped or {}) if isinstance(dumped, dict) else {}
+        return {}
+
+    def _usage_detail_outputs(self, usage: Any, *, response_id: Any = None) -> dict[str, Any]:
+        data = self._usage_to_plain_dict(usage)
+
+        def attr(name: str) -> Any:
+            if isinstance(usage, dict):
+                return usage.get(name)
+            return getattr(usage, name, None) if usage is not None else None
+
+        def nested_detail(container_name: str, field_name: str) -> Any:
+            nested = data.get(container_name)
+            if nested is None and usage is not None and not isinstance(usage, dict):
+                nested = getattr(usage, container_name, None)
+            if isinstance(nested, dict):
+                return nested.get(field_name)
+            return getattr(nested, field_name, None) if nested is not None else None
+
+        audio_tokens = self._first_not_none(data.get('audio_tokens'), attr('audio_tokens'))
+        if audio_tokens is None:
+            audio_prompt = nested_detail('prompt_tokens_details', 'audio_tokens')
+            audio_completion = nested_detail('completion_tokens_details', 'audio_tokens')
+            if audio_prompt is not None or audio_completion is not None:
+                audio_tokens = (audio_prompt or 0) + (audio_completion or 0)
+
+        raw_usage_json = data.get('raw_usage_json')
+        if raw_usage_json is None:
+            raw_usage_json = attr('raw_usage_json')
+        if raw_usage_json is None and data and hasattr(usage, 'model_dump'):
+            raw_usage_json = dict(data)
+
+        return {
+            'provider_request_id': self._first_not_none(
+                data.get('provider_request_id'),
+                attr('provider_request_id'),
+                response_id,
+            ),
+            'prompt_tokens': self._first_not_none(data.get('prompt_tokens'), attr('prompt_tokens')),
+            'completion_tokens': self._first_not_none(data.get('completion_tokens'), attr('completion_tokens')),
+            'total_tokens': self._first_not_none(data.get('total_tokens'), attr('total_tokens')),
+            'cached_tokens_read': self._first_not_none(
+                data.get('cached_tokens_read'),
+                data.get('cached_read_tokens'),
+                attr('cached_tokens_read'),
+                attr('cached_read_tokens'),
+                nested_detail('prompt_tokens_details', 'cached_tokens'),
+            ),
+            'cached_tokens_write': self._first_not_none(
+                data.get('cached_tokens_write'),
+                data.get('cached_write_tokens'),
+                attr('cached_tokens_write'),
+                attr('cached_write_tokens'),
+            ),
+            'reasoning_tokens': self._first_not_none(
+                data.get('reasoning_tokens'),
+                attr('reasoning_tokens'),
+                nested_detail('completion_tokens_details', 'reasoning_tokens'),
+            ),
+            'audio_tokens': audio_tokens,
+            'accepted_prediction_tokens': self._first_not_none(
+                data.get('accepted_prediction_tokens'),
+                attr('accepted_prediction_tokens'),
+                nested_detail('completion_tokens_details', 'accepted_prediction_tokens'),
+            ),
+            'rejected_prediction_tokens': self._first_not_none(
+                data.get('rejected_prediction_tokens'),
+                attr('rejected_prediction_tokens'),
+                nested_detail('completion_tokens_details', 'rejected_prediction_tokens'),
+            ),
+            'provider_extra': self._first_not_none(data.get('provider_extra'), attr('provider_extra')),
+            'service_tier': self._first_not_none(data.get('service_tier'), attr('service_tier')),
+            'usage_source': self._first_not_none(data.get('usage_source'), attr('usage_source')),
+            'raw_usage_json': raw_usage_json,
+        }
+
     async def process(self, chat_log):
         self.stream = self._resolve_runtime_value(self.INPUT_HANDLER_STREAM, self._default_stream, 'bool')
         self.iterate = self._resolve_runtime_value(self.INPUT_HANDLER_ITERATE, self._default_iterate, 'bool')
@@ -595,6 +738,37 @@ class NodeLLM(Node):
                     return extract_message(msg['content'])
                 return json.dumps(msg)
             return str(msg) if msg is not None else ''
+
+        def inject_history_message(chat_obj: ModelChat, msg: dict) -> None:
+            role = msg.get('role', 'user')
+            raw_content = msg.get('content', '')
+            content = extract_message(raw_content)
+
+            if role == 'user':
+                chat_obj.add_user_message(content)
+            elif role == 'assistant':
+                tool_calls = msg.get('tool_calls')
+                if isinstance(tool_calls, list) and tool_calls:
+                    chat_obj.add_tool_call_message(
+                        tool_calls=tool_calls,
+                        content=None if raw_content is None else content,
+                    )
+                else:
+                    chat_obj.add_assistant_message(content)
+            elif role == 'tool':
+                tool_call_id = msg.get('tool_call_id')
+                if isinstance(tool_call_id, str) and tool_call_id:
+                    chat_obj.add_tool_result(
+                        tool_call_id=tool_call_id,
+                        content=content,
+                        is_error=bool(msg.get('is_error', False)),
+                    )
+                    if msg.get('name') is not None:
+                        chat_obj.messages[-1]['name'] = msg.get('name')
+                else:
+                    chat_obj.add_message(role, content)
+            elif role == 'system':
+                chat_obj.add_system_message(content)
 
         client: MagicLLM = self.get_input(self.INPUT_HANDLER_CLIENT_PROVIDER, required=True)
         if c := params.get(self.INPUT_HANDLER_CHAT):
@@ -636,14 +810,7 @@ class NodeLLM(Node):
                 logger.debug("NodeLLM:%s injecting %d history_messages (no-CHAT graph path)",
                              self.node_id, len(self._history_messages))
                 for msg in self._history_messages:
-                    role = msg.get('role', 'user')
-                    content = extract_message(msg.get('content', ''))
-                    if role == 'user':
-                        chat.add_user_message(content)
-                    elif role == 'assistant':
-                        chat.add_assistant_message(content)
-                    elif role == 'system':
-                        chat.add_system_message(content)
+                    inject_history_message(chat, msg)
             if k := params.get(self.INPUT_HANDLER_USER_MESSAGE):
                 chat.add_user_message(extract_message(k))
             else:
@@ -801,17 +968,15 @@ class NodeLLM(Node):
                 # === HOOK: on_llm_end (schema-only tools non-streaming path, Phase 0 R0.1) ===
                 if _llm_ctx is not None:
                     usage = getattr(intention, 'usage', None)
+                    usage_outputs = self._usage_detail_outputs(usage, response_id=getattr(intention, 'id', None))
                     finish_reason = None
                     if hasattr(intention, 'choices') and intention.choices:
                         finish_reason = intention.choices[0].finish_reason
                     _llm_ctx.outputs = {
                         "model": getattr(intention, 'model', ''),
                         "content": getattr(intention, 'content', ''),
-                        "provider_request_id": getattr(intention, 'id', None),
-                        "prompt_tokens": getattr(usage, 'prompt_tokens', None) if usage else None,
-                        "completion_tokens": getattr(usage, 'completion_tokens', None) if usage else None,
-                        "total_tokens": getattr(usage, 'total_tokens', None) if usage else None,
                         "finish_reason": finish_reason,
+                        **usage_outputs,
                     }
                     await self._hooks.invoke("on_llm_end", _llm_ctx)
                     # Single-call path — fire on_llm_loop_end with total_iterations: 1
@@ -847,17 +1012,15 @@ class NodeLLM(Node):
                 # === HOOK: on_llm_end (non-tool non-streaming path, Phase 0 R0.4) ===
                 if _llm_ctx is not None:
                     usage = getattr(intention, 'usage', None)
+                    usage_outputs = self._usage_detail_outputs(usage, response_id=getattr(intention, 'id', None))
                     finish_reason = None
                     if hasattr(intention, 'choices') and intention.choices:
                         finish_reason = intention.choices[0].finish_reason
                     _llm_ctx.outputs = {
                         "model": getattr(intention, 'model', ''),
                         "content": getattr(intention, 'content', ''),
-                        "provider_request_id": getattr(intention, 'id', None),
-                        "prompt_tokens": getattr(usage, 'prompt_tokens', None) if usage else None,
-                        "completion_tokens": getattr(usage, 'completion_tokens', None) if usage else None,
-                        "total_tokens": getattr(usage, 'total_tokens', None) if usage else None,
                         "finish_reason": finish_reason,
+                        **usage_outputs,
                     }
                     await self._hooks.invoke("on_llm_end", _llm_ctx)
                     # Single-call path — fire on_llm_loop_end with total_iterations: 1
@@ -1009,33 +1172,32 @@ class NodeLLM(Node):
 
                 self._warn_unsupported_engine(client)
                 last_chunk = None
+                stream_tool_calls: dict[int, dict] = {}
                 async for i in client.llm.async_stream_generate(chat, tools=tools_schemas, **self.extra_data):
                     self.generated += i.choices[0].delta.content or ''
                     last_chunk = i
+                    self._accumulate_stream_tool_calls(stream_tool_calls, i)
                     yield self.yield_static(i, content_type=self.OUTPUT_HANDLE_CONTENT)
                 if last_chunk:
                     # === HOOK: on_llm_end (schema-only tools streaming path, Phase 0 R0.2) ===
                     if _llm_ctx is not None:
                         usage = getattr(last_chunk, 'usage', None)
+                        usage_outputs = self._usage_detail_outputs(usage, response_id=getattr(last_chunk, 'id', None))
                         finish_reason = None
                         if hasattr(last_chunk, 'choices') and last_chunk.choices:
                             finish_reason = last_chunk.choices[0].finish_reason
                         _llm_ctx.outputs = {
                             "model": getattr(last_chunk, 'model', ''),
                             "content": self.generated,
-                            "provider_request_id": getattr(last_chunk, 'id', None),
-                            "prompt_tokens": getattr(usage, 'prompt_tokens', None) if usage else None,
-                            "completion_tokens": getattr(usage, 'completion_tokens', None) if usage else None,
-                            "total_tokens": getattr(usage, 'total_tokens', None) if usage else None,
                             "finish_reason": finish_reason,
+                            **usage_outputs,
                         }
                         await self._hooks.invoke("on_llm_end", _llm_ctx)
                         # Single-call path — fire on_llm_loop_end with total_iterations: 1
                         _llm_ctx.outputs["total_iterations"] = 1
                         await self._hooks.invoke("on_llm_loop_end", _llm_ctx)
 
-                    final_tool_calls = getattr(last_chunk.choices[0].delta, 'tool_calls', []) or []
-                    final_tool_calls = self._normalize_stream_tool_calls(last_chunk)
+                    final_tool_calls = self._finalize_stream_tool_calls(stream_tool_calls)
                     # Phase 0: emit LLM_GENERATION for execution tree persistence
                     # TODO: verify on_llm_end carries cached/reasoning/audio token fields
                     # before removing _emit_llm_generation fallback (P1-NEW)
@@ -1072,17 +1234,18 @@ class NodeLLM(Node):
                 # === HOOK: on_llm_end (non-tool streaming path, Phase 0 R0.4) ===
                 if _llm_ctx is not None:
                     usage = getattr(last_chunk, 'usage', None) if last_chunk else None
+                    usage_outputs = self._usage_detail_outputs(
+                        usage,
+                        response_id=getattr(last_chunk, 'id', None) if last_chunk else None,
+                    )
                     finish_reason = None
                     if last_chunk and hasattr(last_chunk, 'choices') and last_chunk.choices:
                         finish_reason = last_chunk.choices[0].finish_reason
                     _llm_ctx.outputs = {
                         "model": getattr(last_chunk, 'model', '') if last_chunk else '',
                         "content": self.generated,
-                        "provider_request_id": getattr(last_chunk, 'id', None) if last_chunk else None,
-                        "prompt_tokens": getattr(usage, 'prompt_tokens', None) if usage else None,
-                        "completion_tokens": getattr(usage, 'completion_tokens', None) if usage else None,
-                        "total_tokens": getattr(usage, 'total_tokens', None) if usage else None,
                         "finish_reason": finish_reason,
+                        **usage_outputs,
                     }
                     await self._hooks.invoke("on_llm_end", _llm_ctx)
                     # Single-call path — fire on_llm_loop_end with total_iterations: 1
@@ -1168,18 +1331,15 @@ class NodeLLM(Node):
             Debug event dict suitable for yielding via SYSTEM_EVENT_DEBUG channel.
         """
         usage = getattr(intention, 'usage', None)
+        usage_outputs = self._usage_detail_outputs(
+            usage,
+            response_id=getattr(intention, 'id', None),
+        )
         event_payload = {
             'event_type': 'LLM_GENERATION',
             'node_id': self.node_id,
             'model': getattr(intention, 'model', 'unknown'),
-            'provider_request_id': getattr(intention, 'id', None),
-            'prompt_tokens': getattr(usage, 'prompt_tokens', 0) if usage else 0,
-            'completion_tokens': getattr(usage, 'completion_tokens', 0) if usage else 0,
-            'total_tokens': getattr(usage, 'total_tokens', 0) if usage else 0,
-            'cached_tokens_read': getattr(usage, 'cached_read_tokens', 0) if usage else 0,
-            'cached_tokens_write': getattr(usage, 'cached_write_tokens', 0) if usage else 0,
-            'reasoning_tokens': getattr(usage, 'reasoning_tokens', 0) if usage else 0,
-            'audio_tokens': getattr(usage, 'audio_tokens', 0) if usage else 0,
+            **usage_outputs,
         }
         if duration_ms is not None:
             event_payload['duration_ms'] = duration_ms

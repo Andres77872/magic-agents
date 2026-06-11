@@ -73,6 +73,9 @@ class NodeMemory(Node):
 
         # NEW: history_messages injected from api.magic_llm deps
         self._history_messages: list[dict] = kwargs.pop('history_messages', [])
+        # Optional API-side tracker lets request finalization await background
+        # MEMORY extraction/upsert before computing client-visible usage totals.
+        self._background_task_tracker = kwargs.pop('background_task_tracker', None)
 
         # Handle overrides
         handles = handles or {}
@@ -122,10 +125,19 @@ class NodeMemory(Node):
         # FIRE-AND-FORGET: Background extraction + upsert (Phases 2-3)
         # =====================================================================
         if self._instructions and (client or self._embedding_client):
-            asyncio.create_task(
-                self._extract_and_upsert_background(msg_str, client, chat_log),
-                name=f"mem-extract-{self.node_id}",
-            )
+            background_coro = self._extract_and_upsert_background(msg_str, client, chat_log)
+            if callable(self._background_task_tracker):
+                try:
+                    self._background_task_tracker(background_coro)
+                except Exception as exc:
+                    logger.warning(
+                        "NodeMemory '%s': background_task_tracker failed, falling back to create_task: %s",
+                        self.node_id,
+                        exc,
+                    )
+                    asyncio.create_task(background_coro, name=f"mem-extract-{self.node_id}")
+            else:
+                asyncio.create_task(background_coro, name=f"mem-extract-{self.node_id}")
 
         # =====================================================================
         # SEQUENTIAL: Vector search + injection (Phases 4-6)

@@ -122,8 +122,12 @@ class HookRelay(AgentHooks):
         so existing consumers with legacy state objects remain compatible.
         """
         value = getattr(state, "step", None)
+        if not isinstance(value, int):
+            value = None
         if value is None:
             value = getattr(state, "iteration", fallback)
+        if not isinstance(value, int):
+            value = fallback
         return value
 
     def _next_sequence(self) -> int:
@@ -257,6 +261,96 @@ class HookRelay(AgentHooks):
 
         return ctx
 
+    @staticmethod
+    def _first_not_none(*values: Any) -> Any:
+        for value in values:
+            if value is not None:
+                return value
+        return None
+
+    def _usage_to_plain_dict(self, usage: Any) -> Dict[str, Any]:
+        if usage is None:
+            return {}
+        if isinstance(usage, dict):
+            return dict(usage)
+        if hasattr(usage, 'model_dump'):
+            dumped = usage.model_dump()
+            return dict(dumped or {}) if isinstance(dumped, dict) else {}
+        return {}
+
+    def _usage_detail_outputs(self, usage: Any, *, response_id: Any = None) -> Dict[str, Any]:
+        data = self._usage_to_plain_dict(usage)
+
+        def attr(name: str) -> Any:
+            if isinstance(usage, dict):
+                return usage.get(name)
+            return getattr(usage, name, None) if usage is not None else None
+
+        def nested_detail(container_name: str, field_name: str) -> Any:
+            nested = data.get(container_name)
+            if nested is None and usage is not None and not isinstance(usage, dict):
+                nested = getattr(usage, container_name, None)
+            if isinstance(nested, dict):
+                return nested.get(field_name)
+            return getattr(nested, field_name, None) if nested is not None else None
+
+        audio_tokens = self._first_not_none(data.get('audio_tokens'), attr('audio_tokens'))
+        if audio_tokens is None:
+            audio_prompt = nested_detail('prompt_tokens_details', 'audio_tokens')
+            audio_completion = nested_detail('completion_tokens_details', 'audio_tokens')
+            if audio_prompt is not None or audio_completion is not None:
+                audio_tokens = (audio_prompt or 0) + (audio_completion or 0)
+
+        raw_usage_json = data.get('raw_usage_json')
+        if raw_usage_json is None:
+            raw_usage_json = attr('raw_usage_json')
+        if raw_usage_json is None and data and hasattr(usage, 'model_dump'):
+            raw_usage_json = dict(data)
+
+        return {
+            "provider_request_id": self._first_not_none(
+                data.get('provider_request_id'),
+                attr('provider_request_id'),
+                response_id,
+            ),
+            "prompt_tokens": self._first_not_none(data.get('prompt_tokens'), attr('prompt_tokens')),
+            "completion_tokens": self._first_not_none(data.get('completion_tokens'), attr('completion_tokens')),
+            "total_tokens": self._first_not_none(data.get('total_tokens'), attr('total_tokens')),
+            "cached_tokens_read": self._first_not_none(
+                data.get('cached_tokens_read'),
+                data.get('cached_read_tokens'),
+                attr('cached_tokens_read'),
+                attr('cached_read_tokens'),
+                nested_detail('prompt_tokens_details', 'cached_tokens'),
+            ),
+            "cached_tokens_write": self._first_not_none(
+                data.get('cached_tokens_write'),
+                data.get('cached_write_tokens'),
+                attr('cached_tokens_write'),
+                attr('cached_write_tokens'),
+            ),
+            "reasoning_tokens": self._first_not_none(
+                data.get('reasoning_tokens'),
+                attr('reasoning_tokens'),
+                nested_detail('completion_tokens_details', 'reasoning_tokens'),
+            ),
+            "audio_tokens": audio_tokens,
+            "accepted_prediction_tokens": self._first_not_none(
+                data.get('accepted_prediction_tokens'),
+                attr('accepted_prediction_tokens'),
+                nested_detail('completion_tokens_details', 'accepted_prediction_tokens'),
+            ),
+            "rejected_prediction_tokens": self._first_not_none(
+                data.get('rejected_prediction_tokens'),
+                attr('rejected_prediction_tokens'),
+                nested_detail('completion_tokens_details', 'rejected_prediction_tokens'),
+            ),
+            "provider_extra": self._first_not_none(data.get('provider_extra'), attr('provider_extra')),
+            "service_tier": self._first_not_none(data.get('service_tier'), attr('service_tier')),
+            "usage_source": self._first_not_none(data.get('usage_source'), attr('usage_source')),
+            "raw_usage_json": raw_usage_json,
+        }
+
     # === AgentHooks Protocol Implementation ===
 
     def on_iteration_start(self, iteration: int, state: AgentState) -> None:
@@ -313,67 +407,17 @@ class HookRelay(AgentHooks):
             response: The raw LLM response.
             state: The current agent state (read-only).
         """
-        self._current_provider_request_id = getattr(response, 'id', None)
-
         usage = getattr(response, 'usage', None) or {}
-        prompt_tokens = usage.get('prompt_tokens') if isinstance(usage, dict) else getattr(usage, 'prompt_tokens', None)
-        completion_tokens = usage.get('completion_tokens') if isinstance(usage, dict) else getattr(usage, 'completion_tokens', None)
-        total_tokens = usage.get('total_tokens') if isinstance(usage, dict) else getattr(usage, 'total_tokens', None)
-
-        # Extract detail fields — handle both object-style (UsageModel) and dict-style usage.
-        # Per spec HOOK_RELAY_FORWARD_ALL_USAGE_FIELDS: forward ALL UsageModel detail fields
-        # including cached_tokens_read, cached_tokens_write, reasoning_tokens, audio_tokens,
-        # and raw_usage_json. For object-style, also check nested prompt_tokens_details and
-        # completion_tokens_details (where magic-llm UsageModel stores these fields).
-        if isinstance(usage, dict):
-            cached_tokens_read = usage.get('cached_tokens_read')
-            cached_tokens_write = usage.get('cached_tokens_write')
-            reasoning_tokens = usage.get('reasoning_tokens')
-            audio_tokens = usage.get('audio_tokens')
-            raw_usage_json = usage.get('raw_usage_json')
-        else:
-            # Try direct attributes first (provider-specific usage objects may have these)
-            cached_tokens_read = getattr(usage, 'cached_tokens_read', None)
-            if cached_tokens_read is None:
-                prompt_details = getattr(usage, 'prompt_tokens_details', None)
-                if prompt_details is not None:
-                    cached_tokens_read = getattr(prompt_details, 'cached_tokens', None)
-
-            cached_tokens_write = getattr(usage, 'cached_tokens_write', None)
-
-            reasoning_tokens = getattr(usage, 'reasoning_tokens', None)
-            if reasoning_tokens is None:
-                completion_details = getattr(usage, 'completion_tokens_details', None)
-                if completion_details is not None:
-                    reasoning_tokens = getattr(completion_details, 'reasoning_tokens', None)
-
-            audio_tokens = getattr(usage, 'audio_tokens', None)
-            if audio_tokens is None:
-                prompt_details = getattr(usage, 'prompt_tokens_details', None)
-                completion_details = getattr(usage, 'completion_tokens_details', None)
-                audio_prompt = getattr(prompt_details, 'audio_tokens', 0) if prompt_details is not None else 0
-                audio_comp = getattr(completion_details, 'audio_tokens', 0) if completion_details is not None else 0
-                audio_tokens = (audio_prompt or 0) + (audio_comp or 0)
-
-            raw_usage_json = getattr(usage, 'raw_usage_json', None)
-            if raw_usage_json is None and hasattr(usage, 'model_dump'):
-                raw_usage_json = usage.model_dump()
+        usage_outputs = self._usage_detail_outputs(usage, response_id=getattr(response, 'id', None))
+        self._current_provider_request_id = usage_outputs.get("provider_request_id")
 
         context = self._build_context(
             outputs={
                 "model": getattr(response, 'model', 'unknown'),
                 "content": getattr(response, 'content', ''),
                 "finish_reason": getattr(response, 'finish_reason', None),
-                "provider_request_id": self._current_provider_request_id,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": total_tokens,
-                "cached_tokens_read": cached_tokens_read,
-                "cached_tokens_write": cached_tokens_write,
-                "reasoning_tokens": reasoning_tokens,
-                "audio_tokens": audio_tokens,
-                "raw_usage_json": raw_usage_json,
                 "iteration": self._iteration_from_state(state),
+                **usage_outputs,
             }
         )
         self._safe_invoke_sync("on_llm_end", context)
@@ -502,9 +546,7 @@ class HookRelay(AgentHooks):
         """
         iteration = self._iteration_from_state(state)
         usage = getattr(final_response, 'usage', None) or {}
-        prompt_tokens = usage.get('prompt_tokens') if isinstance(usage, dict) else getattr(usage, 'prompt_tokens', None)
-        completion_tokens = usage.get('completion_tokens') if isinstance(usage, dict) else getattr(usage, 'completion_tokens', None)
-        total_tokens = usage.get('total_tokens') if isinstance(usage, dict) else getattr(usage, 'total_tokens', None)
+        usage_outputs = self._usage_detail_outputs(usage, response_id=getattr(final_response, 'id', None))
 
         context = self._build_context(
             outputs={
@@ -514,10 +556,7 @@ class HookRelay(AgentHooks):
                 "finish_reason": getattr(final_response, 'finish_reason', None),
                 "iteration": iteration,
                 "total_iterations": iteration + 1,
-                "provider_request_id": getattr(final_response, 'id', None),
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": total_tokens,
+                **usage_outputs,
             }
         )
         self._safe_invoke_sync("on_llm_loop_end", context)
