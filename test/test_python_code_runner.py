@@ -9,6 +9,10 @@ Tests cover:
 - Docstring sandbox warnings
 """
 import asyncio
+import multiprocessing
+import os
+import time
+
 import pytest
 
 from magic_agents.node_system.python_code_runner import CodeRunner
@@ -104,8 +108,7 @@ class TestCodeRunnerExecute:
             "def run(handler): return 1 / 0",
             {},
         )
-        assert "error" in result
-        assert "division by zero" in result["error"] or "ZeroDivisionError" in result["error"]
+        assert result == {"error": "division by zero"}
 
     @pytest.mark.asyncio
     async def test_execute_empty_handler(self):
@@ -135,8 +138,8 @@ class TestCodeRunnerExecute:
             "def run(handler): return 1/",
             {},
         )
-        assert "error" in result
-        assert "Syntax error" in result["error"]
+        assert set(result) == {"error"}
+        assert result["error"].startswith("Syntax error in user code:")
 
     @pytest.mark.asyncio
     async def test_execute_missing_run(self):
@@ -146,51 +149,75 @@ class TestCodeRunnerExecute:
             "x = 1",
             {},
         )
-        assert "error" in result
-        assert "must define run" in result["error"]
+        assert result == {"error": "User code must define run(handler) function"}
 
     @pytest.mark.asyncio
     async def test_execute_timeout(self):
-        """Timeout enforcement returns timeout error dict via asyncio.wait_for."""
-        runner = CodeRunner(timeout=0.01)
-        # Use a tight loop that should far exceed the 10ms timeout
-        # asyncio.wait_for + asyncio.to_thread will raise TimeoutError
+        """A non-terminating subprocess is killed at the configured deadline."""
+        runner = CodeRunner(timeout=0.1)
+        started = time.monotonic()
+
         result = await runner.execute(
-            "def run(handler):\n"
-            "    total = 0\n"
-            "    for _ in range(10**8):\n"
-            "        total += 1\n"
-            "    return total",
+            "def run(handler):\n    while True:\n        pass",
             {},
         )
-        assert "error" in result
-        assert "timed out" in result["error"]
+
+        assert result == {"error": "execution timed out after 0.1 seconds"}
+        assert time.monotonic() - started < 2.0
+        assert not any(
+            child.name == "magic-agents-python-exec" and child.is_alive()
+            for child in multiprocessing.active_children()
+        )
 
     @pytest.mark.asyncio
     async def test_execute_does_not_block_event_loop(self):
-        """asyncio.to_thread allows other tasks to run during execution."""
-        runner = CodeRunner(timeout=10.0)
-
-        async def other_task():
-            return "I ran concurrently"
-
-        # Use a CPU-bound loop that runs in the thread (via to_thread).
-        # Other_task should complete while the thread is still running.
-        exec_task = asyncio.create_task(
+        """A blocked run(handler) worker does not block another coroutine."""
+        runner = CodeRunner(timeout=2.0)
+        execution_task = asyncio.create_task(
             runner.execute(
-                "def run(handler):\n"
-                "    x = 0\n"
-                "    for i in range(500000):\n"
-                "        x += i\n"
-                "    return handler['result'] + x",
-                {"result": 42},
+                "import time\ndef run(handler):\n    time.sleep(0.2)\n    return 'done'",
+                {},
             )
         )
-        other_task_obj = asyncio.create_task(other_task())
+        await asyncio.sleep(0.01)
 
-        exec_result, other_result = await asyncio.gather(exec_task, other_task_obj)
-        assert other_result == "I ran concurrently"
-        assert exec_result == {"result": 42 + sum(range(500000))}
+        assert not execution_task.done()
+        assert await execution_task == {"result": "done"}
+
+    @pytest.mark.asyncio
+    async def test_subprocess_mode_isolates_pid_and_handler_mutation(self):
+        runner = CodeRunner(safety_mode="subprocess")
+        handler = {"items": [1]}
+
+        result = await runner.execute(
+            "import os\ndef run(handler):\n"
+            "    handler['items'].append(2)\n"
+            "    return {'pid': os.getpid(), 'items': handler['items']}",
+            handler,
+        )
+
+        assert result["result"]["pid"] != os.getpid()
+        assert result["result"]["items"] == [1, 2]
+        assert handler == {"items": [1]}
+
+    @pytest.mark.asyncio
+    async def test_max_output_chars_truncates_string_results(self):
+        runner = CodeRunner(max_output_chars=5)
+
+        result = await runner.execute("def run(handler): return 'abcdefgh'", {})
+
+        assert result == {"result": "abcde\n... [truncated 3 chars]"}
+
+    @pytest.mark.asyncio
+    async def test_restricted_mode_blocks_import_while_in_process_allows_it(self):
+        source = "import os\ndef run(handler): return os.getpid()"
+
+        restricted = await CodeRunner(safety_mode="restricted_builtins").execute(source, {})
+        local = await CodeRunner(safety_mode="in_process").execute(source, {})
+
+        assert "error" in restricted
+        assert "__import__" in restricted["error"]
+        assert local == {"result": os.getpid()}
 
 
 class TestCodeRunnerSandboxDocs:
@@ -204,8 +231,8 @@ class TestCodeRunnerSandboxDocs:
         assert "NOT a security boundary" in doc, (
             "Class docstring must contain 'NOT a security boundary'"
         )
-        assert "Do not use with untrusted" in doc or "Do NOT use with untrusted" in doc, (
-            "Class docstring must contain 'Do not use with untrusted code'"
+        assert "Do NOT use with untrusted/third-party code" in doc, (
+            "Class docstring must contain its untrusted-code warning"
         )
 
     def test_init_docstring_has_warnings(self):
@@ -215,6 +242,6 @@ class TestCodeRunnerSandboxDocs:
         assert "NOT a security boundary" in init_doc, (
             "__init__ docstring must contain 'NOT a security boundary'"
         )
-        assert "Do not use with untrusted" in init_doc, (
-            "__init__ docstring must contain 'Do not use with untrusted code'"
+        assert "Do not use with untrusted code" in init_doc, (
+            "__init__ docstring must contain its untrusted-code warning"
         )

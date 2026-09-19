@@ -11,16 +11,11 @@ These tests verify the fixes for critical issues:
 
 import pytest
 import json
-import asyncio
-from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock, patch
 
 from magic_agents import run_agent
 from magic_agents.agt_flow import build
-from magic_agents.models.factory.AgentFlowModel import AgentFlowModel
-from magic_agents.models.model_agent_run_log import ModelAgentRunLog
+from magic_agents.debug.events import DebugEventType
 from magic_agents.execution.reactive_executor import (
-    execute_graph_loop_reactive,
     find_iteration_subgraph,
     topological_sort_iteration,
     prepare_item_output,
@@ -28,32 +23,17 @@ from magic_agents.execution.reactive_executor import (
     reset_iteration_nodes,
     DEFAULT_MAX_ITERATIONS,
 )
+from magic_agents.models.factory.EdgeNodeModel import EdgeNodeModel
 from magic_agents.node_system.NodeLoop import NodeLoop
-from magic_agents.node_system.Node import Node
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
-
-def _get_debug_summary(items: list) -> Optional[dict]:
-    """Extract debug_summary from async generator output."""
-    for item in items:
-        if isinstance(item, dict) and item.get("type") == "debug_summary":
-            return item.get("content")
-    return None
-
 
 def _get_executed_nodes(debug_summary: dict) -> set:
     """Extract set of executed node IDs from debug summary."""
     if not debug_summary:
         return set()
     return {n["node_id"] for n in debug_summary.get("nodes", []) if n.get("was_executed")}
-
-
-def _get_bypassed_nodes(debug_summary: dict) -> set:
-    """Extract set of bypassed node IDs from debug summary."""
-    if not debug_summary:
-        return set()
-    return {n["node_id"] for n in debug_summary.get("nodes", []) if n.get("was_bypassed")}
 
 
 def _collect_all(async_gen):
@@ -66,25 +46,21 @@ def _collect_all(async_gen):
     return _collect()
 
 
-class MockNode(Node):
-    """Mock node for testing."""
+class DebugCapture:
+    """Collect observer events delivered through run_agent's callback API."""
 
-    def __init__(self, node_id: str, iterate: bool = False, **kwargs):
-        super().__init__(node_id=node_id, **kwargs)
-        self.iterate = iterate
-        self.execute_count = 0
-        self.received_items = []
+    def __init__(self):
+        self.events = []
 
-    async def process(self, chat_log):
-        self.execute_count += 1
-        # Get input and store it
-        input_val = self.inputs.get('handle_user_message')
-        self.received_items.append(input_val)
+    async def __call__(self, event):
+        self.events.append(event)
 
-        # Process and yield result
-        result = f"processed_{input_val}"
-        self._response = result
-        yield self.yield_static(result, content_type='handle_generated_content')
+    @property
+    def summary(self) -> dict:
+        for event in reversed(self.events):
+            if event.event_type == DebugEventType.GRAPH_END:
+                return event.payload
+        return {}
 
 
 class TestFindIterationSubgraph:
@@ -93,25 +69,16 @@ class TestFindIterationSubgraph:
     def test_simple_linear_subgraph(self):
         """Test finding nodes in a simple linear iteration."""
         # Loop -> Node A -> Loop (feedback)
+        loop = NodeLoop(node_id="loop", node_type="loop")
         nodes = {
-            'loop': MagicMock(
-                OUTPUT_HANDLE_ITEM='handle_item',
-                INPUT_HANDLE_LOOP='handle_loop',
-                OUTPUT_HANDLE_END='handle_end'
-            ),
-            'node_a': MagicMock()
+            "loop": loop,
+            "node_a": object(),
         }
-
-        class Edge:
-            def __init__(self, source, target, sourceHandle, targetHandle):
-                self.source = source
-                self.target = target
-                self.sourceHandle = sourceHandle
-                self.targetHandle = targetHandle
-
         edges = [
-            Edge('loop', 'node_a', 'handle_item', 'input'),
-            Edge('node_a', 'loop', 'output', 'handle_loop'),
+            EdgeNodeModel(id="e1", source="loop", target="node_a",
+                          sourceHandle=loop.OUTPUT_HANDLE_ITEM, targetHandle="input"),
+            EdgeNodeModel(id="e2", source="node_a", target="loop",
+                          sourceHandle="output", targetHandle=loop.INPUT_HANDLE_LOOP),
         ]
 
         result = find_iteration_subgraph('loop', nodes, edges)
@@ -121,27 +88,19 @@ class TestFindIterationSubgraph:
     def test_multi_node_subgraph(self):
         """Test finding nodes in a multi-node iteration chain."""
         # Loop -> Node A -> Node B -> Loop
+        loop = NodeLoop(node_id="loop", node_type="loop")
         nodes = {
-            'loop': MagicMock(
-                OUTPUT_HANDLE_ITEM='handle_item',
-                INPUT_HANDLE_LOOP='handle_loop',
-                OUTPUT_HANDLE_END='handle_end'
-            ),
-            'node_a': MagicMock(),
-            'node_b': MagicMock(),
+            "loop": loop,
+            "node_a": object(),
+            "node_b": object(),
         }
-
-        class Edge:
-            def __init__(self, source, target, sourceHandle, targetHandle):
-                self.source = source
-                self.target = target
-                self.sourceHandle = sourceHandle
-                self.targetHandle = targetHandle
-
         edges = [
-            Edge('loop', 'node_a', 'handle_item', 'input'),
-            Edge('node_a', 'node_b', 'output', 'input'),
-            Edge('node_b', 'loop', 'output', 'handle_loop'),
+            EdgeNodeModel(id="e1", source="loop", target="node_a",
+                          sourceHandle=loop.OUTPUT_HANDLE_ITEM, targetHandle="input"),
+            EdgeNodeModel(id="e2", source="node_a", target="node_b",
+                          sourceHandle="output", targetHandle="input"),
+            EdgeNodeModel(id="e3", source="node_b", target="loop",
+                          sourceHandle="output", targetHandle=loop.INPUT_HANDLE_LOOP),
         ]
 
         result = find_iteration_subgraph('loop', nodes, edges)
@@ -151,27 +110,19 @@ class TestFindIterationSubgraph:
 
     def test_excludes_end_nodes(self):
         """Test that nodes after handle_end are not included."""
+        loop = NodeLoop(node_id="loop", node_type="loop")
         nodes = {
-            'loop': MagicMock(
-                OUTPUT_HANDLE_ITEM='handle_item',
-                INPUT_HANDLE_LOOP='handle_loop',
-                OUTPUT_HANDLE_END='handle_end'
-            ),
-            'node_a': MagicMock(),
-            'node_end': MagicMock(),
+            "loop": loop,
+            "node_a": object(),
+            "node_end": object(),
         }
-
-        class Edge:
-            def __init__(self, source, target, sourceHandle, targetHandle):
-                self.source = source
-                self.target = target
-                self.sourceHandle = sourceHandle
-                self.targetHandle = targetHandle
-
         edges = [
-            Edge('loop', 'node_a', 'handle_item', 'input'),
-            Edge('node_a', 'loop', 'output', 'handle_loop'),
-            Edge('loop', 'node_end', 'handle_end', 'input'),
+            EdgeNodeModel(id="e1", source="loop", target="node_a",
+                          sourceHandle=loop.OUTPUT_HANDLE_ITEM, targetHandle="input"),
+            EdgeNodeModel(id="e2", source="node_a", target="loop",
+                          sourceHandle="output", targetHandle=loop.INPUT_HANDLE_LOOP),
+            EdgeNodeModel(id="e3", source="loop", target="node_end",
+                          sourceHandle=loop.OUTPUT_HANDLE_END, targetHandle="input"),
         ]
 
         result = find_iteration_subgraph('loop', nodes, edges)
@@ -184,19 +135,13 @@ class TestTopologicalSortIteration:
 
     def test_linear_order(self):
         """Test sorting a linear chain of nodes."""
-        class Edge:
-            def __init__(self, source, target, sourceHandle='out', targetHandle='in'):
-                self.source = source
-                self.target = target
-                self.sourceHandle = sourceHandle
-                self.targetHandle = targetHandle
-
         iteration_nodes = {'a', 'b', 'c'}
-        item_edges = [Edge('loop', 'a')]
+        item_edges = [EdgeNodeModel(id="item", source="loop", target="a",
+                                    sourceHandle="out", targetHandle="in")]
         loop_back_edges = [
-            Edge('a', 'b'),
-            Edge('b', 'c'),
-            Edge('c', 'loop'),
+            EdgeNodeModel(id="ab", source="a", target="b", sourceHandle="out", targetHandle="in"),
+            EdgeNodeModel(id="bc", source="b", target="c", sourceHandle="out", targetHandle="in"),
+            EdgeNodeModel(id="back", source="c", target="loop", sourceHandle="out", targetHandle="in"),
         ]
 
         result = topological_sort_iteration(iteration_nodes, item_edges, loop_back_edges)
@@ -207,23 +152,16 @@ class TestTopologicalSortIteration:
 
     def test_parallel_nodes(self):
         """Test nodes with no dependencies between them."""
-        class Edge:
-            def __init__(self, source, target, sourceHandle='out', targetHandle='in'):
-                self.source = source
-                self.target = target
-                self.sourceHandle = sourceHandle
-                self.targetHandle = targetHandle
-
         # Both a and b receive from loop, both feed to c
         iteration_nodes = {'a', 'b', 'c'}
         item_edges = [
-            Edge('loop', 'a'),
-            Edge('loop', 'b'),
+            EdgeNodeModel(id="item-a", source="loop", target="a", sourceHandle="out", targetHandle="in"),
+            EdgeNodeModel(id="item-b", source="loop", target="b", sourceHandle="out", targetHandle="in"),
         ]
         loop_back_edges = [
-            Edge('a', 'c'),
-            Edge('b', 'c'),
-            Edge('c', 'loop'),
+            EdgeNodeModel(id="ac", source="a", target="c", sourceHandle="out", targetHandle="in"),
+            EdgeNodeModel(id="bc", source="b", target="c", sourceHandle="out", targetHandle="in"),
+            EdgeNodeModel(id="back", source="c", target="loop", sourceHandle="out", targetHandle="in"),
         ]
 
         result = topological_sort_iteration(iteration_nodes, item_edges, loop_back_edges)
@@ -258,7 +196,7 @@ class TestLoopIterationSync:
             ],
             "edges": [
                 {"id": "e1", "source": "input", "target": "list_text",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
                 {"id": "e2", "source": "list_text", "target": "loop",
                  "sourceHandle": "handle_text_output", "targetHandle": "handle_list"},
                 {"id": "e3", "source": "loop", "target": "transform",
@@ -266,16 +204,16 @@ class TestLoopIterationSync:
                 {"id": "e4", "source": "transform", "target": "loop",
                  "sourceHandle": "handle_parser_output", "targetHandle": "handle_loop"},
                 {"id": "e5", "source": "loop", "target": "end",
-                 "sourceHandle": "handle_end", "targetHandle": "h1"},
+                 "sourceHandle": "handle_end", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
-        all_items = await _collect_all(run_agent(graph))
-        debug_summary = _get_debug_summary(all_items)
+        debug_capture = DebugCapture()
+        await _collect_all(run_agent(graph, debug_callback=debug_capture))
 
         # Verify the transform node executed
-        executed = _get_executed_nodes(debug_summary)
+        executed = _get_executed_nodes(debug_capture.summary)
         assert "transform" in executed, f"transform should have executed, got: {executed}"
 
         # Verify aggregation contains actual results (not None)
@@ -287,7 +225,7 @@ class TestLoopIterationSync:
         end_node = graph.nodes.get("end")
         assert end_node is not None
         # The end node should have received the aggregated list from loop's handle_end
-        agg_input = end_node.inputs.get("h1")
+        agg_input = end_node.inputs.get("handle_flow_input")
         assert agg_input is not None, "End node should have received aggregation from loop"
         assert isinstance(agg_input, list), f"Aggregation should be a list, got {type(agg_input)}"
         assert len(agg_input) == 3, f"Should have 3 aggregated items, got {len(agg_input)}"
@@ -329,17 +267,6 @@ class TestTypePreservation:
         assert output['content'] == "hello world"
         assert output['type'] == 'str'
 
-
-def prepare_item_output(item: Any, index: int) -> Dict[str, Any]:
-    """Prepare item for output preserving type information."""
-    return {
-        "node": "NodeLoop",
-        "content": item,
-        "index": index,
-        "type": type(item).__name__
-    }
-
-
 class TestIterationLimits:
     """Tests for iteration safety limits."""
 
@@ -347,28 +274,12 @@ class TestIterationLimits:
         """Verify default max iterations is reasonable."""
         assert DEFAULT_MAX_ITERATIONS == 100
 
-    @pytest.mark.asyncio
-    async def test_max_iterations_enforced(self):
-        """Slice 2: Verify loop stops at max_iterations.
-
-        Already covered by test_loop_execution.py::test_loop_max_iterations_enforced.
-        This test delegates to that implementation to avoid duplication.
-        """
-        # Delegation: the real test is in test_loop_execution.py
-        # Here we just verify the constant and mechanism exist
-        from magic_agents.execution.reactive_executor import DEFAULT_MAX_ITERATIONS
-        assert DEFAULT_MAX_ITERATIONS == 100
-        # The actual enforcement is tested in test_loop_execution.py with 200 items
-        # and max_iterations=100, verifying MaxIterationsExceeded debug event.
-
 
 class TestProgressEvents:
     """Tests for loop progress events."""
     
     def test_progress_event_structure(self):
         """Verify progress event has expected fields."""
-        from magic_agents.execution.reactive_executor import emit_loop_progress
-        
         event = emit_loop_progress(
             loop_id='loop1',
             current_index=5,
@@ -414,7 +325,7 @@ class TestAggregationResults:
             ],
             "edges": [
                 {"id": "e1", "source": "input", "target": "list_text",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
                 {"id": "e2", "source": "list_text", "target": "loop",
                  "sourceHandle": "handle_text_output", "targetHandle": "handle_list"},
                 {"id": "e3", "source": "loop", "target": "transform",
@@ -424,16 +335,16 @@ class TestAggregationResults:
                 {"id": "e5", "source": "loop", "target": "format",
                  "sourceHandle": "handle_end", "targetHandle": "handle_parser_input"},
                 {"id": "e6", "source": "format", "target": "end",
-                 "sourceHandle": "handle_parser_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
-        all_items = await _collect_all(run_agent(graph))
-        debug_summary = _get_debug_summary(all_items)
+        debug_capture = DebugCapture()
+        await _collect_all(run_agent(graph, debug_callback=debug_capture))
 
         # Verify both nodes executed
-        executed = _get_executed_nodes(debug_summary)
+        executed = _get_executed_nodes(debug_capture.summary)
         assert "transform" in executed, f"transform should have executed, got: {executed}"
         assert "format" in executed, f"format should have executed, got: {executed}"
 
@@ -475,7 +386,7 @@ class TestAggregationResults:
             ],
             "edges": [
                 {"id": "e1", "source": "input", "target": "list_text",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
                 {"id": "e2", "source": "list_text", "target": "loop",
                  "sourceHandle": "handle_text_output", "targetHandle": "handle_list"},
                 {"id": "e3", "source": "loop", "target": "transform",
@@ -485,12 +396,12 @@ class TestAggregationResults:
                 {"id": "e5", "source": "loop", "target": "format",
                  "sourceHandle": "handle_end", "targetHandle": "handle_parser_input"},
                 {"id": "e6", "source": "format", "target": "end",
-                 "sourceHandle": "handle_parser_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
-        all_items = await _collect_all(run_agent(graph))
+        await _collect_all(run_agent(graph))
 
         # Get aggregation from format node
         format_node = graph.nodes.get("format")
@@ -507,21 +418,6 @@ class TestAggregationResults:
 
 class TestNodeReset:
     """Tests for proper node reset between iterations."""
-
-    def test_node_outputs_cleared(self):
-        """Verify node outputs are cleared between iterations."""
-        node = MockNode(node_id='test')
-        node.outputs['some_handle'] = {'content': 'old_value'}
-        node._response = 'old_response'
-
-        # Reset logic
-        node._response = None
-        node.outputs.clear()
-        if hasattr(node, 'generated'):
-            node.generated = ''
-
-        assert node._response is None
-        assert len(node.outputs) == 0
 
     @pytest.mark.asyncio
     async def test_all_iteration_nodes_reset(self):
@@ -548,7 +444,7 @@ class TestNodeReset:
             ],
             "edges": [
                 {"id": "e1", "source": "input", "target": "list_text",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
                 {"id": "e2", "source": "list_text", "target": "loop",
                  "sourceHandle": "handle_text_output", "targetHandle": "handle_list"},
                 {"id": "e3", "source": "loop", "target": "transform",
@@ -558,22 +454,22 @@ class TestNodeReset:
                 {"id": "e5", "source": "enrich", "target": "loop",
                  "sourceHandle": "handle_parser_output", "targetHandle": "handle_loop"},
                 {"id": "e6", "source": "loop", "target": "end",
-                 "sourceHandle": "handle_end", "targetHandle": "h1"},
+                 "sourceHandle": "handle_end", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
-        all_items = await _collect_all(run_agent(graph))
-        debug_summary = _get_debug_summary(all_items)
+        debug_capture = DebugCapture()
+        await _collect_all(run_agent(graph, debug_callback=debug_capture))
 
         # Both iteration nodes should have executed
-        executed = _get_executed_nodes(debug_summary)
+        executed = _get_executed_nodes(debug_capture.summary)
         assert "transform" in executed, f"transform should have executed, got: {executed}"
         assert "enrich" in executed, f"enrich should have executed, got: {executed}"
 
         # Verify aggregation has 3 items (one per iteration)
         end_node = graph.nodes.get("end")
-        agg_input = end_node.inputs.get("h1")
+        agg_input = end_node.inputs.get("handle_flow_input")
         assert agg_input is not None, "End node should have received aggregation"
         assert len(agg_input) == 3, f"Should have 3 aggregated items, got {len(agg_input)}"
 
@@ -595,9 +491,6 @@ class TestNodeReset:
         - outputs are cleared
         - inputs are NOT cleared (current behavior — not necessarily a bug)
         """
-        from magic_agents.node_system.NodeText import NodeText
-        from magic_agents.models.factory.Nodes import TextNodeModel
-
         # Create a real parser node for testing
         from magic_agents.node_system.NodeParser import NodeParser
         from magic_agents.models.factory.Nodes import ParserNodeModel
@@ -659,7 +552,7 @@ def simple_loop_graph_data():
                     "source": "loop1",
                     "target": "end1",
                     "sourceHandle": "handle_end",
-                    "targetHandle": "handle_generated_end"
+                    "targetHandle": "handle_flow_input"
                 }
             ]
         }
@@ -722,7 +615,7 @@ def llm_loop_graph_data():
                     "source": "loop1",
                     "target": "end1",
                     "sourceHandle": "handle_end",
-                    "targetHandle": "handle_generated_end"
+                    "targetHandle": "handle_flow_input"
                 }
             ]
         }

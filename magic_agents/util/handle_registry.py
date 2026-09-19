@@ -92,6 +92,7 @@ CANONICAL_OUTPUT_HANDLES: Dict[str, Set[str]] = {
     ModelAgentFlowTypesModel.VOID: set(),  # Terminal node - no outputs
     ModelAgentFlowTypesModel.PYTHON_EXEC: {
         'handle-tool-definition',
+        'handle-python_exec-result',
     },
     ModelAgentFlowTypesModel.MCP: {
         'handle-tool-definition',
@@ -135,7 +136,10 @@ CANONICAL_INPUT_HANDLES: Dict[str, Set[str]] = {
         'handle-fetch-headers',
         'handle_fetch_input',  # documented template-context alias for existing browsing examples
     },
-    ModelAgentFlowTypesModel.CLIENT: set(),  # No inputs (provides client to LLM)
+    ModelAgentFlowTypesModel.CLIENT: {
+        'handle-client-model',
+        'handle-client-engine',
+    },
     ModelAgentFlowTypesModel.LLM: {
         'handle_user_message',        # Primary user message input
         'handle-client-provider',     # Client provider input (actual handle)
@@ -162,7 +166,11 @@ CANONICAL_INPUT_HANDLES: Dict[str, Set[str]] = {
         'handle_flow_input',  # Standard input for END nodes
     },
     ModelAgentFlowTypesModel.VOID: set(),  # Terminal sink - no inputs validated
-    ModelAgentFlowTypesModel.PYTHON_EXEC: set(),  # No input handles
+    ModelAgentFlowTypesModel.PYTHON_EXEC: {
+        'handle-python_exec-safety_mode',
+        'handle-python_exec-timeout',
+        'handle-python_exec-max_output_chars',
+    },
     ModelAgentFlowTypesModel.MCP: set(),  # No input handles
     ModelAgentFlowTypesModel.TOOL: set(),  # Schema-only tool source, no inputs
     # Phase 6: NodeHook input handles
@@ -243,12 +251,19 @@ PORT_CARDINALITY: Dict[str, Dict[str, CardinalityInfo]] = {
     },
     # VOID: sink node, no cardinality restrictions
     ModelAgentFlowTypesModel.VOID: {},
-    # Source nodes (user_input, client, constant, chat): no inputs
+    # Source nodes (user_input, constant, chat): no inputs
     ModelAgentFlowTypesModel.USER_INPUT: {},
-    ModelAgentFlowTypesModel.CLIENT: {},
+    ModelAgentFlowTypesModel.CLIENT: {
+        'handle-client-model': CardinalityInfo(cardinality="one", exclusive=True),
+        'handle-client-engine': CardinalityInfo(cardinality="one", exclusive=True),
+    },
     ModelAgentFlowTypesModel.CONSTANT: {},
     ModelAgentFlowTypesModel.CHAT: {},
-    ModelAgentFlowTypesModel.PYTHON_EXEC: {},
+    ModelAgentFlowTypesModel.PYTHON_EXEC: {
+        'handle-python_exec-safety_mode': CardinalityInfo(cardinality="one", exclusive=True),
+        'handle-python_exec-timeout': CardinalityInfo(cardinality="one", exclusive=True),
+        'handle-python_exec-max_output_chars': CardinalityInfo(cardinality="one", exclusive=True),
+    },
     ModelAgentFlowTypesModel.MCP: {},
     ModelAgentFlowTypesModel.TOOL: {},
     # Phase 6: NodeHook cardinality

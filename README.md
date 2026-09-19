@@ -59,8 +59,9 @@ graph = build(spec, message="Hi")
 
 async def main():
     async for event in run_agent(graph):
-        if hasattr(event, 'choices') and event.choices:
-            print(event.choices[0].delta.content or "", end="")
+        content = event.get("content")
+        if hasattr(content, "choices") and content.choices:
+            print(content.choices[0].delta.content or "", end="")
 
 asyncio.run(main())
 ```
@@ -80,3 +81,19 @@ Use the docs for current per-node behavior and routing details: [docs/nodes/READ
 - [examples/json/INDEX.md](examples/json/INDEX.md)
 - [examples/conditional/INDEX.md](examples/conditional/INDEX.md)
 - [examples/loop/INDEX.md](examples/loop/INDEX.md)
+
+## Testing
+
+Install the test tools and run the deterministic node/integration suite without
+provider credentials:
+
+```bash
+pip install -e ".[test]"
+make test-credential-free
+make coverage-credential-free
+```
+
+The coverage target exercises both complete test suites with branch coverage,
+a 70% aggregate gate, and a 60% minimum for every `Node*.py` module.
+Live-provider tests are marked `needs_api`/`credential_gated` and excluded from
+this target.

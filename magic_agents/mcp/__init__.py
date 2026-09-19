@@ -11,7 +11,8 @@ which can fail if pydantic version is incompatible.
 
 The MCP SDK is only loaded when actually needed (e.g. when NodeMcp
 is instantiated). This is safe because:
-1. NodeMcpProxy in node_system/__init__.py delays NodeMcp class import
+1. NodeMcpProxy in node_system/__init__.py delays NodeMcp class import while
+   retaining ``isinstance``/``issubclass`` behavior through its metaclass
 2. This module delays session.py import until symbols are accessed
 3. Combined, non-MCP graphs never touch the mcp SDK
 

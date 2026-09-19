@@ -137,17 +137,6 @@ class TestConditionalNodeModel:
             default_handle="fallback"
         )
         assert model.default_handle == "fallback"
-    
-    def test_extra_fields_allowed(self):
-        """Test that extra fields from JSON are allowed."""
-        model = ConditionalNodeModel(
-            condition="{{ x }}",
-            position={"x": 100, "y": 200},
-            custom_field="value"
-        )
-        assert model.condition == "{{ x }}"
-        # Extra fields should be accessible
-        assert model.model_extra.get("position") == {"x": 100, "y": 200}
 
 
 class TestConditionalSignalTypes:

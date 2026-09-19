@@ -53,6 +53,7 @@ class NodeMemory(Node):
         # Extract constructor-injected dependencies
         self._vector_db = kwargs.pop('vector_db', None)
         self._embedding_client = kwargs.pop('embedding_client', None)
+        self._client = kwargs.pop('client', None)
         if self._vector_db is None:
             from magic_agents.vector_storage import InMemoryVectorDB
 
@@ -112,9 +113,11 @@ class NodeMemory(Node):
 
         msg_str = str(msg)
 
-        client = None
+        client = self._client
         try:
-            client = self.get_input(self.CLIENT_HANDLE)
+            input_client = self.get_input(self.CLIENT_HANDLE)
+            if input_client is not None:
+                client = input_client
         except Exception as exc:
             logger.warning(
                 "NodeMemory '%s': Failed to get client input: %s",
@@ -255,6 +258,8 @@ class NodeMemory(Node):
                         trigger=mem.trigger,
                     )
                     memory_entries.append(entry)
+                self._extracted_count = len(memory_entries)
+                self._memory_entries.extend(memory_entries)
 
             except Exception as exc:
                 logger.warning(

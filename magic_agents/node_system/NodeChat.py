@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 from magic_llm.model import ModelChat
 
@@ -102,6 +102,77 @@ class NodeChat(Node):
         # Uses resolved self._max_input_tokens (Layer 2 safety net)
         self.chat = ModelChat(max_input_tokens=self._max_input_tokens)
 
+    @staticmethod
+    def _decode_attachment_input(value: Any) -> list[Any]:
+        """Normalize scalar, list, or JSON-encoded attachment input."""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            try:
+                decoded = json.loads(value)
+            except json.JSONDecodeError:
+                return [value]
+            if isinstance(decoded, list):
+                return decoded
+            return [decoded]
+        if isinstance(value, tuple):
+            return list(value)
+        if isinstance(value, list):
+            return value
+        return [value]
+
+    @staticmethod
+    def _normalize_image_reference(value: Any) -> str | bytes | list[str | bytes]:
+        """Return a provider-compatible image reference from common envelopes."""
+        if isinstance(value, (str, bytes)):
+            return value
+        if isinstance(value, list) and all(isinstance(item, (str, bytes)) for item in value):
+            return value
+        if isinstance(value, dict):
+            image_url = value.get("image_url")
+            if isinstance(image_url, dict):
+                image_url = image_url.get("url")
+            reference = value.get("url") or value.get("image") or image_url
+            if isinstance(reference, (str, bytes)):
+                return reference
+        raise ValueError(
+            "Image entries must be strings, bytes, lists of image references, "
+            "or mappings containing url/image/image_url."
+        )
+
+    @classmethod
+    def _normalize_file_descriptors(
+        cls,
+        values: list[Any],
+    ) -> list[tuple[str, str | bytes | list[str | bytes] | None]]:
+        """Normalize file inputs already converted to prompt text and optional images.
+
+        ``ModelChat`` has no provider-neutral raw-file primitive. The file handle
+        therefore accepts the established ``[text, image]`` pair format and an
+        equivalent mapping format (``text``/``content`` plus optional image/url).
+        Text-only descriptors are useful for extracted document content.
+        """
+        descriptors: list[tuple[str, str | bytes | list[str | bytes] | None]] = []
+        for index, value in enumerate(values):
+            text: Any
+            image: Any = None
+            if isinstance(value, (list, tuple)) and len(value) == 2:
+                text, image = value
+            elif isinstance(value, dict):
+                text = value.get("content", value.get("text", value.get("message")))
+                image = value.get("image", value.get("url", value.get("image_url")))
+            else:
+                raise ValueError(
+                    f"File entry {index} must be a [text, image] pair or a mapping "
+                    "with text/content and an optional image/url."
+                )
+
+            if not isinstance(text, str) or not text:
+                raise ValueError(f"File entry {index} requires non-empty text/content.")
+            normalized_image = None if image is None else cls._normalize_image_reference(image)
+            descriptors.append((text, normalized_image))
+        return descriptors
+
     async def process(self, chat_log):
         """
         Process chat node with merge logic aligned with backend contract.
@@ -156,39 +227,68 @@ class NodeChat(Node):
         
         # Slot 5: User message (final slot)
         if c := self.get_input(self.INPUT_HANDLER_USER_MESSAGE):
-            if im := self.get_input(self.INPUT_HANDLER_USER_IMAGES):
-                if isinstance(im, str):
-                    im = json.loads(im)
-                is_list_single = False
-                is_list_pair = False
-                for i in im:
-                    if isinstance(i, str):
-                        is_list_single = True
-                    elif isinstance(i, list):
-                        is_list_pair = True
-                if is_list_single and is_list_pair:
-                    logger.error("NodeChat:%s UserImage and UserFile cannot be used together", self.node_id)
-                    yield self.yield_debug_error(
-                        error_type="ValidationError",
-                        error_message="UserImage and UserFile cannot be used together. Images must be either all single strings or all pairs.",
-                        context={
-                            "images_input": im,
-                            "has_single_strings": is_list_single,
-                            "has_pairs": is_list_pair
-                        }
-                    )
-                    return
-                if is_list_single:
-                    logger.debug("NodeChat:%s adding user message with images (single list)", self.node_id)
-                    self.chat.add_user_message(c, im)
-                elif is_list_pair:
-                    logger.debug("NodeChat:%s adding user message with images (pair list)", self.node_id)
-                    for i in im:
-                        self.chat.add_user_message(i[0], i[1])
+            raw_images = self.get_input(self.INPUT_HANDLER_USER_IMAGES)
+            raw_files = self.get_input(self.INPUT_HANDLER_USER_FILES)
+            images: list[Any] = []
+            files: list[Any] = []
+            try:
+                images = self._decode_attachment_input(raw_images) if raw_images else []
+                files = self._decode_attachment_input(raw_files) if raw_files else []
+
+                if images and files:
+                    raise ValueError("User images and files cannot be used together.")
+
+                if files:
+                    logger.debug("NodeChat:%s adding %d file descriptors", self.node_id, len(files))
+                    for file_text, file_image in self._normalize_file_descriptors(files):
+                        self.chat.add_user_message(file_text, file_image)
                     self.chat.add_user_message(c)
-            else:
-                logger.debug("NodeChat:%s adding user message", self.node_id)
-                self.chat.add_user_message(c)
+                elif images:
+                    pair_like = [
+                        isinstance(item, (list, tuple, dict))
+                        and not (
+                            isinstance(item, dict)
+                            and any(key in item for key in ("url", "image", "image_url"))
+                            and not any(key in item for key in ("text", "content", "message"))
+                        )
+                        for item in images
+                    ]
+                    if any(pair_like) and not all(pair_like):
+                        raise ValueError(
+                            "Image entries must not mix image references with legacy file descriptors."
+                        )
+                    if all(pair_like):
+                        # Backward compatibility for graphs that historically routed
+                        # file [text, image] pairs through the images handle.
+                        for file_text, file_image in self._normalize_file_descriptors(images):
+                            self.chat.add_user_message(file_text, file_image)
+                        self.chat.add_user_message(c)
+                    else:
+                        normalized_images = [
+                            self._normalize_image_reference(image) for image in images
+                        ]
+                        logger.debug(
+                            "NodeChat:%s adding user message with %d images",
+                            self.node_id,
+                            len(normalized_images),
+                        )
+                        self.chat.add_user_message(c, normalized_images)
+                else:
+                    logger.debug("NodeChat:%s adding user message", self.node_id)
+                    self.chat.add_user_message(c)
+            except (TypeError, ValueError) as exc:
+                logger.error("NodeChat:%s invalid attachment input: %s", self.node_id, exc)
+                yield self.yield_debug_error(
+                    error_type="ValidationError",
+                    error_message=str(exc),
+                    context={
+                        "images_handle": self.INPUT_HANDLER_USER_IMAGES,
+                        "files_handle": self.INPUT_HANDLER_USER_FILES,
+                        "images_count": len(images),
+                        "files_count": len(files),
+                    },
+                )
+                return
         
         # Post-merge windowing (Layer 1 - PRIMARY)
         if self._max_messages is not None or self._max_input_tokens is not None:

@@ -139,6 +139,30 @@ class GraphEventDispatcher:
                 )
                 for edge in incoming
             ]
+
+            # A declarative edge hook is not a normal graph edge targeting the
+            # NodeHook.  Without an explicit dependency, an otherwise unconnected
+            # hook node is treated as a source and may execute before the edge is
+            # traversed.  Track each configured hook trigger as a virtual incoming
+            # edge so the hook waits for its HookContext instead of racing the
+            # source node.
+            hook_node = self.nodes.get(node_id)
+            hook_context_handle = getattr(
+                hook_node, "INPUT_HANDLE_HOOK_CONTEXT", None
+            )
+            if hook_context_handle:
+                expected_inputs.extend(
+                    InputInfo(
+                        edge_id=self._hook_trigger_edge_id(edge.id, node_id),
+                        handle=hook_context_handle,
+                        source_node=edge.source,
+                        source_handle=edge.sourceHandle,
+                    )
+                    for edge in self.edges
+                    if edge.hooks
+                    and edge.hooks.enabled
+                    and edge.hooks.hook_node_id == node_id
+                )
             
             self._trackers[node_id] = NodeInputTracker(
                 node_id=node_id,
@@ -151,6 +175,44 @@ class GraphEventDispatcher:
                 len(expected_inputs),
                 [i.edge_id for i in expected_inputs]
             )
+
+    @staticmethod
+    def _hook_trigger_edge_id(edge_id: str, hook_node_id: str) -> str:
+        """Return the tracker key for one declarative edge-hook trigger."""
+
+        return f"__edge_hook__:{edge_id}:{hook_node_id}"
+
+    async def _bypass_edge_hook_trigger(
+        self,
+        edge_id: Optional[str],
+    ) -> Optional[str]:
+        """Account for a hook whose edge was bypassed and return its node ID."""
+
+        if edge_id is None:
+            return None
+        edge = next((candidate for candidate in self.edges if candidate.id == edge_id), None)
+        if not edge or not edge.hooks or not edge.hooks.enabled:
+            return None
+        hook_node_id = edge.hooks.hook_node_id
+        if not hook_node_id:
+            return None
+        tracker = self._trackers.get(hook_node_id)
+        if tracker is not None:
+            await tracker.receive_bypass(
+                edge_id=self._hook_trigger_edge_id(edge.id, hook_node_id)
+            )
+            if (
+                tracker.is_bypassed
+                and self.get_state(hook_node_id)
+                not in (NodeState.BYPASSED, NodeState.COMPLETED, NodeState.ERROR)
+            ):
+                self.set_state(hook_node_id, NodeState.BYPASSED)
+                hook_node = self.nodes.get(hook_node_id)
+                if hook_node and hasattr(hook_node, "mark_bypassed"):
+                    hook_node.mark_bypassed()
+                return hook_node_id
+
+        return None
     
     def get_source_nodes(self) -> List[str]:
         """Get nodes with no incoming edges (entry points)."""
@@ -176,7 +238,13 @@ class GraphEventDispatcher:
             self._executions[node_id].state = state
             logger.debug("Node %s: %s -> %s", node_id, old_state.value, state.value)
     
-    async def dispatch_input(self, target_node_id: str, handle: str, content: Any):
+    async def dispatch_input(
+        self,
+        target_node_id: str,
+        handle: str,
+        content: Any,
+        edge_id: Optional[str] = None,
+    ):
         """
         Deliver input to a node's handle.
         
@@ -184,6 +252,7 @@ class GraphEventDispatcher:
             target_node_id: ID of the receiving node
             handle: Target handle name
             content: The content to deliver
+            edge_id: Exact incoming graph edge, when known.
         """
         if target_node_id not in self._trackers:
             logger.warning("Unknown target node: %s", target_node_id)
@@ -197,7 +266,7 @@ class GraphEventDispatcher:
             node.inputs[handle] = content
         
         # Notify tracker
-        await tracker.receive_input(handle, content)
+        await tracker.receive_input(handle, content, edge_id=edge_id)
     
     async def dispatch_bypass(self, target_node_id: str, handle: str = None):
         """
@@ -211,6 +280,65 @@ class GraphEventDispatcher:
             return
         
         await self._trackers[target_node_id].receive_bypass(handle)
+
+    async def dispatch_edge_hook(
+        self,
+        edge: EdgeNodeModel,
+        source_node_id: str,
+        content: Any,
+        *,
+        notify_tracker: bool = True,
+    ) -> Optional[str]:
+        """Deliver one traversed edge context to its configured NodeHook.
+
+        The normal reactive executor notifies the hook's virtual input tracker.
+        The loop executor owns scheduling explicitly and therefore only needs
+        the fresh context placed on the hook node for each traversal.
+
+        Returns:
+            The hook node ID when a valid enabled hook was dispatched, else None.
+        """
+
+        if not edge.hooks or not edge.hooks.enabled or not edge.hooks.hook_node_id:
+            return None
+
+        hook_node_id = edge.hooks.hook_node_id
+        hook_node = self.nodes.get(hook_node_id)
+        if not hook_node or not hasattr(hook_node, "INPUT_HANDLE_HOOK_CONTEXT"):
+            return None
+
+        self._sequence_counter += 1
+        source_node = self.nodes.get(source_node_id)
+        from magic_agents.hooks.context_factory import HookContextFactory
+
+        hook_context = HookContextFactory.build_edge_context(
+            execution_id=self._execution_id,
+            run_id=self._run_id,
+            node_id=source_node_id,
+            node_type=(
+                getattr(source_node, "node_type", "unknown")
+                if source_node
+                else "unknown"
+            ),
+            node_class=source_node.__class__.__name__ if source_node else "",
+            sequence_number=self._sequence_counter,
+            source=source_node_id,
+            target=edge.target,
+            content=content,
+            source_handle=edge.sourceHandle,
+            target_handle=edge.targetHandle,
+        )
+        hook_node.inputs[hook_node.INPUT_HANDLE_HOOK_CONTEXT] = hook_context
+
+        if notify_tracker:
+            await self.dispatch_input(
+                hook_node_id,
+                hook_node.INPUT_HANDLE_HOOK_CONTEXT,
+                hook_context,
+                edge_id=self._hook_trigger_edge_id(edge.id, hook_node_id),
+            )
+
+        return hook_node_id
     
     async def propagate_outputs(self, source_node_id: str, outputs: Dict[str, Any]):
         """
@@ -239,40 +367,13 @@ class GraphEventDispatcher:
                 await self.dispatch_input(
                     edge.target,
                     edge.targetHandle,
-                    content
+                    content,
+                    edge_id=edge.id,
                 )
                 
-                # Phase 8.2: Edge-level hook — when an edge has hook config,
-                # deliver edge traversal context to the configured NodeHook node
-                # and dispatch input on the hook context handle so the node's
-                # input tracker signals the waiting task (fix: was only setting
-                # hook_node.inputs directly without dispatch, causing the hook
-                # node to hang waiting for input signal).
-                if edge.hooks and edge.hooks.enabled and edge.hooks.hook_node_id:
-                    hook_node = self.nodes.get(edge.hooks.hook_node_id)
-                    if hook_node and hasattr(hook_node, 'INPUT_HANDLE_HOOK_CONTEXT'):
-                        self._sequence_counter += 1
-                        source_node = self.nodes.get(source_node_id)
-                        from magic_agents.hooks.context_factory import HookContextFactory
-                        _hook_ctx = HookContextFactory.build_edge_context(
-                            execution_id=self._execution_id,
-                            run_id=self._run_id,
-                            node_id=source_node_id,
-                            node_type=getattr(source_node, 'node_type', 'unknown') if source_node else 'unknown',
-                            node_class=source_node.__class__.__name__ if source_node else '',
-                            sequence_number=self._sequence_counter,
-                            source=source_node_id,
-                            target=edge.target,
-                            content=content,
-                            source_handle=edge.sourceHandle,
-                            target_handle=edge.targetHandle,
-                        )
-                        hook_node.inputs[hook_node.INPUT_HANDLE_HOOK_CONTEXT] = _hook_ctx
-                        await self.dispatch_input(
-                            edge.hooks.hook_node_id,
-                            hook_node.INPUT_HANDLE_HOOK_CONTEXT,
-                            _hook_ctx,
-                        )
+                # Deliver edge traversal context and notify the virtual hook
+                # dependency used by the normal reactive executor.
+                await self.dispatch_edge_hook(edge, source_node_id, content)
                 
                 logger.debug(
                     "Propagated %s.%s -> %s.%s",
@@ -327,9 +428,12 @@ class GraphEventDispatcher:
         # If a target is reachable via selected handle, don't bypass it
         bypassed_targets -= selected_targets
         
-        # Propagate bypass to non-selected targets
-        for target in bypassed_targets:
-            await self._recursive_bypass(target)
+        # Account for each non-selected edge independently. A target may also
+        # receive a selected edge (fan-in convergence), in which case only the
+        # inactive edge is bypassed and the target remains eligible to execute.
+        for edge in outgoing:
+            if edge.sourceHandle != selected_handle:
+                await self._recursive_bypass(edge.target, edge_id=edge.id)
         
         return {
             "selected_handle": selected_handle,
@@ -349,14 +453,28 @@ class GraphEventDispatcher:
         """
         logger.warning("Node %s emitted BYPASS_ALL signal, bypassing all downstream", node_id)
         for edge in self._outgoing.get(node_id, []):
-            await self._recursive_bypass(edge.target)
+            await self._recursive_bypass(edge.target, edge_id=edge.id)
     
-    async def _recursive_bypass(self, node_id: str):
+    async def _recursive_bypass(
+        self,
+        node_id: str,
+        edge_id: Optional[str] = None,
+    ):
         """
         Recursively bypass a node and all its downstream nodes.
         
-        A node is bypassed if ALL its incoming edges are bypassed.
+        A node is bypassed if ALL its incoming edges are bypassed. When an
+        originating edge is known, only that edge is marked; this preserves
+        active fan-in paths that converge on the same downstream node.
         """
+        bypassed_hook_id = await self._bypass_edge_hook_trigger(edge_id)
+        if bypassed_hook_id is not None:
+            for hook_edge in self._outgoing.get(bypassed_hook_id, []):
+                await self._recursive_bypass(
+                    hook_edge.target,
+                    edge_id=hook_edge.id,
+                )
+
         if self.get_state(node_id) in (NodeState.BYPASSED, NodeState.COMPLETED):
             return
         
@@ -364,8 +482,7 @@ class GraphEventDispatcher:
         if not tracker:
             return
         
-        # Mark all inputs as bypassed
-        await tracker.receive_bypass()
+        await tracker.receive_bypass(edge_id=edge_id)
         
         # If the node should bypass (all inputs bypassed)
         if tracker.is_bypassed:
@@ -378,7 +495,7 @@ class GraphEventDispatcher:
             
             # Recursively bypass downstream
             for edge in self._outgoing.get(node_id, []):
-                await self._recursive_bypass(edge.target)
+                await self._recursive_bypass(edge.target, edge_id=edge.id)
     
     async def propagate_error_bypass(
         self,
@@ -405,7 +522,9 @@ class GraphEventDispatcher:
         
         # Start from direct downstream of the error source
         for edge in self._outgoing.get(source_node_id, []):
-            await self._error_bypass_collect(edge.target, bypassed)
+            await self._error_bypass_collect(
+                edge.target, bypassed, edge_id=edge.id
+            )
         
         return bypassed
     
@@ -413,6 +532,7 @@ class GraphEventDispatcher:
         self,
         node_id: str,
         bypassed: List[str],
+        edge_id: Optional[str] = None,
     ) -> None:
         """Recursively bypass downstream nodes and collect their IDs.
         
@@ -420,6 +540,16 @@ class GraphEventDispatcher:
             node_id: Node to bypass.
             bypassed: Accumulator list for bypassed node IDs.
         """
+        bypassed_hook_id = await self._bypass_edge_hook_trigger(edge_id)
+        if bypassed_hook_id is not None and bypassed_hook_id not in bypassed:
+            bypassed.append(bypassed_hook_id)
+            for hook_edge in self._outgoing.get(bypassed_hook_id, []):
+                await self._error_bypass_collect(
+                    hook_edge.target,
+                    bypassed,
+                    edge_id=hook_edge.id,
+                )
+
         if self.get_state(node_id) in (NodeState.BYPASSED, NodeState.COMPLETED, NodeState.ERROR):
             return
         
@@ -441,7 +571,9 @@ class GraphEventDispatcher:
             
             # Recurse downstream
             for edge in self._outgoing.get(node_id, []):
-                await self._error_bypass_collect(edge.target, bypassed)
+                await self._error_bypass_collect(
+                    edge.target, bypassed, edge_id=edge.id
+                )
     
     def get_ready_nodes(self) -> List[str]:
         """Get list of nodes that are ready to execute."""

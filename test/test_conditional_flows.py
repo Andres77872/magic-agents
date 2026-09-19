@@ -1,14 +1,11 @@
 import os
-import sys
 import json
 import pytest
-import asyncio
 from copy import deepcopy
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from magic_agents import run_agent
 from magic_agents.agt_flow import build
+from test_support import skip_if_no_api_keys
 
 # Load API keys from environment or configured file path
 _api_keys_file = os.environ.get("MAGIC_AGENTS_API_KEY_FILE", "")
@@ -32,8 +29,8 @@ AGT_FLOW = {
         {"id": "e2", "source": "cond", "target": "send-msg", "sourceHandle": "empty", "targetHandle": "handle_send_extra"},
         {"id": "e3", "source": "cond", "target": "llm-node", "sourceHandle": "not_empty", "targetHandle": "handle_user_message"},
         {"id": "e4", "source": "client-node", "target": "llm-node", "sourceHandle": "handle-client-provider", "targetHandle": "handle-client-provider"},
-        {"id": "e5", "source": "send-msg", "target": "end-node", "sourceHandle": "handle_message_output", "targetHandle": "handle-5"},
-        {"id": "e6", "source": "llm-node", "target": "end-node", "sourceHandle": "handle_generated_content", "targetHandle": "handle-6"}
+        {"id": "e5", "source": "send-msg", "target": "end-node", "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
+        {"id": "e6", "source": "llm-node", "target": "end-node", "sourceHandle": "handle_generated_content", "targetHandle": "handle_flow_input"}
     ],
     "nodes": [
         {"id": "user-input", "type": "user_input"},
@@ -71,28 +68,28 @@ class TestConditionalFlows:
                     "source": "cond-check",
                     "target": "text-empty",
                     "sourceHandle": "empty",
-                    "targetHandle": "handle_text_input"
+                    "targetHandle": "handle_flow_input"
                 },
                 {
                     "id": "cond-not-empty-to-text",
                     "source": "cond-check",
                     "target": "text-not-empty",
                     "sourceHandle": "not_empty",
-                    "targetHandle": "handle_text_input"
+                    "targetHandle": "handle_flow_input"
                 },
                 {
                     "id": "text-empty-to-end",
                     "source": "text-empty",
                     "target": "end-node",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle-5"
+                    "sourceHandle": "handle_text_output",
+                    "targetHandle": "handle_flow_input"
                 },
                 {
                     "id": "text-not-empty-to-end",
                     "source": "text-not-empty",
                     "target": "end-node",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle-6"
+                    "sourceHandle": "handle_text_output",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -135,15 +132,11 @@ class TestConditionalFlows:
                     delta = msg.choices[0].delta.content
                     content_collected += delta or ""
         assert "input is empty" in content_collected.lower()
-
-
-
-
     @pytest.mark.asyncio
+    @pytest.mark.needs_api
     async def test_not_empty_input_llm(self):
         """Non-empty input should return an LLM-generated response (streamed) and bypass SendMessage."""
-        if 'openai_key' not in var_env:
-            pytest.skip("OpenAI key not configured")
+        skip_if_no_api_keys(var_env)
 
         agt = deepcopy(AGT_FLOW)
         # Ensure the LLM node streams tokens so we can incrementally collect them

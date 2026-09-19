@@ -384,6 +384,13 @@ def validate_edge_target_handles(
         if not target_node_type:
             # Node might be stub or error node - skip handle validation
             continue
+
+        # Some node contracts intentionally derive their input schema at
+        # runtime. Node-mode PythonExec, for example, maps every incoming
+        # target handle to a key in run(handler). Treat those declared dynamic
+        # inputs as first-class ports instead of reporting them as unknown.
+        if getattr(target_node, 'accepts_dynamic_input_handles', False):
+            continue
         
         # Get input handles from the node instance (if available)
         instance_handles = get_node_input_handles_from_instance(target_node)
@@ -421,8 +428,9 @@ def validate_edge_target_handles(
                 )
             })
         elif "Opaque/legacy" in reason:
-            # Valid but opaque/legacy - produce advisory warning in warn mode
-            if mode == "warn":
+            # Shadow mode computes the same advisory diagnostics as warn mode;
+            # only agt_flow decides whether to surface them in logs.
+            if mode in ("shadow", "warn"):
                 errors.append({
                     "type": "OpaqueTargetHandle",
                     "severity": "warning",

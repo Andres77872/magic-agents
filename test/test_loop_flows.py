@@ -1,13 +1,13 @@
+"""Loop execution tests, split between local coverage and opt-in live smoke tests."""
+
 import json
 import os
-import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import pytest
 
 from magic_agents import run_agent
 from magic_agents.agt_flow import build
+from test_support import _is_placeholder_value
 
 # Load API keys from environment or configured file path
 _api_keys_file = os.environ.get("MAGIC_AGENTS_API_KEY_FILE", "")
@@ -15,17 +15,36 @@ _api_keys_env = os.environ.get("OPENAI_API_KEY", "")
 _api_keys_serper = os.environ.get("SERPER_API_KEY", "")
 
 if _api_keys_file and os.path.exists(_api_keys_file):
-    var_env = json.load(open(_api_keys_file))
+    try:
+        with open(_api_keys_file, encoding="utf-8") as api_keys_file:
+            var_env = json.load(api_keys_file)
+    except (OSError, json.JSONDecodeError):
+        var_env = {}
 elif _api_keys_env:
     var_env = {"openai_key": _api_keys_env, "serper_key": _api_keys_serper}
 else:
     var_env = {}
 
-# Most tests in this module need API keys
-pytestmark = pytest.mark.skipif(
-    'openai_key' not in var_env,
-    reason="OpenAI API key required (set OPENAI_API_KEY or MAGIC_AGENTS_API_KEY_FILE)"
-)
+_live_tests_enabled = os.environ.get("MAGIC_AGENTS_RUN_LIVE_TESTS", "").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+
+
+def _assert_clean_contract(graph):
+    """Fail locally if an opt-in smoke graph drifts from node contracts."""
+    assert graph._validation_errors is None
+    assert graph.get_contract_errors() == []
+    assert graph.get_contract_warnings() == []
+
+
+def _require_live_openai():
+    """Gate provider execution after local graph construction and validation."""
+    if not _live_tests_enabled:
+        pytest.skip("live provider smoke test; set MAGIC_AGENTS_RUN_LIVE_TESTS=1 to opt in")
+    if _is_placeholder_value(var_env.get("openai_key", "")):
+        pytest.skip("a real OpenAI API key is required")
 
 
 class TestLoopFlows:
@@ -33,9 +52,12 @@ class TestLoopFlows:
 
     def setup_method(self):
         """Setup method to initialize common test data."""
-        self.load_chat = lambda **kwargs: print(f"Chat loaded: {kwargs}")
+        self.load_chat = lambda **kwargs: None
         self.api_keys = var_env
 
+    @pytest.mark.needs_api
+    @pytest.mark.credential_gated
+    @pytest.mark.slow
     @pytest.mark.asyncio
     async def test_basic_loop_with_text_processing(self):
         """Test basic loop functionality that processes a list of items through an LLM."""
@@ -89,7 +111,7 @@ class TestLoopFlows:
                     "source": "loop-node",
                     "target": "end-node",
                     "sourceHandle": "handle_end",
-                    "targetHandle": "handle-5"
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -116,7 +138,7 @@ class TestLoopFlows:
                         "model": "gpt-4o-mini",
                         "engine": "openai",
                         "api_info": {
-                            "api_key": self.api_keys['openai_key'],
+                            "api_key": self.api_keys.get('openai_key', ''),
                             "base_url": "https://api.openai.com/v1"
                         }
                     }
@@ -140,6 +162,8 @@ class TestLoopFlows:
 
         graph = build(agt_data=agt, message='Process each fruit name into a short description',
                       load_chat=self.load_chat)
+        _assert_clean_contract(graph)
+        _require_live_openai()
         response = ""
 
         async for i in run_agent(graph=graph):
@@ -152,6 +176,9 @@ class TestLoopFlows:
         # Should contain references to fruits being processed
         assert any(fruit in response.lower() for fruit in ['apple', 'banana', 'cherry'])
 
+    @pytest.mark.needs_api
+    @pytest.mark.credential_gated
+    @pytest.mark.slow
     @pytest.mark.asyncio
     async def test_loop_with_aggregation_processing(self):
         """Test loop with final aggregation processing like the provided example."""
@@ -227,8 +254,8 @@ class TestLoopFlows:
                     "id": "aggregator-to-end",
                     "source": "aggregator-llm",
                     "target": "end-node",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle-5"
+                    "sourceHandle": "handle_generated_content",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -255,7 +282,7 @@ class TestLoopFlows:
                         "model": "gpt-4o-mini",
                         "engine": "openai",
                         "api_info": {
-                            "api_key": self.api_keys['openai_key'],
+                            "api_key": self.api_keys.get('openai_key', ''),
                             "base_url": "https://api.openai.com/v1"
                         }
                     }
@@ -295,6 +322,8 @@ class TestLoopFlows:
         }
 
         graph = build(agt_data=agt, message='Describe each number', load_chat=self.load_chat)
+        _assert_clean_contract(graph)
+        _require_live_openai()
         response = ""
 
         async for i in run_agent(graph=graph):
@@ -307,6 +336,9 @@ class TestLoopFlows:
         # Should contain some summary of processing numbers
         assert len(response) > 0
 
+    @pytest.mark.needs_api
+    @pytest.mark.credential_gated
+    @pytest.mark.slow
     @pytest.mark.asyncio
     async def test_loop_with_aggregation_processing2(self):
         """Test loop with final aggregation processing like the provided example."""
@@ -371,11 +403,11 @@ class TestLoopFlows:
                     "targetHandle": "handle_user_message"
                 },
                 {
-                    "id": "xy-edge__77984a46-f85c-4fb4-917a-787058bdafaehandle_generated_end-5handle_generated_end",
+                    "id": "aggregator-to-end",
                     "source": "77984a46-f85c-4fb4-917a-787058bdafae",
                     "target": "5",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle_generated_end"
+                    "sourceHandle": "handle_generated_content",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -400,7 +432,7 @@ class TestLoopFlows:
                         "model": "gpt-4o-mini",
                         "engine": "openai",
                         "api_info": {
-                            "api_key": self.api_keys['openai_key'],
+                            "api_key": self.api_keys.get('openai_key', ''),
                             "base_url": "https://api.openai.com/v1"
                         }
                     },
@@ -453,6 +485,8 @@ class TestLoopFlows:
         }
 
         graph = build(agt_data=agt, message='Write the number', load_chat=self.load_chat)
+        _assert_clean_contract(graph)
+        _require_live_openai()
         response = ""
 
         async for i in run_agent(graph=graph):
@@ -465,6 +499,9 @@ class TestLoopFlows:
         # Should contain some summary of processing numbers
         assert len(response) > 0
 
+    @pytest.mark.needs_api
+    @pytest.mark.credential_gated
+    @pytest.mark.slow
     @pytest.mark.asyncio
     async def test_loop_exact_example_pattern(self):
         """Test the exact pattern from the provided loop example."""
@@ -540,8 +577,8 @@ class TestLoopFlows:
                     "id": "xy-edge__aggregator-to-end",
                     "source": "aggregator-llm",
                     "target": "end-node",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle_generated_end"
+                    "sourceHandle": "handle_generated_content",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -565,7 +602,7 @@ class TestLoopFlows:
                         "model": "gpt-4o-mini",
                         "engine": "openai",
                         "api_info": {
-                            "api_key": self.api_keys['openai_key'],
+                            "api_key": self.api_keys.get('openai_key', ''),
                             "base_url": "https://api.openai.com/v1"
                         }
                     }
@@ -609,6 +646,8 @@ class TestLoopFlows:
         }
 
         graph = build(agt_data=agt, message='Process each number and describe it', load_chat=self.load_chat)
+        _assert_clean_contract(graph)
+        _require_live_openai()
         response = ""
 
         async for i in run_agent(graph=graph):
@@ -620,6 +659,7 @@ class TestLoopFlows:
         print(f"\nExact Example Pattern Response: {response}")
         assert len(response) > 0
 
+    @pytest.mark.credential_free
     @pytest.mark.asyncio
     async def test_loop_with_parser_transformation(self):
         """Test loop with parser nodes for data transformation."""
@@ -627,14 +667,6 @@ class TestLoopFlows:
             "type": "chat",
             "debug": True,
             "edges": [
-                # User input (required by graph validation; not used by this test)
-                {
-                    "id": "ui-to-void",
-                    "source": "user-input",
-                    "target": "end-node",
-                    "sourceHandle": "handle_user_message",
-                    "targetHandle": "handle-5"
-                },
                 # Text list to loop
                 {
                     "id": "text-to-loop",
@@ -680,8 +712,8 @@ class TestLoopFlows:
                     "id": "send-to-end",
                     "source": "send-node",
                     "target": "end-node",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle-5"
+                    "sourceHandle": "handle_message_output",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -745,6 +777,7 @@ Total colors processed: {{ handle_parser_input | length }}
         print(f"\nLoop with Parser Response: {response}")
         assert "Color processing complete!" in response
 
+    @pytest.mark.credential_free
     @pytest.mark.asyncio
     async def test_loop_with_mixed_data_types(self):
         """Test loop with mixed data types in the list."""
@@ -752,14 +785,6 @@ Total colors processed: {{ handle_parser_input | length }}
             "type": "chat",
             "debug": True,
             "edges": [
-                # User input (required by graph validation; not used by this test)
-                {
-                    "id": "ui-to-void",
-                    "source": "user-input",
-                    "target": "end-node",
-                    "sourceHandle": "handle_user_message",
-                    "targetHandle": "handle-5"
-                },
                 # Text list to loop
                 {
                     "id": "mixed-to-loop",
@@ -797,8 +822,8 @@ Total colors processed: {{ handle_parser_input | length }}
                     "id": "send-to-end",
                     "source": "send-results",
                     "target": "end-node",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle-5"
+                    "sourceHandle": "handle_message_output",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -851,6 +876,7 @@ Total colors processed: {{ handle_parser_input | length }}
         print(f"\nMixed Data Types Response: {response}")
         assert "Mixed data processing complete!" in response
 
+    @pytest.mark.credential_free
     @pytest.mark.asyncio
     async def test_empty_loop_handling(self):
         """Test loop behavior with empty list."""
@@ -858,14 +884,6 @@ Total colors processed: {{ handle_parser_input | length }}
             "type": "chat",
             "debug": True,
             "edges": [
-                # User input (required by graph validation; not used by this test)
-                {
-                    "id": "ui-to-void",
-                    "source": "user-input",
-                    "target": "end-node",
-                    "sourceHandle": "handle_user_message",
-                    "targetHandle": "handle-5"
-                },
                 # Empty list to loop
                 {
                     "id": "empty-to-loop",
@@ -903,8 +921,8 @@ Total colors processed: {{ handle_parser_input | length }}
                     "id": "send-to-end",
                     "source": "send-empty",
                     "target": "end-node",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle-5"
+                    "sourceHandle": "handle_message_output",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -957,40 +975,3 @@ Total colors processed: {{ handle_parser_input | length }}
         print(f"\nEmpty Loop Response: {response}")
         assert "Empty loop completed!" in response
         assert "Should not execute" not in response
-
-
-def run_loop_tests():
-    """Helper function to run all loop tests."""
-    import asyncio
-
-    test_suite = TestLoopFlows()
-    test_suite.setup_method()
-
-    tests = [
-        ("Basic Loop with Text Processing", test_suite.test_basic_loop_with_text_processing()),
-        ("Loop with Aggregation Processing", test_suite.test_loop_with_aggregation_processing()),
-        ("Loop with Aggregation Processing2", test_suite.test_loop_with_aggregation_processing2()),
-        ("Exact Example Pattern", test_suite.test_loop_exact_example_pattern()),
-        ("Loop with Parser Transformation", test_suite.test_loop_with_parser_transformation()),
-        ("Loop with Mixed Data Types", test_suite.test_loop_with_mixed_data_types()),
-        ("Empty Loop Handling", test_suite.test_empty_loop_handling())
-    ]
-
-    async def run_tests():
-        for i, (test_name, test_coro) in enumerate(tests, 1):
-            print(f"\n{'=' * 70}")
-            print(f"Running Loop Test {i}: {test_name}")
-            print(f"{'=' * 70}")
-            try:
-                await test_coro
-                print(f"✓ Loop Test {i} ({test_name}) passed")
-            except Exception as e:
-                print(f"✗ Loop Test {i} ({test_name}) failed: {e}")
-                import traceback
-                traceback.print_exc()
-
-    asyncio.run(run_tests())
-
-
-if __name__ == "__main__":
-    run_loop_tests()

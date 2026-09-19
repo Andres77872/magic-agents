@@ -18,7 +18,7 @@ Build or reuse a `ModelChat` transcript for downstream LLM generation. NodeChat 
 | Input | `handle-system-context` | System context message — inserted at index 0 (Slot 4). |
 | Input | `handle_user_message` | Current-turn user message — appended last (Slot 5). |
 | Input | `handle_messages` | Runtime messages list — appended or replaces history (Slot 2). |
-| Input | `handle_user_files` | User file content for message attachment. |
+| Input | `handle_user_files` | Extracted file content, optionally paired with a page/image reference. |
 | Input | `handle_user_images` | User image content for multimodal message attachment. |
 | Output | `handle_chat_output` | Assembled `ModelChat` with windowed messages. Canonical output. |
 
@@ -100,7 +100,24 @@ yield self.yield_static(self.chat, ...)        ← windowed output
 | **2** | `handle_messages` input | `extend()` (APPEND) or replace (REPLACE) | Runtime messages from upstream node. Mode controlled by `messages_append_mode` field. |
 | **3** | `data.custom_messages` | `extend()` (always APPEND) | Config-level messages appended after history + runtime. |
 | **4** | `handle-system-context` input | `set_system()` (INSERT at index 0) | System context message inserted at the beginning of the message list. |
-| **5** | `handle_user_message` input | `add_user_message()` (APPEND) | Current-turn user input — always the final slot. Supports multimodal content via `handle_user_images`. |
+| **5** | `handle_user_message` input | `add_user_message()` (APPEND) | Current-turn user input — always the final slot. Supports multimodal content via `handle_user_images` and extracted attachments via `handle_user_files`. |
+
+### Image and file inputs
+
+`handle_user_images` accepts image references (URL/data URL/bytes), including a
+JSON-encoded list. All image references are attached to the current-turn user
+message.
+
+`handle_user_files` accepts provider-neutral descriptors because `ModelChat`
+does not expose a raw-file primitive. Each descriptor is either a
+`[text, image]` pair or a mapping with `text`/`content` and an optional
+`image`/`url`/`image_url`. Extracted file messages are inserted immediately
+before the current-turn user message. For backward compatibility, legacy
+`[text, image]` descriptors routed through `handle_user_images` remain valid.
+
+The image and file handles are mutually exclusive for a single Chat node
+execution. Invalid or mixed attachment shapes produce a `ValidationError`
+debug event and no chat output.
 
 ## STM Windowing
 
@@ -334,7 +351,6 @@ The following fields are exposed via `NodeChat._capture_internal_state()`:
 
 The following are explicitly **not** part of this STM windowing change:
 
-- `handle_user_files` dead-code cleanup — unrelated to STM windowing; deferred to a separate change.
 - `session_required` enforcement — unrelated to STM windowing; P2 priority.
 - `middle` truncation strategy — adds complexity with limited use cases; deferred.
 - Role preservation flags — system and last-user preservation are always-on and non-configurable in MVP.

@@ -1,13 +1,20 @@
+"""Opt-in live smoke tests plus credential-free graph contract checks.
+
+Set ``MAGIC_AGENTS_RUN_LIVE_TESTS=1`` and provide the required provider
+credentials to execute the two network-backed smoke tests.  Merely exposing
+credentials to the test process must not make the ordinary test suite perform
+billable, non-deterministic network calls.
+"""
+
+from copy import deepcopy
 import json
 import os
-import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import pytest
 
 from magic_agents import run_agent
 from magic_agents.agt_flow import build
+from test_support import _is_placeholder_value
 
 # Load API keys from environment or configured file path
 _api_keys_file = os.environ.get("MAGIC_AGENTS_API_KEY_FILE", "")
@@ -15,16 +22,30 @@ _api_keys_env = os.environ.get("OPENAI_API_KEY", "")
 _api_keys_serper = os.environ.get("SERPER_API_KEY", "")
 
 if _api_keys_file and os.path.exists(_api_keys_file):
-    var_env = json.load(open(_api_keys_file))
+    with open(_api_keys_file, encoding="utf-8") as api_keys_file:
+        var_env = json.load(api_keys_file)
 elif _api_keys_env:
     var_env = {"openai_key": _api_keys_env, "serper_key": _api_keys_serper}
 else:
     var_env = {}
 
-# Skip entire module if no API keys available (all tests need real API calls)
-pytestmark = pytest.mark.skipif(
-    'openai_key' not in var_env or 'serper_key' not in var_env,
-    reason="OpenAI and Serper API keys required"
+_live_tests_enabled = os.environ.get("MAGIC_AGENTS_RUN_LIVE_TESTS", "").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+_live_opt_in = pytest.mark.skipif(
+    not _live_tests_enabled,
+    reason="live provider smoke test; set MAGIC_AGENTS_RUN_LIVE_TESTS=1 to opt in",
+)
+_needs_openai = pytest.mark.skipif(
+    _is_placeholder_value(var_env.get("openai_key", "")),
+    reason="a real OpenAI API key is required",
+)
+_needs_openai_and_serper = pytest.mark.skipif(
+    _is_placeholder_value(var_env.get("openai_key", ""))
+    or _is_placeholder_value(var_env.get("serper_key", "")),
+    reason="real OpenAI and Serper API keys are required",
 )
 
 template_str = """
@@ -85,14 +106,14 @@ agt = {
             "id": "llm-client__llm-rewrite",
             "source": "llm-client",
             "target": "llm-rewrite",
-            "sourceHandle": "handle-2",
+            "sourceHandle": "handle-client-provider",
             "targetHandle": "handle-client-provider"
         },
         {
             "id": "system-prompt-rewrite__llm-rewrite",
             "source": "system-prompt-rewrite",
             "target": "llm-rewrite",
-            "sourceHandle": "handle-2",
+            "sourceHandle": "handle_parser_output",
             "targetHandle": "handle_user_message"
         },
         {
@@ -113,57 +134,57 @@ agt = {
             "id": "fetch__parser",
             "source": "fetch",
             "target": "parser-browsing-response",
-            "sourceHandle": "handle_response_json",
+            "sourceHandle": "handle_fetch_output",
             "targetHandle": "handle_parser_input"
         },
         {
             "id": "fetch__parser-browsing-references",
             "source": "fetch",
             "target": "parser-browsing-references",
-            "sourceHandle": "handle_response_json",
+            "sourceHandle": "handle_fetch_output",
             "targetHandle": "handle_parser_input"
         },
         {
             "id": "parser-browsing-references__send-message",
             "source": "parser-browsing-references",
             "target": "send-message",
-            "sourceHandle": "handle_send_extra",
+            "sourceHandle": "handle_parser_output",
             "targetHandle": "handle_send_extra"
         },
         {
             "id": "send-message__finish",
             "source": "send-message",
             "target": "finish",
-            "sourceHandle": "handle_generated_end",
-            "targetHandle": "handle-5"
+            "sourceHandle": "handle_message_output",
+            "targetHandle": "handle_flow_input"
         },
         {
             "id": "parser__system-prompt",
             "source": "parser-browsing-response",
             "target": "system-prompt",
-            "sourceHandle": "handle_generated_end",
-            "targetHandle": "handle_parser_output"
+            "sourceHandle": "handle_parser_output",
+            "targetHandle": "handle_parser_input"
         },
         {
             "id": "system-prompt__llm-final",
             "source": "system-prompt",
             "target": "llm-final",
-            "sourceHandle": "handle-2",
+            "sourceHandle": "handle_parser_output",
             "targetHandle": "handle-system-context"
         },
         {
             "id": "llm-client__llm-final",
             "source": "llm-client",
             "target": "llm-final",
-            "sourceHandle": "handle-2",
+            "sourceHandle": "handle-client-provider",
             "targetHandle": "handle-client-provider"
         },
         {
             "id": "llm-final__finish",
             "source": "llm-final",
             "target": "finish",
-            "sourceHandle": "handle_generated_end",
-            "targetHandle": "handle-5"
+            "sourceHandle": "handle_generated_content",
+            "targetHandle": "handle_flow_input"
         }
     ],
     "nodes": [
@@ -197,7 +218,7 @@ agt = {
         {
             "id": "system-prompt",
             "data": {
-                "text": "using the next XML information {{handle_parser_output}} respond the user question"
+                "text": "using the next XML information {{handle_parser_input}} respond the user question"
             },
             "type": "parser"
         },
@@ -270,26 +291,45 @@ agt = {
 }
 
 
+def _build_smoke_graph(agent_definition, message):
+    """Build without mutating the module-level serialized fixture."""
+    return build(
+        agt_data=deepcopy(agent_definition),
+        message=message,
+        load_chat=lambda **_: None,
+    )
+
+
+def _assert_clean_contract(graph):
+    assert graph._validation_errors is None
+    assert graph.get_contract_errors() == []
+    assert graph.get_contract_warnings() == []
+
+
+def test_browsing_graph_uses_current_handles():
+    graph = _build_smoke_graph(
+        agt,
+        message="que es la entropia?, dame las referencias",
+    )
+
+    _assert_clean_contract(graph)
+
+
 @pytest.mark.asyncio
-async def test_run_agent():
-    def load_chat(**kwargs):
-        print(kwargs)
+@pytest.mark.needs_api
+@pytest.mark.slow
+@pytest.mark.credential_gated
+@_live_opt_in
+@_needs_openai_and_serper
+async def test_run_agent_live_browsing():
+    graph = _build_smoke_graph(
+        agt,
+        message="que es la entropia?, dame las referencias",
+    )
 
-    print(agt)
-    graph = build(agt_data=agt,
-                  message='que es la entropia?, dame las referencias',
-                  load_chat=load_chat)
+    events = [event async for event in run_agent(graph=graph)]
 
-    async for i in run_agent(
-            graph=graph,
-    ):
-        # print(i)
-        content = i.get('content')
-        if hasattr(content, 'choices') and content.choices:
-            print(content.choices[0].delta.content, end='')
-        # print(i['content'].extras)
-        # print(i, end='')
-        # print(i)
+    assert any(event.get("type") == "content" for event in events)
 
 
 agt_2 = {
@@ -353,11 +393,11 @@ agt_2 = {
             "targetHandle": "handle_user_message"
         },
         {
-            "id": "xy-edge__77984a46-f85c-4fb4-917a-787058bdafaehandle_generated_end-5handle_generated_end",
+            "id": "final-llm__finish",
             "source": "77984a46-f85c-4fb4-917a-787058bdafae",
             "target": "5",
-            "sourceHandle": "handle_generated_end",
-            "targetHandle": "handle_generated_end"
+            "sourceHandle": "handle_generated_content",
+            "targetHandle": "handle_flow_input"
         }
     ],
     "nodes": [
@@ -497,30 +537,21 @@ agt_2 = {
 }
 
 
+def test_loop_graph_uses_current_handles():
+    graph = _build_smoke_graph(agt_2, message="Write N times the user input")
+
+    _assert_clean_contract(graph)
+
+
 @pytest.mark.asyncio
-async def test_run_agent_loop():
-    def load_chat(**kwargs):
-        print(kwargs)
+@pytest.mark.needs_api
+@pytest.mark.slow
+@pytest.mark.credential_gated
+@_live_opt_in
+@_needs_openai
+async def test_run_agent_live_loop():
+    graph = _build_smoke_graph(agt_2, message="Write N times the user input")
 
-    print(agt_2)
-    graph = build(agt_data=agt_2,
-                  message='Write N times the user input',
-                  load_chat=load_chat)
+    events = [event async for event in run_agent(graph=graph)]
 
-    async for i in run_agent(
-            graph=graph,
-    ):
-        # print(i)
-        content = i.get('content')
-        if hasattr(content, 'choices') and content.choices:
-            print(content.choices[0].delta.content, end='')
-        # print(i['content'].extras)
-        # print(i, end='')
-        # print(i)
-
-# def test_build_agent():
-#     print(agt)
-#
-#     res = build(agt_data=agt, message='que es la entropia?, dame las referencias')
-#
-#     print(res)
+    assert any(event.get("type") == "content" for event in events)

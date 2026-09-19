@@ -15,6 +15,7 @@ Contracts:
 - Errors are isolated (logged, not propagated) per spec requirement
 """
 import asyncio
+import inspect
 import json
 import logging
 import uuid
@@ -654,7 +655,7 @@ class HookRelay(AgentHooks):
                 return  # Hook method not implemented (partial implementation)
 
             # FlowHooks methods may be async or sync
-            if asyncio.iscoroutinefunction(method):
+            if inspect.iscoroutinefunction(method):
                 self._invoke_async_method(method, hook_name, context, extra)
             else:
                 # Sync hook — call directly

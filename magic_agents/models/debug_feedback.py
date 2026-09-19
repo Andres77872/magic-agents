@@ -49,7 +49,7 @@ class GraphDebugFeedback(BaseModel):
     execution_id: str = Field(..., description="Unique identifier for this execution")
     graph_type: str = Field(..., description="Type of graph executed")
     # ── Phase 0 cross-repo instrumentation ──
-    # Populated from chat_log (which now carries run_id).
+    # Execution-span and run correlation intentionally use separate domains.
     parent_execution_id: Optional[str] = Field(None, description="Parent execution span ID")
     run_id: Optional[str] = Field(None, description="Run ID from chat_log")
     

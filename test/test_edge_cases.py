@@ -6,9 +6,6 @@ Tests that need API keys are skipped gracefully when keys are missing.
 """
 import json
 import os
-import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import pytest
 import asyncio
@@ -16,7 +13,7 @@ import asyncio
 from magic_agents import run_agent
 from magic_agents.agt_flow import build, validate_graph
 from magic_agents.models.factory.Nodes import ModelAgentFlowTypesModel
-from conftest import collect_all_from_generator
+from test_support import _is_placeholder_value, collect_all_from_generator
 
 
 # Try to load API keys from environment or configured file path
@@ -26,16 +23,26 @@ _api_keys_env = os.environ.get("OPENAI_API_KEY", "")
 
 if _api_keys_file and os.path.exists(_api_keys_file):
     try:
-        with open(_api_keys_file) as f:
+        with open(_api_keys_file, encoding="utf-8") as f:
             _API_KEYS = json.load(f)
-    except (json.JSONDecodeError, KeyError):
+    except (OSError, json.JSONDecodeError, KeyError):
         pass
 elif _api_keys_env:
     _API_KEYS = {"openai_key": _api_keys_env}
 
+_openai_key = (_API_KEYS or {}).get("openai_key", "")
+_live_tests_enabled = os.environ.get("MAGIC_AGENTS_RUN_LIVE_TESTS", "").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+_live_opt_in = pytest.mark.skipif(
+    not _live_tests_enabled,
+    reason="live provider smoke test; set MAGIC_AGENTS_RUN_LIVE_TESTS=1 to opt in",
+)
 _needs_api = pytest.mark.skipif(
-    _API_KEYS is None,
-    reason="API keys not available (set OPENAI_API_KEY or MAGIC_AGENTS_API_KEY_FILE)"
+    not _openai_key or _is_placeholder_value(_openai_key),
+    reason="Real OpenAI API key required (placeholder test keys do not enable live tests)",
 )
 
 
@@ -57,9 +64,9 @@ class TestEdgeCases:
             "debug": True,
             "edges": [
                 {"id": "e1", "source": "node-a", "target": "node-b",
-                 "sourceHandle": "out", "targetHandle": "in"},
+                 "sourceHandle": "handle_text_output", "targetHandle": "handle_flow_input"},
                 {"id": "e2", "source": "node-b", "target": "node-a",
-                 "sourceHandle": "out", "targetHandle": "in"},
+                 "sourceHandle": "handle_text_output", "targetHandle": "handle_flow_input"},
             ],
             "nodes": [
                 {"id": "user-input", "type": ModelAgentFlowTypesModel.USER_INPUT},
@@ -85,7 +92,8 @@ class TestEdgeCases:
             "edges": [
                 {"id": "e1", "source": "user-input", "target": "bad-parser",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_parser_input"},
-                {"id": "e2", "source": "bad-parser", "target": "end-node"},
+                {"id": "e2", "source": "bad-parser", "target": "end-node",
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
             ],
             "nodes": [
                 {"id": "user-input", "type": ModelAgentFlowTypesModel.USER_INPUT},
@@ -117,7 +125,8 @@ class TestEdgeCases:
                  "sourceHandle": "handle_text_output", "targetHandle": "handle_list"},
                 {"id": "e2", "source": "loop-node", "target": "final-parser",
                  "sourceHandle": "handle_end", "targetHandle": "handle_parser_input"},
-                {"id": "e3", "source": "final-parser", "target": "end-node"},
+                {"id": "e3", "source": "final-parser", "target": "end-node",
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
             ],
             "nodes": [
                 {"id": "user-input", "type": ModelAgentFlowTypesModel.USER_INPUT},
@@ -153,7 +162,7 @@ class TestEdgeCases:
                 {"id": "e1", "source": "user-input", "target": "parser-node",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_parser_input"},
                 {"id": "e2", "source": "parser-node", "target": "end-node",
-                 "sourceHandle": "handle_generated_end", "targetHandle": "handle-5"},
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
             ],
             "nodes": [
                 {"id": "user-input", "type": ModelAgentFlowTypesModel.USER_INPUT},
@@ -172,7 +181,7 @@ class TestEdgeCases:
         async def _collect_with_timeout():
             return await asyncio.wait_for(
                 collect_all_from_generator(run_agent(graph=graph)),
-                timeout=30.0
+                timeout=2.0
             )
 
         events = await _collect_with_timeout()
@@ -196,27 +205,21 @@ class TestEdgeCases:
         # Should be valid — no duplicate edges
         assert result["valid"] is True
 
-    # ─── API-dependent tests (skip when keys missing) ───────────────────
+    # ─── Credential-free execution edge cases ───────────────────────────
 
-    @pytest.mark.needs_api
-    @_needs_api
     @pytest.mark.asyncio
     async def test_very_long_input_handling(self):
-        """Test handling of very long inputs."""
+        """The real parser truncates long input without a provider call."""
         long_text = "This is a test. " * 100
 
         agt = {
-            "type": "chat",
+            "type": "graph",
             "debug": True,
             "edges": [
                 {"id": "e1", "source": "user-input", "target": "truncator",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_parser_input"},
-                {"id": "e2", "source": "truncator", "target": "llm-node",
-                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_user_message"},
-                {"id": "e3", "source": "client-node", "target": "llm-node",
-                 "sourceHandle": "handle-client-provider", "targetHandle": "handle-client-provider"},
-                {"id": "e4", "source": "llm-node", "target": "end-node",
-                 "sourceHandle": "handle_generated_end", "targetHandle": "handle-5"},
+                {"id": "e2", "source": "truncator", "target": "end-node",
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
             ],
             "nodes": [
                 {"id": "user-input", "type": ModelAgentFlowTypesModel.USER_INPUT},
@@ -231,52 +234,29 @@ Input truncated (was {{ handle_parser_input | length }} chars): {{ handle_parser
 {% endif %}"""
                     }
                 },
-                {
-                    "id": "client-node", "type": ModelAgentFlowTypesModel.CLIENT,
-                    "data": {
-                        "engine": "openai",
-                        "api_info": {
-                            "api_key": self.api_keys['openai_key'],
-                            "base_url": "https://api.openai.com/v1"
-                        },
-                        "model": "gpt-4.1-mini-2025-04-14"
-                    }
-                },
-                {
-                    "id": "llm-node", "type": ModelAgentFlowTypesModel.LLM,
-                    "data": {"top_p": 1, "stream": True, "max_tokens": 50, "temperature": 0.7}
-                },
                 {"id": "end-node", "type": ModelAgentFlowTypesModel.END},
             ]
         }
 
         graph = build(agt_data=agt, message=long_text, load_chat=self.load_chat)
-        response = ""
-        async for i in run_agent(graph=graph):
-            if isinstance(i, dict) and 'content' in i:
-                content = i['content']
-                if hasattr(content, 'choices') and content.choices and content.choices[0].delta.content:
-                    response += content.choices[0].delta.content
+        await collect_all_from_generator(run_agent(graph=graph))
 
+        response = graph.nodes["truncator"].response
         assert "truncated" in response.lower()
+        assert f"{len(long_text)} chars" in response
+        assert len(response) < len(long_text)
 
-    @pytest.mark.needs_api
-    @_needs_api
     @pytest.mark.asyncio
     async def test_special_characters_handling(self):
-        """Test handling of special characters and escaping."""
+        """The parser's Jinja environment escapes HTML and JSON locally."""
         agt = {
-            "type": "chat",
+            "type": "graph",
             "debug": True,
             "edges": [
                 {"id": "e1", "source": "user-input", "target": "escaper",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_parser_input"},
-                {"id": "e2", "source": "escaper", "target": "llm-node",
-                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_user_message"},
-                {"id": "e3", "source": "client-node", "target": "llm-node",
-                 "sourceHandle": "handle-client-provider", "targetHandle": "handle-client-provider"},
-                {"id": "e4", "source": "llm-node", "target": "end-node",
-                 "sourceHandle": "handle_generated_end", "targetHandle": "handle-5"},
+                {"id": "e2", "source": "escaper", "target": "end-node",
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
             ],
             "nodes": [
                 {"id": "user-input", "type": ModelAgentFlowTypesModel.USER_INPUT},
@@ -288,53 +268,30 @@ Original: {{ handle_parser_input | e }}
 JSON Safe: {{ handle_parser_input | tojson }}"""
                     }
                 },
-                {
-                    "id": "client-node", "type": ModelAgentFlowTypesModel.CLIENT,
-                    "data": {
-                        "engine": "openai",
-                        "api_info": {
-                            "api_key": self.api_keys['openai_key'],
-                            "base_url": "https://api.openai.com/v1"
-                        },
-                        "model": "gpt-4.1-mini-2025-04-14"
-                    }
-                },
-                {
-                    "id": "llm-node", "type": ModelAgentFlowTypesModel.LLM,
-                    "data": {"top_p": 1, "stream": True, "max_tokens": 100, "temperature": 0.7}
-                },
                 {"id": "end-node", "type": ModelAgentFlowTypesModel.END},
             ]
         }
 
         special_input = 'Hello & "world" <script>alert("test")</script>'
         graph = build(agt_data=agt, message=special_input, load_chat=self.load_chat)
-        response = ""
-        async for i in run_agent(graph=graph):
-            if isinstance(i, dict) and 'content' in i:
-                content = i['content']
-                if hasattr(content, 'choices') and content.choices and content.choices[0].delta.content:
-                    response += content.choices[0].delta.content
+        await collect_all_from_generator(run_agent(graph=graph))
 
-        assert "&" in response or "amp" in response
+        response = graph.nodes["escaper"].response
+        assert "&lt;script&gt;" in response
+        assert '\\"world\\"' in response
+        assert '<script>alert(\\"test\\")</script>' in response
 
-    @pytest.mark.needs_api
-    @_needs_api
     @pytest.mark.asyncio
     async def test_unicode_handling(self):
-        """Test handling of Unicode characters."""
+        """The real parser preserves Unicode without a provider round-trip."""
         agt = {
-            "type": "chat",
+            "type": "graph",
             "debug": True,
             "edges": [
                 {"id": "e1", "source": "user-input", "target": "unicode-processor",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_parser_input"},
-                {"id": "e2", "source": "unicode-processor", "target": "llm-node",
-                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_user_message"},
-                {"id": "e3", "source": "client-node", "target": "llm-node",
-                 "sourceHandle": "handle-client-provider", "targetHandle": "handle-client-provider"},
-                {"id": "e4", "source": "llm-node", "target": "end-node",
-                 "sourceHandle": "handle_generated_end", "targetHandle": "handle-5"},
+                {"id": "e2", "source": "unicode-processor", "target": "end-node",
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
             ],
             "nodes": [
                 {"id": "user-input", "type": ModelAgentFlowTypesModel.USER_INPUT},
@@ -346,53 +303,29 @@ Original: {{ handle_parser_input }}
 Length: {{ handle_parser_input | length }} characters"""
                     }
                 },
-                {
-                    "id": "client-node", "type": ModelAgentFlowTypesModel.CLIENT,
-                    "data": {
-                        "engine": "openai",
-                        "api_info": {
-                            "api_key": self.api_keys['openai_key'],
-                            "base_url": "https://api.openai.com/v1"
-                        },
-                        "model": "gpt-4.1-mini-2025-04-14"
-                    }
-                },
-                {
-                    "id": "llm-node", "type": ModelAgentFlowTypesModel.LLM,
-                    "data": {"top_p": 1, "stream": True, "max_tokens": 100, "temperature": 0.7}
-                },
                 {"id": "end-node", "type": ModelAgentFlowTypesModel.END},
             ]
         }
 
         unicode_input = "Hello 世界 🌍 مرحبا"
         graph = build(agt_data=agt, message=unicode_input, load_chat=self.load_chat)
-        response = ""
-        async for i in run_agent(graph=graph):
-            if isinstance(i, dict) and 'content' in i:
-                content = i['content']
-                if hasattr(content, 'choices') and content.choices and content.choices[0].delta.content:
-                    response += content.choices[0].delta.content
+        await collect_all_from_generator(run_agent(graph=graph))
 
-        assert "世界" in response or "🌍" in response or "مرحبا" in response
+        response = graph.nodes["unicode-processor"].response
+        assert unicode_input in response
+        assert f"Length: {len(unicode_input)} characters" in response
 
-    @pytest.mark.needs_api
-    @_needs_api
     @pytest.mark.asyncio
     async def test_missing_required_inputs(self):
-        """Test handling of missing required inputs."""
+        """A parser can select its real fallback input when user input is absent."""
         agt = {
-            "type": "chat",
+            "type": "graph",
             "debug": True,
             "edges": [
                 {"id": "e1", "source": "default-text", "target": "input-checker",
                  "sourceHandle": "handle_text_output", "targetHandle": "handle_default"},
-                {"id": "e2", "source": "input-checker", "target": "llm-node",
-                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_user_message"},
-                {"id": "e3", "source": "client-node", "target": "llm-node",
-                 "sourceHandle": "handle-client-provider", "targetHandle": "handle-client-provider"},
-                {"id": "e4", "source": "llm-node", "target": "end-node",
-                 "sourceHandle": "handle_generated_end", "targetHandle": "handle-5"},
+                {"id": "e2", "source": "input-checker", "target": "end-node",
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
             ],
             "nodes": [
                 {"id": "user-input", "type": ModelAgentFlowTypesModel.USER_INPUT},
@@ -410,21 +343,6 @@ No user input provided. Using default: {{ handle_default }}
 {% endif %}"""
                     }
                 },
-                {
-                    "id": "client-node", "type": ModelAgentFlowTypesModel.CLIENT,
-                    "data": {
-                        "engine": "openai",
-                        "api_info": {
-                            "api_key": self.api_keys['openai_key'],
-                            "base_url": "https://api.openai.com/v1"
-                        },
-                        "model": "gpt-4.1-mini-2025-04-14"
-                    }
-                },
-                {
-                    "id": "llm-node", "type": ModelAgentFlowTypesModel.LLM,
-                    "data": {"top_p": 1, "stream": True, "max_tokens": 50, "temperature": 0.7}
-                },
                 {"id": "end-node", "type": ModelAgentFlowTypesModel.END},
             ]
         }
@@ -437,9 +355,10 @@ No user input provided. Using default: {{ handle_default }}
         # The parser template should contain the conditional logic
         assert "handle_default" in checker_node.text
 
-        # Run the agent — should complete without errors
-        events = await collect_all_from_generator(run_agent(graph=graph))
-        assert len(events) > 0, "Expected at least one event from execution"
+        await collect_all_from_generator(run_agent(graph=graph))
+        assert checker_node.response is not None
+        assert "No user input provided" in checker_node.response
+        assert "Default fallback message" in checker_node.response
 
     @pytest.mark.asyncio
     async def test_nested_json_parsing(self):
@@ -455,11 +374,11 @@ No user input provided. Using default: {{ handle_default }}
             "debug": True,
             "edges": [
                 {"id": "e0", "source": "input", "target": "complex-json",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
                 {"id": "e1", "source": "complex-json", "target": "json-navigator",
                  "sourceHandle": "handle_text_output", "targetHandle": "handle_parser_input"},
                 {"id": "e2", "source": "json-navigator", "target": "end-node",
-                 "sourceHandle": "handle_parser_output", "targetHandle": "handle-5"},
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
             ],
             "nodes": [
                 {"id": "input", "type": ModelAgentFlowTypesModel.USER_INPUT},
@@ -491,33 +410,19 @@ User Profile:
         assert navigator is not None
         assert "data.user.name" in navigator.text
 
-        events = await collect_all_from_generator(run_agent(graph=graph))
-        assert len(events) > 0, "Expected at least one event from execution"
+        await collect_all_from_generator(run_agent(graph=graph))
 
-        # Verify no execution errors occurred
-        debug_errors = [
-            e for e in events
-            if e.get("type") == "debug" and e.get("content", {}).get("error")
-        ]
-        assert len(debug_errors) == 0, (
-            f"Parser should not error on nested JSON. Errors: "
-            f"{[e['content']['error'] for e in debug_errors]}"
-        )
-
-        # Verify the parser node executed successfully
-        parser_debug = [
-            e for e in events
-            if e.get("type") == "debug"
-            and e.get("content", {}).get("node_id") == "json-navigator"
-            and e.get("content", {}).get("was_executed")
-        ]
-        assert len(parser_debug) > 0, "Parser node should have executed"
-
-        # Verify content was produced (send_message or text output)
-        content_events = [e for e in events if e.get("type") == "content"]
-        assert len(content_events) > 0, "Expected content events from parser output"
+        rendered = navigator.response
+        assert rendered is not None
+        assert "Name: John" in rendered
+        assert "Theme: dark" in rendered
+        assert "Tags: developer, python, ai" in rendered
+        assert graph.nodes["end-node"].inputs["handle_flow_input"] == rendered
 
     @pytest.mark.needs_api
+    @pytest.mark.credential_gated
+    @pytest.mark.slow
+    @_live_opt_in
     @_needs_api
     @pytest.mark.asyncio
     async def test_timeout_simulation_with_api(self):
@@ -533,7 +438,7 @@ User Profile:
                 {"id": "e3", "source": "client-node", "target": "llm-node",
                  "sourceHandle": "handle-client-provider", "targetHandle": "handle-client-provider"},
                 {"id": "e4", "source": "llm-node", "target": "end-node",
-                 "sourceHandle": "handle_generated_end", "targetHandle": "handle-5"},
+                 "sourceHandle": "handle_generated_content", "targetHandle": "handle_flow_input"},
             ],
             "nodes": [
                 {"id": "user-input", "type": ModelAgentFlowTypesModel.USER_INPUT},

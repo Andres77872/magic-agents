@@ -495,6 +495,16 @@ class TestAssignToolHandlesOverwritesWrongValues:
 class TestPythonExecToolWrapper:
     """Tests for PythonExecToolWrapper dual-param tool schema."""
 
+    class FakeCodeRunner:
+        def __init__(self):
+            self.calls = []
+
+        async def execute(self, code, handler):
+            self.calls.append({"code": code, "handler": handler})
+            if "handler['x'] * 2" in code:
+                return {"result": handler["x"] * 2}
+            return {"result": handler}
+
     def test_tool_schema_has_code_and_handler_params(self):
         """PythonExecToolWrapper.tool_schema contains both code and handler params."""
         from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
@@ -533,10 +543,9 @@ class TestPythonExecToolWrapper:
     async def test_call_with_handler_uses_code_runner(self):
         """__call__(handler={'x': 1}) uses CodeRunner for execution."""
         from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
-        from magic_agents.node_system.python_code_runner import CodeRunner
 
         executor = MagicMock()
-        code_runner = CodeRunner()
+        code_runner = self.FakeCodeRunner()
         wrapper = PythonExecToolWrapper(
             executor=executor,
             code_runner=code_runner,
@@ -548,22 +557,27 @@ class TestPythonExecToolWrapper:
         import json
         parsed = json.loads(result)
         assert parsed == {"result": 10}
+        assert code_runner.calls == [{
+            "code": "def run(handler): return handler['x'] * 2",
+            "handler": {"x": 5},
+        }]
 
     @pytest.mark.asyncio
     async def test_call_both_code_and_handler_prefers_handler(self):
         """When both code and handler provided, handler takes precedence and warning logged."""
+        import importlib
         from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
-        from magic_agents.node_system.python_code_runner import CodeRunner
 
         executor = MagicMock()
-        code_runner = CodeRunner()
+        code_runner = self.FakeCodeRunner()
         wrapper = PythonExecToolWrapper(
             executor=executor,
             code_runner=code_runner,
             node_id='test-node',
         )
+        node_python_exec_module = importlib.import_module("magic_agents.node_system.NodePythonExec")
 
-        with patch('magic_agents.node_system.NodePythonExec.logger') as mock_logger:
+        with patch.object(node_python_exec_module, 'logger') as mock_logger:
             result = await wrapper(code="print('ignored')", handler={"value": "test"})
 
             # Warning should be logged
@@ -671,7 +685,6 @@ class TestPythonExecEdgeWiringCustomToolName:
     @pytest.mark.asyncio
     async def test_mixed_fetch_and_python_exec_tools_with_custom_names(self):
         """Fetch and PythonExec tools both collected by same LLM."""
-        from magic_llm.util.python_executor import PythonExecutor
         from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
         from magic_agents.node_system.NodeFetch import FetchToolCallable
 
@@ -696,7 +709,7 @@ class TestPythonExecEdgeWiringCustomToolName:
                 self.inputs = {}
                 self._response = None
                 self.generated = ""
-                self.executor = PythonExecutor(safety_mode='subprocess')
+                self.executor = MagicMock()
             def mark_bypassed(self):
                 pass
             @property

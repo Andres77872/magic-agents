@@ -60,6 +60,7 @@ def resolve_preset(preset_name: str) -> Dict[str, Any]:
 from magic_agents.node_system.NodeClientLLM import NodeClientLLM
 from magic_agents.node_system.NodeConstant import NodeConstant
 from magic_agents.node_system.NodeEND import NodeEND
+from magic_agents.node_system.NodeVoid import NodeVoid
 from magic_agents.node_system.NodeFetch import NodeFetch
 from magic_agents.node_system.NodeLLM import NodeLLM
 from magic_agents.node_system.NodeLoop import NodeLoop
@@ -84,7 +85,17 @@ def get_node_mcp():
         _NodeMcp_class = NodeMcp
     return _NodeMcp_class
 
-class NodeMcpProxy:
+class _NodeMcpProxyMeta(type):
+    """Preserve normal type checks while keeping the optional MCP stack lazy."""
+
+    def __instancecheck__(cls, instance):
+        return isinstance(instance, get_node_mcp())
+
+    def __subclasscheck__(cls, subclass):
+        return issubclass(subclass, get_node_mcp())
+
+
+class NodeMcpProxy(metaclass=_NodeMcpProxyMeta):
     def __new__(cls, *args, **kwargs):
         return get_node_mcp()(*args, **kwargs)
 
@@ -336,6 +347,7 @@ __all__ = [
     "NodeCodex",
     "NodeConstant",
     "NodeEND",
+    "NodeVoid",
     "NodeFetch",
     "NodeLLM",
     "NodeParser",

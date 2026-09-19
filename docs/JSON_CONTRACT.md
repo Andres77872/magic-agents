@@ -76,7 +76,7 @@ Each node in `nodes` array must contain an `id` and `type`; `data` and `position
 | `chat` | `NodeChat` | `ChatNodeModel` | Chat memory node |
 | `text` | `NodeText` | `TextNodeModel` | Static text node |
 | `constant` | `NodeConstant` | `ConstantNodeModel` | Typed primitive value source |
-| `void` | `NodeEND` | `None` | Silent terminal (no output) |
+| `void` | `NodeVoid` | `None` | Silent terminal (no output) |
 | `loop` | `NodeLoop` | `LoopNodeModel` | Iteration control node |
 | `inner` | `NodeInner` | `InnerNodeModel` | Subgraph execution node |
 | `conditional` | `NodeConditional` | `ConditionalNodeModel` | Branch routing node |
@@ -111,6 +111,10 @@ All node types inherit base fields:
 | `extras` | `object` | Optional | `null` | - |
 | `session_id` | `string` | Optional | `null` | - |
 | `session_required` | `boolean` | Optional | `false` | - |
+
+For backward compatibility, scalar `files` or `images` values are accepted and
+normalized to one-item lists before node execution. Canonical JSON should use
+arrays.
 
 ### end Fields
 
@@ -582,6 +586,7 @@ Each edge in `edges` array must contain:
 1. **`source` must reference existing node**
 2. **`target` must reference existing node**
 3. **Handles are validated** — legacy handles are rejected; unknown/opaque target handles usually warn in `warn`/`shadow` modes and are stricter only in deferred `strict` paths
+4. **`hook_node_id` must reference an existing `hook` node**, and each hook node binds to at most one enabled edge — repeated traversals of that edge (for example, loop iterations) reuse the binding and invoke the hook once per traversal
 
 ---
 

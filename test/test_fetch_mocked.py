@@ -261,11 +261,14 @@ class TestFetchMockedHTTP:
             async for item in fetch_node(chat_log):
                 results.append(item)
 
-        # The fetch should have produced some output (even if error handling is imperfect
-        # due to telemetry decorator interactions). Verify the request was attempted.
         assert mock_session.request.called
         call_kwargs = mock_session.request.call_args
         assert call_kwargs.kwargs["method"] == "GET"
+        debug_events = [r for r in results if r.get("type") == "debug"]
+        assert len(debug_events) == 1
+        assert debug_events[0]["content"]["error_type"] == "HTTPError"
+        assert debug_events[0]["content"]["context"]["status_code"] == 500
+        assert debug_events[0]["content"]["context"]["headers"] == {}
 
     @pytest.mark.asyncio
     async def test_fetch_no_inputs_returns_empty(self):

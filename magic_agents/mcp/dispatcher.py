@@ -94,11 +94,13 @@ class MCPToolDispatcher:
         self,
         session: MCPSessionManager,
         namespace: MCPToolNamespace,
-        timeout: Optional[float] = None
+        timeout: Optional[float] = None,
+        session_factory: Optional[Callable[[], MCPSessionManager]] = None,
     ):
         self._session = session
         self._namespace = namespace
         self._timeout = timeout or session._config.tool_timeout
+        self._session_factory = session_factory
     
     def build_bundle(
         self,
@@ -197,12 +199,35 @@ class MCPToolDispatcher:
                     "message": error_msg
                 })
             
-            # Arguments valid - proceed with remote call
+            # NodeMcp supplies a factory because its discovery session is closed
+            # as soon as the node finishes. Each downstream tool invocation gets
+            # a fresh, bounded session instead of retaining a dead transport.
+            if self._session_factory is not None:
+                call_session = self._session_factory()
+                try:
+                    await call_session.connect()
+                    return await self._call_tool_internal(
+                        remote_name=remote_name,
+                        local_name=local_name,
+                        arguments=kwargs,
+                        timeout=timeout,
+                        session=call_session,
+                    )
+                finally:
+                    try:
+                        await call_session.cleanup()
+                    except Exception as cleanup_error:
+                        logger.warning(
+                            "MCPToolDispatcher tool '%s' cleanup failed: %s",
+                            local_name,
+                            cleanup_error,
+                        )
+
             return await self._call_tool_internal(
                 remote_name=remote_name,
                 local_name=local_name,
                 arguments=kwargs,
-                timeout=timeout
+                timeout=timeout,
             )
         
         # Set __name__ for magic-llm registration
@@ -215,7 +240,8 @@ class MCPToolDispatcher:
         remote_name: str,
         local_name: str,
         arguments: dict,
-        timeout: float
+        timeout: float,
+        session: Optional[MCPSessionManager] = None,
     ) -> str:
         """Internal tool call implementation.
         
@@ -240,7 +266,8 @@ class MCPToolDispatcher:
         )
         
         try:
-            result = await self._session.call_tool(
+            active_session = session or self._session
+            result = await active_session.call_tool(
                 name=remote_name,
                 arguments=arguments,
                 timeout=timeout

@@ -6,7 +6,7 @@ Internal sink node for outputs that should be dropped.
 
 ## Runtime class
 
-- implemented with `NodeEND`
+- implemented with the dedicated silent `NodeVoid` sink
 
 ## Why it is special
 

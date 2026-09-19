@@ -6,7 +6,6 @@ Tests cover:
 - _build_handler_dict() with various input configurations
 """
 import pytest
-from unittest.mock import MagicMock, patch
 
 from magic_agents.models.factory.Nodes import PythonExecNodeModel
 from magic_agents.node_system.NodePythonExec import NodePythonExec
@@ -17,42 +16,39 @@ class TestNodePythonExecHasCode:
 
     def test_has_code_none(self):
         """_has_code() returns False when code is None."""
-        with patch('magic_llm.util.python_executor.PythonExecutor'):
-            node = NodePythonExec(
-                data=PythonExecNodeModel(safety_mode='subprocess', timeout=30.0, max_output_chars=8000),
-                node_id='py-1',
-                debug=False,
-            )
+        node = NodePythonExec(
+            data=PythonExecNodeModel(safety_mode='subprocess', timeout=30.0, max_output_chars=8000),
+            node_id='py-1',
+            debug=False,
+        )
         assert node._has_code() is False
 
     def test_has_code_with_code(self):
         """_has_code() returns True when code is a non-empty string."""
-        with patch('magic_llm.util.python_executor.PythonExecutor'):
-            node = NodePythonExec(
-                data=PythonExecNodeModel(
-                    safety_mode='subprocess',
-                    timeout=30.0,
-                    max_output_chars=8000,
-                    code="def run(handler): return handler",
-                ),
-                node_id='py-1',
-                debug=False,
-            )
+        node = NodePythonExec(
+            data=PythonExecNodeModel(
+                safety_mode='subprocess',
+                timeout=30.0,
+                max_output_chars=8000,
+                code="def run(handler): return handler",
+            ),
+            node_id='py-1',
+            debug=False,
+        )
         assert node._has_code() is True
 
     def test_has_code_empty_string(self):
         """_has_code() returns False when code is empty string."""
-        with patch('magic_llm.util.python_executor.PythonExecutor'):
-            node = NodePythonExec(
-                data=PythonExecNodeModel(
-                    safety_mode='subprocess',
-                    timeout=30.0,
-                    max_output_chars=8000,
-                    code="",
-                ),
-                node_id='py-1',
-                debug=False,
-            )
+        node = NodePythonExec(
+            data=PythonExecNodeModel(
+                safety_mode='subprocess',
+                timeout=30.0,
+                max_output_chars=8000,
+                code="",
+            ),
+            node_id='py-1',
+            debug=False,
+        )
         assert node._has_code() is False
 
 
@@ -60,20 +56,18 @@ class TestNodePythonExecBuildHandlerDict:
     """Tests for NodePythonExec._build_handler_dict()."""
 
     def _make_node(self, code=None, handles=None):
-        """Helper to create a NodePythonExec instance with mocked PythonExecutor."""
-        with patch('magic_llm.util.python_executor.PythonExecutor'):
-            node = NodePythonExec(
-                data=PythonExecNodeModel(
-                    safety_mode='subprocess',
-                    timeout=30.0,
-                    max_output_chars=8000,
-                    code=code,
-                ),
-                handles=handles,
-                node_id='py-1',
-                debug=False,
-            )
-        return node
+        """Create a NodePythonExec with its real local executor/configuration."""
+        return NodePythonExec(
+            data=PythonExecNodeModel(
+                safety_mode='subprocess',
+                timeout=30.0,
+                max_output_chars=8000,
+                code=code,
+            ),
+            handles=handles,
+            node_id='py-1',
+            debug=False,
+        )
 
     def test_build_handler_excludes_config_handles(self):
         """_build_handler_dict() excludes config handles (safety_mode, timeout, max_output_chars)."""
@@ -142,43 +136,40 @@ class TestNodePythonExecDualModeOutputHandle:
 
     def test_node_mode_default_output_handle(self):
         """Node mode default output handle is 'handle-python_exec-result'."""
-        with patch('magic_llm.util.python_executor.PythonExecutor'):
-            node = NodePythonExec(
-                data=PythonExecNodeModel(
-                    safety_mode='subprocess',
-                    timeout=30.0,
-                    max_output_chars=8000,
-                    code="def run(handler): return handler",
-                ),
-                node_id='py-1',
-                debug=False,
-            )
+        node = NodePythonExec(
+            data=PythonExecNodeModel(
+                safety_mode='subprocess',
+                timeout=30.0,
+                max_output_chars=8000,
+                code="def run(handler): return handler",
+            ),
+            node_id='py-1',
+            debug=False,
+        )
         assert node.OUTPUT_HANDLE_CODE_RESULT == 'handle-python_exec-result'
 
     def test_node_mode_custom_output_handle(self):
         """Node mode respects configured handles.output for output handle."""
-        with patch('magic_llm.util.python_executor.PythonExecutor'):
-            node = NodePythonExec(
-                data=PythonExecNodeModel(
-                    safety_mode='subprocess',
-                    timeout=30.0,
-                    max_output_chars=8000,
-                    code="def run(handler): return handler",
-                ),
-                handles={'output': 'my-custom-handle'},
-                node_id='py-1',
-                debug=False,
-            )
+        node = NodePythonExec(
+            data=PythonExecNodeModel(
+                safety_mode='subprocess',
+                timeout=30.0,
+                max_output_chars=8000,
+                code="def run(handler): return handler",
+            ),
+            handles={'output': 'my-custom-handle'},
+            node_id='py-1',
+            debug=False,
+        )
         assert node.OUTPUT_HANDLE_CODE_RESULT == 'my-custom-handle'
 
     def test_tool_mode_default_output_handle(self):
         """Tool mode default output handle is 'handle-tool-definition'."""
-        with patch('magic_llm.util.python_executor.PythonExecutor'):
-            node = NodePythonExec(
-                data=PythonExecNodeModel(),
-                node_id='py-1',
-                debug=False,
-            )
+        node = NodePythonExec(
+            data=PythonExecNodeModel(),
+            node_id='py-1',
+            debug=False,
+        )
         assert node.OUTPUT_HANDLE == 'handle-tool-definition'
 
 
@@ -194,7 +185,7 @@ class TestPythonExecToolWrapperToolName:
         from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
 
         wrapper = PythonExecToolWrapper(
-            executor=MagicMock(),
+            executor=object(),
             tool_name="analyze",
         )
         assert wrapper.__name__ == "analyze"
@@ -204,7 +195,7 @@ class TestPythonExecToolWrapperToolName:
         from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
 
         wrapper = PythonExecToolWrapper(
-            executor=MagicMock(),
+            executor=object(),
             tool_name="analyze",
         )
         schema = wrapper.tool_schema
@@ -214,14 +205,14 @@ class TestPythonExecToolWrapperToolName:
         """PythonExecToolWrapper().__name__ returns 'execute_python' (default)."""
         from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
 
-        wrapper = PythonExecToolWrapper(executor=MagicMock())
+        wrapper = PythonExecToolWrapper(executor=object())
         assert wrapper.__name__ == "execute_python"
 
     def test_default_tool_name_in_schema(self):
         """PythonExecToolWrapper().tool_schema uses 'execute_python'."""
         from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
 
-        wrapper = PythonExecToolWrapper(executor=MagicMock())
+        wrapper = PythonExecToolWrapper(executor=object())
         schema = wrapper.tool_schema
         assert schema["function"]["name"] == "execute_python"
 
@@ -229,8 +220,8 @@ class TestPythonExecToolWrapperToolName:
         """Two wrappers with different tool_name have distinct schemas."""
         from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
 
-        wrapper_a = PythonExecToolWrapper(executor=MagicMock(), tool_name="analyze")
-        wrapper_b = PythonExecToolWrapper(executor=MagicMock(), tool_name="execute")
+        wrapper_a = PythonExecToolWrapper(executor=object(), tool_name="analyze")
+        wrapper_b = PythonExecToolWrapper(executor=object(), tool_name="execute")
 
         schema_a = wrapper_a.tool_schema
         schema_b = wrapper_b.tool_schema
@@ -259,49 +250,45 @@ class TestPythonExecNodeModelToolName:
 
     def test_node_init_stores_custom_tool_name(self):
         """NodePythonExec.__init__ with custom tool_name stores and passes it to wrapper."""
-        with patch('magic_llm.util.python_executor.PythonExecutor'):
-            node = NodePythonExec(
-                data=PythonExecNodeModel(tool_name="analyze"),
-                node_id='py-1',
-                debug=False,
-            )
+        node = NodePythonExec(
+            data=PythonExecNodeModel(tool_name="analyze"),
+            node_id='py-1',
+            debug=False,
+        )
         assert node._tool_name == "analyze"
 
     def test_node_init_default_tool_name(self):
         """NodePythonExec.__init__ with default None tool_name stores 'execute_python'."""
-        with patch('magic_llm.util.python_executor.PythonExecutor'):
-            node = NodePythonExec(
-                data=PythonExecNodeModel(),
-                node_id='py-1',
-                debug=False,
-            )
+        node = NodePythonExec(
+            data=PythonExecNodeModel(),
+            node_id='py-1',
+            debug=False,
+        )
         assert node._tool_name == "execute_python"
 
     @pytest.mark.asyncio
     async def test_process_passes_custom_tool_name_to_wrapper(self):
         """NodePythonExec.process() passes tool_name to PythonExecToolWrapper."""
-        with patch('magic_llm.util.python_executor.PythonExecutor') as mock_exec_cls:
-            mock_exec = MagicMock()
-            mock_exec_cls.return_value = mock_exec
+        node = NodePythonExec(
+            data=PythonExecNodeModel(tool_name="analyze"),
+            node_id='py-1',
+            debug=False,
+        )
 
-            node = NodePythonExec(
-                data=PythonExecNodeModel(tool_name="analyze"),
-                node_id='py-1',
-                debug=False,
-            )
+        # Process in tool mode (no code) yields a wrapper around the real executor.
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
 
-            # Process in tool mode (no code) yields a wrapper
-            from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
-            import json
+        results = []
+        async for result in node.process(chat_log=None):
+            results.append(result)
 
-            results = []
-            async for result in node.process(chat_log=None):
-                results.append(result)
+        business_events = [
+            result
+            for result in results
+            if result.get("type") == "handle-tool-definition"
+        ]
+        assert len(business_events) == 1
 
-            # The yielded wrapper should have tool_name="analyze"
-            assert len(results) > 0
-            wrapper = results[0].get('content') if isinstance(results[0], dict) else None
-            # The wrapper is yielded as yield_static content
-            # Check that the wrapper has the correct name
-            if wrapper is not None and hasattr(wrapper, '__name__'):
-                assert wrapper.__name__ == "analyze"
+        wrapper = business_events[0]["content"]["content"]
+        assert isinstance(wrapper, PythonExecToolWrapper)
+        assert wrapper.__name__ == "analyze"

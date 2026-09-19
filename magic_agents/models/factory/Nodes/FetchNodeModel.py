@@ -24,6 +24,7 @@ class FetchNodeModel(BaseNodeModel):
     # Tool mode fields
     tool_mode: bool = False
     tool_name: Optional[str] = None
+    tool_description: Optional[str] = None
     tool_parameters: Optional[dict[str, Any]] = None
 
     @model_validator(mode='after')

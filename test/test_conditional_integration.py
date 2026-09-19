@@ -8,6 +8,7 @@ import pytest
 
 from magic_agents import run_agent
 from magic_agents.agt_flow import build
+from magic_agents.debug.events import DebugEventType
 
 
 def extract_streamed_content(item):
@@ -26,26 +27,29 @@ def extract_streamed_content(item):
     return ""
 
 
-def get_executed_nodes(debug_summary: dict) -> set:
-    """Extract set of executed node IDs from debug summary."""
-    executed = set()
-    if not debug_summary:
-        return executed
-    for node in debug_summary.get("nodes", []):
-        if node.get("was_executed"):
-            executed.add(node.get("node_id"))
-    return executed
+class DebugCapture(list):
+    """Async callback collector for typed direct-runtime debug events."""
+
+    async def __call__(self, event):
+        self.append(event)
 
 
-def get_bypassed_nodes(debug_summary: dict) -> set:
-    """Extract set of bypassed node IDs from debug summary."""
-    bypassed = set()
-    if not debug_summary:
-        return bypassed
-    for node in debug_summary.get("nodes", []):
-        if node.get("was_bypassed"):
-            bypassed.add(node.get("node_id"))
-    return bypassed
+def get_executed_nodes(debug_events) -> set:
+    """Extract node IDs with a successful NODE_END event."""
+    return {
+        event.node_id
+        for event in debug_events
+        if event.event_type == DebugEventType.NODE_END
+    }
+
+
+def get_bypassed_nodes(debug_events) -> set:
+    """Extract node IDs with a NODE_BYPASS event."""
+    return {
+        event.node_id
+        for event in debug_events
+        if event.event_type == DebugEventType.NODE_BYPASS
+    }
 
 
 def get_debug_items(results: list) -> list:
@@ -81,18 +85,17 @@ class TestConditionalEmptyCondition:
                 {"id": "e3", "source": "cond", "target": "send_fallback",
                  "sourceHandle": "fallback", "targetHandle": "handle_send_extra"},
                 {"id": "e4", "source": "send_primary", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
                 {"id": "e5", "source": "send_fallback", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h2"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
+        assert not graph._validation_errors
         content_output = []
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
+        debug_events = DebugCapture()
+        async for item in run_agent(graph, debug_callback=debug_events):
             text = extract_streamed_content(item)
             if text:
                 content_output.append(text)
@@ -100,9 +103,9 @@ class TestConditionalEmptyCondition:
         content_str = "".join(content_output)
         assert "FALLBACK" in content_str
         assert "PRIMARY" not in content_str
-        executed = get_executed_nodes(debug_summary)
+        executed = get_executed_nodes(debug_events)
         assert "send_fallback" in executed
-        bypassed = get_bypassed_nodes(debug_summary)
+        bypassed = get_bypassed_nodes(debug_events)
         assert "send_primary" in bypassed
 
     @pytest.mark.asyncio
@@ -129,18 +132,17 @@ class TestConditionalEmptyCondition:
                 {"id": "e3", "source": "cond", "target": "send_fallback",
                  "sourceHandle": "fallback", "targetHandle": "handle_send_extra"},
                 {"id": "e4", "source": "send_primary", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
                 {"id": "e5", "source": "send_fallback", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h2"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
+        assert not graph._validation_errors
         content_output = []
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
+        debug_events = DebugCapture()
+        async for item in run_agent(graph, debug_callback=debug_events):
             text = extract_streamed_content(item)
             if text:
                 content_output.append(text)
@@ -148,9 +150,9 @@ class TestConditionalEmptyCondition:
         content_str = "".join(content_output)
         assert "PRIMARY" in content_str
         assert "FALLBACK" not in content_str
-        executed = get_executed_nodes(debug_summary)
+        executed = get_executed_nodes(debug_events)
         assert "send_primary" in executed
-        bypassed = get_bypassed_nodes(debug_summary)
+        bypassed = get_bypassed_nodes(debug_events)
         assert "send_fallback" in bypassed
 
 
@@ -187,22 +189,21 @@ class TestConditionalFanOut:
                 {"id": "e5", "source": "cond", "target": "send_single",
                  "sourceHandle": "single", "targetHandle": "handle_send_extra"},
                 {"id": "e6", "source": "send_1", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
                 {"id": "e7", "source": "send_2", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h2"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
                 {"id": "e8", "source": "send_3", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h3"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
                 {"id": "e9", "source": "send_single", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h4"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
+        assert not graph._validation_errors
         content_output = []
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
+        debug_events = DebugCapture()
+        async for item in run_agent(graph, debug_callback=debug_events):
             text = extract_streamed_content(item)
             if text:
                 content_output.append(text)
@@ -213,11 +214,11 @@ class TestConditionalFanOut:
         assert "T3" in content_str
         assert "SINGLE" not in content_str
 
-        executed = get_executed_nodes(debug_summary)
+        executed = get_executed_nodes(debug_events)
         assert "send_1" in executed
         assert "send_2" in executed
         assert "send_3" in executed
-        bypassed = get_bypassed_nodes(debug_summary)
+        bypassed = get_bypassed_nodes(debug_events)
         assert "send_single" in bypassed
 
 
@@ -257,18 +258,17 @@ class TestConditionalMultiInput:
                 {"id": "e6", "source": "cond", "target": "send_fail",
                  "sourceHandle": "fail", "targetHandle": "handle_send_extra"},
                 {"id": "e7", "source": "send_pass", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
                 {"id": "e8", "source": "send_fail", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h2"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
+        assert not graph._validation_errors
         content_output = []
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
+        debug_events = DebugCapture()
+        async for item in run_agent(graph, debug_callback=debug_events):
             text = extract_streamed_content(item)
             if text:
                 content_output.append(text)
@@ -276,9 +276,9 @@ class TestConditionalMultiInput:
         content_str = "".join(content_output)
         assert "PASSED" in content_str
         assert "FAILED" not in content_str
-        executed = get_executed_nodes(debug_summary)
+        executed = get_executed_nodes(debug_events)
         assert "send_pass" in executed
-        bypassed = get_bypassed_nodes(debug_summary)
+        bypassed = get_bypassed_nodes(debug_events)
         assert "send_fail" in bypassed
 
     @pytest.mark.asyncio
@@ -314,18 +314,17 @@ class TestConditionalMultiInput:
                 {"id": "e6", "source": "cond", "target": "send_b",
                  "sourceHandle": "branch_b", "targetHandle": "handle_send_extra"},
                 {"id": "e7", "source": "send_a", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
                 {"id": "e8", "source": "send_b", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h2"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
+        assert not graph._validation_errors
         content_output = []
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
+        debug_events = DebugCapture()
+        async for item in run_agent(graph, debug_callback=debug_events):
             text = extract_streamed_content(item)
             if text:
                 content_output.append(text)
@@ -333,9 +332,9 @@ class TestConditionalMultiInput:
         content_str = "".join(content_output)
         assert "BRANCH_A" in content_str
         assert "BRANCH_B" not in content_str
-        executed = get_executed_nodes(debug_summary)
+        executed = get_executed_nodes(debug_events)
         assert "send_a" in executed
-        bypassed = get_bypassed_nodes(debug_summary)
+        bypassed = get_bypassed_nodes(debug_events)
         assert "send_b" in bypassed
 
 
@@ -351,7 +350,8 @@ class TestConditionalErrorPaths:
             "nodes": [
                 {"id": "input", "type": "user_input"},
                 {"id": "cond", "type": "conditional", "data": {
-                    "condition": "{{ 'yes' if undefined_var else 'no' }}",
+                    # Nested access raises under Jinja's default Undefined policy.
+                    "condition": "{{ undefined_var.required_attribute }}",
                     "output_handles": ["yes", "no"],
                 }},
                 {"id": "send_yes", "type": "send_message", "data": {"message": "", "json_extras": "YES"}},
@@ -366,26 +366,34 @@ class TestConditionalErrorPaths:
                 {"id": "e3", "source": "cond", "target": "send_no",
                  "sourceHandle": "no", "targetHandle": "handle_send_extra"},
                 {"id": "e4", "source": "send_yes", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
                 {"id": "e5", "source": "send_no", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h2"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
+        assert not graph._validation_errors
         content_output = []
         debug_items = []
-        async for item in run_agent(graph):
+        debug_events = DebugCapture()
+        async for item in run_agent(graph, debug_callback=debug_events):
             text = extract_streamed_content(item)
             if text:
                 content_output.append(text)
-            if isinstance(item, dict) and item.get("type") == "debug":
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "debug"
+                and item.get("content", {}).get("error_type") == "TemplateError"
+            ):
                 debug_items.append(item)
 
-        # At least one branch should be bypassed due to the error
+        # Both branches are bypassed after the template error.
         content_str = "".join(content_output)
-        assert "YES" not in content_str or "NO" not in content_str
-        assert len(debug_items) > 0
+        assert "YES" not in content_str
+        assert "NO" not in content_str
+        assert {"send_yes", "send_no"} <= get_bypassed_nodes(debug_events)
+        assert len(debug_items) == 1
 
     @pytest.mark.asyncio
     async def test_conditional_no_default_empty_result_bypasses_all(self):
@@ -401,7 +409,7 @@ class TestConditionalErrorPaths:
                 {"id": "input", "type": "user_input"},
                 {"id": "cond", "type": "conditional", "data": {
                     "condition": "{{ '' }}",
-                    "output_handles": ["yes", "no"],
+                    "output_handles": ["yes"],
                 }},
                 {"id": "send_yes", "type": "send_message", "data": {"message": "", "json_extras": "YES"}},
                 {"id": "end", "type": "end"},
@@ -412,28 +420,34 @@ class TestConditionalErrorPaths:
                 {"id": "e2", "source": "cond", "target": "send_yes",
                  "sourceHandle": "yes", "targetHandle": "handle_send_extra"},
                 {"id": "e3", "source": "send_yes", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
+        assert not graph._validation_errors
         content_output = []
         debug_items = []
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
+        debug_events = DebugCapture()
+        async for item in run_agent(graph, debug_callback=debug_events):
             text = extract_streamed_content(item)
             if text:
                 content_output.append(text)
-            if isinstance(item, dict) and item.get("type") == "debug":
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "debug"
+                and item.get("content", {}).get("error_type") == "EmptyHandleError"
+            ):
                 debug_items.append(item)
 
-        # Should have completed (debug_summary present)
-        assert debug_summary is not None
+        assert any(
+            event.event_type == DebugEventType.GRAPH_END
+            for event in debug_events
+        )
 
         # send_yes should be bypassed
         content_str = "".join(content_output)
         assert "YES" not in content_str
+        assert "send_yes" in get_bypassed_nodes(debug_events)
         # Should have debug error about routing
-        assert len(debug_items) > 0
+        assert len(debug_items) == 1

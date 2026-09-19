@@ -7,6 +7,7 @@ summaries, compatible with the existing GraphDebugFeedback format.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
 from typing import Any, Dict, List, Optional
@@ -449,7 +450,7 @@ class StreamingCollector(DebugCollector):
         # Call the event handler if set
         if self._on_event:
             import asyncio
-            if asyncio.iscoroutinefunction(self._on_event):
+            if inspect.iscoroutinefunction(self._on_event):
                 await self._on_event(event)
             else:
                 self._on_event(event)

@@ -293,3 +293,19 @@ class RuntimeConfig:
             True if no graph hooks registered on this instance, False otherwise.
         """
         return len(self._graph_hooks) == 0
+
+    def has_auto_wired_hooks(self) -> bool:
+        """Return whether persistence or debug-SSE has a usable sink."""
+        return (
+            self._persistence_enabled and self._persistence_sink is not None
+        ) or (
+            self._debug_sse_enabled and self._debug_sse_sink is not None
+        )
+
+    def has_configured_hooks(self) -> bool:
+        """Return whether any global, graph, or auto-wired hook is configured."""
+        return (
+            not self.is_empty()
+            or self.has_global_hooks()
+            or self.has_auto_wired_hooks()
+        )

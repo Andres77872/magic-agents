@@ -145,7 +145,12 @@ class NodeMcp(Node):
             dispatcher = MCPToolDispatcher(
                 session=self._session,
                 namespace=namespace,
-                timeout=server_config.tool_timeout
+                timeout=server_config.tool_timeout,
+                session_factory=lambda: MCPSessionManager(
+                    config=server_config,
+                    node_id=self.node_id,
+                    debug=self.debug,
+                ),
             )
             self._bundle = dispatcher.build_bundle(mapped_tools, self.node_id)
             

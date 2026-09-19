@@ -1,6 +1,6 @@
 from typing import Optional, Any
 
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 
 from magic_agents.models.factory.Nodes.BaseNodeModel import BaseNodeModel
 
@@ -16,13 +16,21 @@ class UserInputNodeModel(BaseNodeModel):
     text: Optional[str] = None
     content: Optional[str] = None
     message: Optional[str] = None
-    files: Optional[list[Any] | Any] = None
-    images: Optional[list[Any] | Any] = None
+    files: Optional[list[Any]] = None
+    images: Optional[list[Any]] = None
     extras: Optional[dict[str, Any]] = None  # Client-provided contextual data
     
     # Session configuration for thread persistence
     session_id: Optional[str] = None  # External thread/conversation ID (reuse from backend)
     session_required: bool = False  # If True, enforce session presence (auto-create fallback)
+
+    @field_validator('files', 'images', mode='before')
+    @classmethod
+    def normalize_media_lists(cls, value):
+        """Accept legacy scalar media values as one-item lists."""
+        if value is None or isinstance(value, list):
+            return value
+        return [value]
 
     @model_validator(mode='after')
     def resolve_text_content(self):

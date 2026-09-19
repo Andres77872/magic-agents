@@ -53,12 +53,16 @@ class EdgeHookConfig(BaseModel):
 
     def model_post_init(self, __context) -> None:
         """Post-initialization hook to emit deprecation warnings."""
-        if self.hook_type is not None and self.hook_type != "on_edge_traversed":
+        # Pydantic emits the field's DeprecationWarning on attribute access.
+        # Internal validation must not warn merely because a model was created;
+        # external callers still receive the warning when reading hook_type.
+        hook_type = self.__dict__.get("hook_type")
+        if hook_type is not None and hook_type != "on_edge_traversed":
             logger.warning(
                 "EdgeHookConfig.hook_type is deprecated and will be removed. "
                 "Edge hook dispatch is determined by hook_node_id only. "
                 "Received hook_type=%r",
-                self.hook_type,
+                hook_type,
             )
 
 

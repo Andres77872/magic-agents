@@ -148,7 +148,12 @@ class NodeInputTracker:
             return False  # Source nodes are never bypassed
         return self.is_ready and len(self.received_edges) == 0
     
-    async def receive_input(self, handle: str, content: Any) -> bool:
+    async def receive_input(
+        self,
+        handle: str,
+        content: Any,
+        edge_id: Optional[str] = None,
+    ) -> bool:
         """
         Called when input arrives on a handle.
         
@@ -159,16 +164,31 @@ class NodeInputTracker:
         Args:
             handle: Target handle name
             content: The input content
+            edge_id: Exact incoming edge when the dispatcher knows it.
             
         Returns:
             True if this made the node ready
         """
         async with self._lock:
-            # Find matching edges by handle (multiple edges may share same handle)
-            matching_edges = [
-                (edge_id, info) for edge_id, info in self._expected_inputs.items()
-                if info.handle == handle and not info.received
-            ]
+            if edge_id is not None:
+                info = self._expected_inputs.get(edge_id)
+                matching_edges = (
+                    [(edge_id, info)]
+                    if info is not None
+                    and info.handle == handle
+                    and not info.received
+                    else []
+                )
+            else:
+                # Legacy callers may only know the handle. Never reuse an
+                # already-bypassed edge when another fan-in edge is active.
+                matching_edges = [
+                    (candidate_id, info)
+                    for candidate_id, info in self._expected_inputs.items()
+                    if info.handle == handle
+                    and not info.received
+                    and not info.bypassed
+                ]
             
             if not matching_edges:
                 # No matching unreceived edge for this handle

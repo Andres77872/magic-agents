@@ -20,6 +20,7 @@ All remaining self.inputs keys become handler dict entries.
 """
 
 import asyncio
+import inspect
 import logging
 from typing import Optional, AsyncGenerator, Dict, Any
 
@@ -138,7 +139,10 @@ class PythonExecToolWrapper:
             return await self._execute_with_handler(effective_code, handler_dict)
 
         # Case 3: Only code provided — legacy path
-        return await self._executor(code=code or "")
+        result = await asyncio.to_thread(self._executor, code=code or "")
+        if inspect.isawaitable(result):
+            result = await result
+        return result
 
     async def _execute_with_handler(self, code: str, handler: dict) -> str:
         """Execute code with handler dict via CodeRunner."""
@@ -176,6 +180,10 @@ class NodePythonExec(Node):
     def __init__(self, data: PythonExecNodeModel, handles: Optional[dict] = None, **kwargs):
         super().__init__(**kwargs)
         self._code = data.code  # NEW: store code for mode detection
+        # Node-mode inputs become keys in the user-defined ``handler`` dict, so
+        # their edge handles are intentionally open-ended. Tool mode continues
+        # to accept only its declared runtime-configuration handles.
+        self.accepts_dynamic_input_handles = self._has_code()
         self._data = data
         self._tool_name = data.tool_name or "execute_python"
         self._default_safety_mode = getattr(data, 'safety_mode', 'subprocess')

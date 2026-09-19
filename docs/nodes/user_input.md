@@ -22,6 +22,7 @@ Entry node that injects the initial user message and optional files, images, and
 - when `session_required` is true and no session exists, leaves creation to the backend instead of generating a frontend/runtime UUID
 - mirrors configured `session_id` into `chat_log.id_thread` when no thread ID is already present
 - resolves text from `text`, `content`, or `message`
+- normalizes legacy scalar `files` and `images` values to one-item lists
 - passes `extras` through only when present
 
 ## Common fields

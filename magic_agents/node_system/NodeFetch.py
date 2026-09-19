@@ -27,14 +27,96 @@ _SENSITIVE_KEY_PATTERNS = [
     ]
 ]
 
+_ASSIGNMENT_PATTERN = re.compile(
+    r"(?P<key>(?P<quote>[\"'])(?P<quoted_key>[^\"']+)(?P=quote)|"
+    r"(?P<bare_key>[A-Za-z_][A-Za-z0-9_.-]*))(?P<separator>\s*[:=]\s*)"
+)
+
+
+def _is_sensitive_key(key: Any) -> bool:
+    return isinstance(key, str) and any(
+        pattern.search(key) for pattern in _SENSITIVE_KEY_PATTERNS
+    )
+
+
+def _redact_json_value(value: Any) -> Any:
+    """Recursively redact sensitive mapping values in parsed JSON."""
+    if isinstance(value, dict):
+        return {
+            key: "[REDACTED]" if _is_sensitive_key(key) else _redact_json_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_json_value(item) for item in value]
+    return value
+
+
+def _redact_sensitive_assignments(text: str) -> str:
+    """Best-effort redaction for malformed JSON and key/value text.
+
+    Error bodies are not guaranteed to be valid JSON. This scanner recognizes
+    quoted JSON keys as well as bare ``key=value``/``Header: value`` forms. If
+    a sensitive quoted value is truncated before its closing quote, the rest of
+    the input is discarded as part of that value instead of being logged.
+    """
+    pieces: list[str] = []
+    cursor = 0
+
+    while match := _ASSIGNMENT_PATTERN.search(text, cursor):
+        pieces.append(text[cursor:match.end()])
+        cursor = match.end()
+        key = match.group("quoted_key") or match.group("bare_key") or ""
+        if not _is_sensitive_key(key):
+            continue
+
+        if cursor >= len(text):
+            pieces.append('"[REDACTED]"')
+            break
+
+        first = text[cursor]
+        if first in {'"', "'"}:
+            quote = first
+            value_end = cursor + 1
+            escaped = False
+            while value_end < len(text):
+                char = text[value_end]
+                if char == quote and not escaped:
+                    value_end += 1
+                    break
+                if char == "\\" and not escaped:
+                    escaped = True
+                else:
+                    escaped = False
+                value_end += 1
+            pieces.append(f'{quote}[REDACTED]{quote}')
+            cursor = value_end
+            continue
+
+        if first in "[{":
+            # Valid containers are handled by the recursive JSON path. For a
+            # malformed sensitive container, suppress the remaining fragment;
+            # trying to recover its boundary risks exposing nested credentials.
+            pieces.append('"[REDACTED]"')
+            cursor = len(text)
+            break
+
+        value_end = cursor
+        while value_end < len(text) and text[value_end] not in ",}]\r\n&":
+            value_end += 1
+        pieces.append('"[REDACTED]"')
+        cursor = value_end
+
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
 
 def _redact_body_preview(body_text: str, max_length: int = 500) -> str:
     """Truncate and redact sensitive fields from a response body for logging.
 
-    For valid JSON objects at top level, key-based redaction is applied:
-    any key matching a sensitive pattern (api_key, secret, token, etc.)
-    has its value replaced with ``"[REDACTED]"``.  Non‑JSON bodies and
-    JSON arrays/lists receive truncation‑only treatment.
+    Valid JSON is parsed before truncation so nested secrets can be redacted
+    without a long value turning the preview into invalid JSON. Malformed JSON
+    and key/value text use a conservative scanner that also handles truncated
+    quoted values. The safe result is truncated only after redaction.
 
     Args:
         body_text: Raw response body text.
@@ -43,20 +125,15 @@ def _redact_body_preview(body_text: str, max_length: int = 500) -> str:
     Returns:
         Redacted body preview string safe for diagnostic log output.
     """
-    truncated = body_text[:max_length]
+    if max_length <= 0:
+        return ""
+
     try:
-        parsed = json.loads(truncated)
+        parsed = json.loads(body_text)
     except json.JSONDecodeError:
-        # Non-JSON body: truncation only, no key-based redaction.
-        return truncated
+        return _redact_sensitive_assignments(body_text)[:max_length]
 
-    if isinstance(parsed, dict):
-        # Depth-1 only: iterate top-level keys.
-        for key in list(parsed.keys()):
-            if any(pattern.search(key) for pattern in _SENSITIVE_KEY_PATTERNS):
-                parsed[key] = "[REDACTED]"
-
-    return json.dumps(parsed)
+    return json.dumps(_redact_json_value(parsed))[:max_length]
 
 
 def _json_parse_mapping(value: Any, field_name: str, tool_name: str, allow_none: bool = False) -> dict:
@@ -105,7 +182,7 @@ class FetchToolCallable:
         debug: bool = False,
     ):
         self._url = url_template
-        self._method = method
+        self._method = (method or "GET").upper().strip()
         self._headers = headers or {}
         self._data = data
         self._json_data = json_data
@@ -264,7 +341,7 @@ class FetchToolCallable:
                 if 'url' in rendered_config:
                     effective_url = rendered_config['url']
                 if 'method' in rendered_config:
-                    effective_method = rendered_config['method']
+                    effective_method = str(rendered_config['method']).upper().strip()
                 if 'headers' in rendered_config:
                     hv = rendered_config['headers']
                     if isinstance(hv, dict):
@@ -330,7 +407,9 @@ class FetchToolCallable:
                 if rendered_json_data is not None:
                     fetch_kwargs['json'] = rendered_json_data if isinstance(rendered_json_data, dict) else json.loads(rendered_json_data)
                 elif rendered_data is not None:
-                    fetch_kwargs['data'] = rendered_data if isinstance(rendered_data, dict) else json.loads(rendered_data)
+                    # ``data`` is the raw/form-body channel. Preserve strings
+                    # verbatim; only ``json_data`` requires JSON decoding.
+                    fetch_kwargs['data'] = rendered_data
 
                 if 'json' not in fetch_kwargs and 'data' not in fetch_kwargs:
                     if effective_method != 'GET':
@@ -433,6 +512,7 @@ class NodeFetch(Node):
         # Tool mode configuration
         self.tool_mode = getattr(data, 'tool_mode', False)
         self.tool_name = getattr(data, 'tool_name', None) or 'fetch'
+        self.tool_description = getattr(data, 'tool_description', None)
         self.tool_parameters = getattr(data, 'tool_parameters', None)
         self.debug = getattr(data, 'debug', False)
 
@@ -474,7 +554,6 @@ class NodeFetch(Node):
             json_data = json_data if type(json_data) is dict else json.loads(json_data)
             kwargs['json'] = json_data
         elif data is not None:
-            data = data if type(data) is dict else json.loads(data)
             kwargs['data'] = data
 
         if 'json' not in kwargs and 'data' not in kwargs:
@@ -514,6 +593,7 @@ class NodeFetch(Node):
                 json_data=self.jsondata,
                 params=self.params,
                 tool_name=self.tool_name,
+                tool_description=getattr(self, 'tool_description', None),
                 tool_parameters=tool_parameters,
                 debug=self.debug,
             )
@@ -577,6 +657,7 @@ class NodeFetch(Node):
             yield self.yield_static(response_json, content_type=self.OUTPUT_HANDLE)
         except aiohttp.ClientResponseError as e:
             logger.error("NodeFetch:%s HTTP error %s: %s", self.node_id, e.status, e.message)
+            response_headers = dict(e.headers) if e.headers is not None else {}
             yield self.yield_debug_error(
                 error_type="HTTPError",
                 error_message=f"HTTP request failed with status {e.status}: {e.message}",
@@ -584,7 +665,7 @@ class NodeFetch(Node):
                     "url": rendered_url,
                     "method": self.method,
                     "status_code": e.status,
-                    "headers": dict(e.headers) if hasattr(e, 'headers') else None
+                    "headers": response_headers
                 }
             )
         except aiohttp.ClientError as e:

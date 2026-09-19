@@ -41,6 +41,7 @@ from magic_agents.node_system import (
     NodeChat,
     NodeLLM,
     NodeEND,
+    NodeVoid,
     NodeText,
     NodeConstant,
     NodeUserInput,
@@ -296,7 +297,7 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False, deps: Opti
         ModelAgentFlowTypesModel.LOOP: (NodeLoop, LoopNodeModel),
         ModelAgentFlowTypesModel.CONDITIONAL: (NodeConditional, ConditionalNodeModel),
         ModelAgentFlowTypesModel.INNER: (NodeInner, InnerNodeModel),
-        ModelAgentFlowTypesModel.VOID: (NodeEND, None),
+        ModelAgentFlowTypesModel.VOID: (NodeVoid, None),
         ModelAgentFlowTypesModel.PYTHON_EXEC: (NodePythonExec, PythonExecNodeModel),
         ModelAgentFlowTypesModel.MCP: (NodeMcp, McpNodeModel),
         ModelAgentFlowTypesModel.TOOL: (NodeTool, ToolNodeModel),
@@ -306,7 +307,11 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False, deps: Opti
     }
     
     if node_type not in node_map:
-        error_msg = f"Unsupported node type: {node_type}"
+        available_types = sorted(node_map)
+        error_msg = (
+            f"Unsupported node type: {node_type}. "
+            f"Available types: {available_types}"
+        )
         logger.error("create_node: %s (node_id=%s)", error_msg, node['id'])
         # Hard-fail: unknown node types must not silently become stubs.
         raise ValueError(error_msg)
@@ -375,7 +380,7 @@ async def execute_graph(
     #   2. AgentFlowModel.hooks (graph-level) — fallback
     #   3. No hooks — backward compatible
     _registry = None
-    if hooks is not None and not hooks.is_empty():
+    if hooks is not None and hooks.has_configured_hooks():
         _registry = hooks.create_registry()
         # Also register graph-level hooks from AgentFlowModel if present
         if graph.hooks is not None:
@@ -395,6 +400,7 @@ async def execute_graph(
         run_id=run_id,
         parent_run_id=parent_run_id,
         hooks=_registry,
+        runtime_config=hooks if hooks is not None and hooks.has_auto_wired_hooks() else None,
         debug_callback=debug_callback,
     ):
         yield result
@@ -433,7 +439,7 @@ async def execute_graph_loop(
     """
     # Phase 8.3: Create hook registry from runtime config
     _registry = None
-    if hooks is not None and not hooks.is_empty():
+    if hooks is not None and hooks.has_configured_hooks():
         _registry = hooks.create_registry()
         if graph.hooks is not None:
             _registry.register_graph(graph.hooks)
@@ -452,6 +458,7 @@ async def execute_graph_loop(
         run_id=run_id,
         parent_run_id=parent_run_id,
         hooks=_registry,
+        runtime_config=hooks if hooks is not None and hooks.has_auto_wired_hooks() else None,
         debug_callback=debug_callback,
     ):
         yield result
@@ -574,6 +581,7 @@ def validate_graph(nodes: list[dict], edges: list[dict]) -> dict:
 
     # Task 3.11: EdgeHookConfig validation — hook_node_id must reference a valid node ID
     hook_node_ids = {n.get('id') for n in hook_nodes}
+    enabled_edges_by_hook_node: dict[str, list[str]] = {}
     for edge in edges:
         edge_hooks = edge.get('hooks') or {}
         if isinstance(edge_hooks, dict):
@@ -589,6 +597,55 @@ def validate_graph(nodes: list[dict], edges: list[dict]) -> dict:
                         "valid_node_ids": list(node_ids),
                     }
                 })
+            elif hook_node_ref and hook_node_ref not in hook_node_ids:
+                edge_id = edge.get('id', 'unknown')
+                referenced_node = next(
+                    (node for node in nodes if node.get('id') == hook_node_ref),
+                    {},
+                )
+                errors.append({
+                    "error_type": "HookValidationError",
+                    "error_message": (
+                        f"Edge '{edge_id}' hook_node_id '{hook_node_ref}' must "
+                        "reference a node with type 'hook'."
+                    ),
+                    "context": {
+                        "edge_id": edge_id,
+                        "hook_node_id": hook_node_ref,
+                        "referenced_node_type": referenced_node.get('type'),
+                        "valid_hook_node_ids": sorted(hook_node_ids),
+                    }
+                })
+
+            # Bind each NodeHook to one enabled edge so its scheduling dependency
+            # and delivered context are unambiguous. The bound edge may still
+            # traverse repeatedly in a loop graph. Disabled references do not
+            # participate in this rule.
+            if (
+                hook_node_ref in hook_node_ids
+                and edge_hooks.get('enabled', True) is not False
+            ):
+                edge_id = edge.get('id', 'unknown')
+                enabled_edges_by_hook_node.setdefault(hook_node_ref, []).append(edge_id)
+
+    for hook_node_id, edge_ids in enabled_edges_by_hook_node.items():
+        if len(edge_ids) <= 1:
+            continue
+
+        errors.append({
+            "error_type": "HookValidationError",
+            "error_message": (
+                f"Hook node '{hook_node_id}' is referenced by multiple enabled edges "
+                f"({', '.join(edge_ids)}). A NodeHook may be referenced by at most "
+                "one enabled edge."
+            ),
+            "context": {
+                "hook_node_id": hook_node_id,
+                "edge_ids": edge_ids,
+                "enabled_edge_count": len(edge_ids),
+                "max_enabled_edges": 1,
+            }
+        })
     
     return {
         "valid": len(errors) == 0,

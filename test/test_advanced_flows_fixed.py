@@ -1,32 +1,51 @@
-import json
-import os
-import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
 import pytest
-import asyncio
 
 from magic_agents import run_agent
 from magic_agents.agt_flow import build
 
-# Load API keys from environment or configured file path
-_api_keys_file = os.environ.get("MAGIC_AGENTS_API_KEY_FILE", "")
-_api_keys_env = os.environ.get("OPENAI_API_KEY", "")
-_api_keys_serper = os.environ.get("SERPER_API_KEY", "")
 
-if _api_keys_file and os.path.exists(_api_keys_file):
-    var_env = json.load(open(_api_keys_file))
-elif _api_keys_env:
-    var_env = {"openai_key": _api_keys_env, "serper_key": _api_keys_serper}
-else:
-    var_env = {}
+async def _collect_events(graph):
+    events = []
+    async for event in run_agent(graph=graph):
+        events.append(event)
+    return events
 
-# All tests in this module need API keys
-pytestmark = pytest.mark.skipif(
-    'openai_key' not in var_env,
-    reason="OpenAI API key required (set OPENAI_API_KEY or MAGIC_AGENTS_API_KEY_FILE)"
-)
+
+def _stream_text(events):
+    chunks = []
+    for event in events:
+        content = event.get("content") if isinstance(event, dict) else None
+        choices = getattr(content, "choices", None)
+        if not choices:
+            continue
+        text = getattr(getattr(choices[0], "delta", None), "content", None)
+        if text:
+            chunks.append(text)
+    return "".join(chunks)
+
+
+def _debug_errors(events):
+    return [
+        event["content"]
+        for event in events
+        if isinstance(event, dict)
+        and event.get("type") == "debug"
+        and isinstance(event.get("content"), dict)
+        and (event["content"].get("error_type") or event["content"].get("error"))
+    ]
+
+
+def _payload_extras(events):
+    payloads = []
+    for event in events:
+        content = event.get("content") if isinstance(event, dict) else None
+        extras = getattr(content, "extras", None)
+        if not isinstance(extras, dict):
+            continue
+        payload = {key: value for key, value in extras.items() if key != "meta"}
+        if payload:
+            payloads.append(payload)
+    return payloads
 
 
 class TestAdvancedFlowsFixed:
@@ -34,10 +53,10 @@ class TestAdvancedFlowsFixed:
     
     def setup_method(self):
         """Setup method to initialize common test data."""
-        self.load_chat = lambda **kwargs: print(f"Chat loaded: {kwargs}")
-        self.api_keys = var_env
+        self.load_chat = lambda **kwargs: None
     
     @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
     async def test_send_message_with_extras(self):
         """Test SendMessage node with extras functionality - properly yields ChatCompletionModel."""
         agt = {
@@ -62,8 +81,8 @@ class TestAdvancedFlowsFixed:
                     "id": "send-to-end",
                     "source": "send-msg",
                     "target": "end-node",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle-5"
+                    "sourceHandle": "handle_message_output",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -93,24 +112,23 @@ class TestAdvancedFlowsFixed:
         }
         
         graph = build(agt_data=agt, message='Hello with metadata', load_chat=self.load_chat)
-        response = ""
-        extras_found = False
-        
-        async for i in run_agent(graph=graph):
-            # run_agent yields dictionaries with 'content' key
-            if isinstance(i, dict) and 'content' in i:
-                content = i['content']
-                if hasattr(content, 'choices') and content.choices and content.choices[0].delta.content:
-                    response += content.choices[0].delta.content
-                if hasattr(content, 'extras') and content.extras:
-                    extras_found = True
-                    print(f"\nExtras found: {content.extras}")
-        
-        print(f"\nSendMessage Test Response: {response}")
-        assert "Processing message with metadata" in response
-        assert extras_found or len(response) > 0  # Either extras or content should be present
+        assert not graph._validation_errors
+
+        events = await _collect_events(graph)
+
+        assert not _debug_errors(events)
+        assert _stream_text(events) == "Processing message with metadata"
+        assert {
+            "metadata": {
+                "source": "user",
+                "timestamp": "2024-01-01",
+                "message": "Hello with metadata",
+            }
+        } in _payload_extras(events)
+        assert graph.nodes["end-node"].response is not None
     
     @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
     async def test_deeply_nested_inner_flows_fixed(self):
         """Test deeply nested inner flows with proper content generation using SendMessage nodes."""
         # Level 3 - innermost flow with SendMessage
@@ -136,8 +154,8 @@ class TestAdvancedFlowsFixed:
                     "id": "l3-send-to-end",
                     "source": "l3-send",
                     "target": "l3-end",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle-5"
+                    "sourceHandle": "handle_message_output",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -196,8 +214,8 @@ class TestAdvancedFlowsFixed:
                     "id": "l2-send-to-end",
                     "source": "l2-send",
                     "target": "l2-end",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle-5"
+                    "sourceHandle": "handle_message_output",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -263,8 +281,8 @@ class TestAdvancedFlowsFixed:
                     "id": "send-to-end",
                     "source": "final-send",
                     "target": "end-node",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle-5"
+                    "sourceHandle": "handle_message_output",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -301,18 +319,25 @@ class TestAdvancedFlowsFixed:
         }
         
         graph = build(agt_data=agt, message='nested test', load_chat=self.load_chat)
-        response = ""
-        async for i in run_agent(graph=graph):
-            if isinstance(i, dict) and 'content' in i:
-                content = i['content']
-                if hasattr(content, 'choices') and content.choices and content.choices[0].delta.content:
-                    response += content.choices[0].delta.content
-        
-        print(f"\nDeeply Nested Response: {response}")
-        # With SendMessage nodes, we should see the processed messages
-        assert "processed" in response
+        assert not graph._validation_errors
+
+        events = await _collect_events(graph)
+
+        assert not _debug_errors(events)
+        assert _stream_text(events) == "L3 processedL2 processedL1 processed"
+        completed_subgraphs = {
+            event["content"].get("node_id")
+            for event in events
+            if event.get("type") == "debug"
+            and isinstance(event.get("content"), dict)
+            and event["content"].get("event_type") == "SUBGRAPH_END"
+            and event["content"].get("status") == "completed"
+        }
+        assert {"l2-inner", "inner-node"}.issubset(completed_subgraphs)
+        assert graph.nodes["end-node"].response is not None
     
     @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
     async def test_parser_to_sendmessage_flow(self):
         """Test using SendMessage to display parser output."""
         agt = {
@@ -337,8 +362,8 @@ class TestAdvancedFlowsFixed:
                     "id": "send-to-end",
                     "source": "send-node",
                     "target": "end-node",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle-5"
+                    "sourceHandle": "handle_message_output",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -372,44 +397,38 @@ Reversed: {{ handle_parser_input | reverse }}"""
         }
         
         graph = build(agt_data=agt, message='hello world', load_chat=self.load_chat)
-        response = ""
-        extras_content = ""
-        
-        async for i in run_agent(graph=graph):
-            if isinstance(i, dict) and 'content' in i:
-                content = i['content']
-                # Node class is in extras.meta.node_class
-                extras = content.extras if hasattr(content, 'extras') else {}
-                meta = extras.get('meta', {}) if isinstance(extras, dict) else {}
-                node_name = meta.get('node_class', 'Unknown')
-                if hasattr(content, 'choices') and content.choices and content.choices[0].delta.content:
-                    response += content.choices[0].delta.content
-                # Capture non-meta extras (actual output data, not just metadata)
-                if hasattr(content, 'extras') and content.extras:
-                    if isinstance(content.extras, dict) and 'text' in content.extras:
-                        extras_content = str(content.extras)
-        
-        print(f"\nParser to SendMessage Response: {response}")
-        print(f"Extras: {extras_content}")
-        
-        assert "Transformation result:" in response
-        # The parser output should be in extras['text'] field
-        assert "'text': 'Transform complete:" in extras_content or "HELLO WORLD" in extras_content
+        assert not graph._validation_errors
+
+        events = await _collect_events(graph)
+
+        assert not _debug_errors(events)
+        assert _stream_text(events) == "Transformation result:"
+        assert {
+            "text": (
+                "Transform complete:\n"
+                "Original: hello world\n"
+                "Uppercase: HELLO WORLD\n"
+                "Length: 11\n"
+                "Reversed: dlrow olleh"
+            )
+        } in _payload_extras(events)
+        assert graph.nodes["end-node"].response is not None
     
     @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
     async def test_loop_with_sendmessage_aggregation(self):
         """Test loop results displayed via SendMessage."""
         agt = {
             "type": "chat",
             "debug": True,
             "edges": [
-                # User input (required by graph validation; not used by this test)
+                # Feed the static list node from the graph's required user input.
                 {
-                    "id": "ui-to-void",
+                    "id": "ui-to-items",
                     "source": "user-input",
-                    "target": "end-node",
+                    "target": "items-text",
                     "sourceHandle": "handle_user_message",
-                    "targetHandle": "handle-5"
+                    "targetHandle": "handle_flow_input"
                 },
                 {
                     "id": "items-to-loop",
@@ -450,8 +469,8 @@ Reversed: {{ handle_parser_input | reverse }}"""
                     "id": "send-to-end",
                     "source": "send-results",
                     "target": "end-node",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle-5"
+                    "sourceHandle": "handle_message_output",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -504,29 +523,19 @@ Total items: {{ handle_parser_input | length }}
         }
         
         graph = build(agt_data=agt, message='', load_chat=self.load_chat)
-        response = ""
-        extras_content = ""
-        
-        async for i in run_agent(graph=graph):
-            if isinstance(i, dict) and 'content' in i:
-                content = i['content']
-                # Node class is in extras.meta.node_class
-                extras = content.extras if hasattr(content, 'extras') else {}
-                meta = extras.get('meta', {}) if isinstance(extras, dict) else {}
-                node_name = meta.get('node_class', 'Unknown')
-                if hasattr(content, 'choices') and content.choices and content.choices[0].delta.content:
-                    response += content.choices[0].delta.content
-                # Capture non-meta extras (actual output data, not just metadata)
-                if hasattr(content, 'extras') and content.extras:
-                    if isinstance(content.extras, dict) and 'text' in content.extras:
-                        extras_content = str(content.extras)
-        
-        print(f"\nLoop with SendMessage Response: {response}")
-        print(f"Extras: {extras_content}")
-        
-        assert "Processing Complete!" in response
-        # Look for the loop results in extras - might be in 'text' field
-        assert "'text': 'Loop Results:" in extras_content or "Total items: 3" in extras_content
+        assert not graph._validation_errors
+
+        events = await _collect_events(graph)
+
+        assert not _debug_errors(events)
+        assert _stream_text(events) == "Processing Complete!"
+        payloads = _payload_extras(events)
+        loop_results = next(payload["text"] for payload in payloads if "text" in payload)
+        assert "Total items: 3" in loop_results
+        assert "Processed APPLE" in loop_results
+        assert "Processed BANANA" in loop_results
+        assert "Processed CHERRY" in loop_results
+        assert graph.nodes["end-node"].response is not None
 
 
 def run_fixed_advanced_tests():
@@ -560,4 +569,4 @@ def run_fixed_advanced_tests():
 
 
 if __name__ == "__main__":
-    run_fixed_advanced_tests() 
+    run_fixed_advanced_tests()

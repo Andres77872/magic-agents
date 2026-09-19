@@ -22,7 +22,8 @@ Emit a user-facing `ChatCompletionModel` payload, optionally with extras.
 
 - emits twice: first on `content` for immediate user stream, then on `handle_message_output` for graph routing
 - `handle_send_extra` accepts JSON string or dict; parsed automatically in process()
-- uses `json_extras` or alias `extras` for static extras configuration
+- uses `message` (or alias `content`) as the user-facing text
+- when `message` is empty, uses `json_extras` (or alias `extras`) as a compatibility fallback for older graphs
 - is one of the few nodes that intentionally emits on the system streaming event type `content`
 
 ## Example
@@ -31,6 +32,6 @@ Emit a user-facing `ChatCompletionModel` payload, optionally with extras.
 {
   "id": "send",
   "type": "send_message",
-  "data": {"json_extras": ""}
+  "data": {"message": "Finished"}
 }
 ```

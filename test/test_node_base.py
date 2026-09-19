@@ -8,7 +8,6 @@ Tests cover:
 - yield_static output format
 - Error handling in __call__
 """
-import asyncio
 import pytest
 
 from magic_agents.node_system.Node import Node
@@ -116,57 +115,49 @@ class TestNodeYieldStatic:
 class TestNodeCall:
     """Test __call__ async execution."""
 
-    def test_node_call_yields_results(self):
+    @pytest.mark.asyncio
+    async def test_node_call_yields_results(self):
         """__call__ yields process results."""
         node = ConcreteNode(node_id="test")
         chat_log = ModelAgentRunLog()
 
-        async def _test():
-            results = []
-            async for item in node(chat_log):
-                results.append(item)
-            # Node yields at least the "end" content event
-            # (telemetry may add additional debug events)
-            end_events = [r for r in results if r.get("type") == "end"]
-            assert len(end_events) >= 1
-            assert end_events[0]["content"]["content"] == "result"
+        results = []
+        async for item in node(chat_log):
+            results.append(item)
 
-        asyncio.get_event_loop().run_until_complete(_test())
+        end_events = [r for r in results if r.get("type") == "end"]
+        assert len(end_events) >= 1
+        assert end_events[0]["content"]["content"] == "result"
 
-    def test_node_call_yields_precomputed_response(self):
+    @pytest.mark.asyncio
+    async def test_node_call_yields_precomputed_response(self):
         """If _response is set, yields immediately without calling process."""
         node = ConcreteNode(node_id="test")
         node._response = "precomputed"
         chat_log = ModelAgentRunLog()
 
-        async def _test():
-            results = []
-            async for item in node(chat_log):
-                results.append(item)
-            assert len(results) == 1
-            assert results[0]["type"] == "end"
-            assert results[0]["content"]["content"] == "precomputed"
+        results = []
+        async for item in node(chat_log):
+            results.append(item)
 
-        asyncio.get_event_loop().run_until_complete(_test())
+        assert len(results) == 1
+        assert results[0]["type"] == "end"
+        assert results[0]["content"]["content"] == "precomputed"
 
-    def test_node_call_handles_exception(self):
-        """Exception in process yields debug error, doesn't propagate."""
+    @pytest.mark.asyncio
+    async def test_node_call_propagates_exception_after_partial_yields(self):
+        """Exception in process propagates so the executor can handle cascade state."""
         node = ConcreteErrorNode(node_id="test", debug=True)
         chat_log = ModelAgentRunLog()
+        results = []
 
-        async def _test():
-            results = []
+        with pytest.raises(ValueError, match="test error"):
             async for item in node(chat_log):
                 results.append(item)
-            # Should get at least the pre-error yield and a debug error event
-            assert len(results) >= 1
-            debug_events = [r for r in results if r.get("type") == "debug"]
-            assert len(debug_events) >= 1
-            # Debug event content has error_type at the content level
-            content = debug_events[0].get("content", {})
-            assert "error" in content or "error_type" in content
 
-        asyncio.get_event_loop().run_until_complete(_test())
+        end_events = [r for r in results if r.get("type") == "end"]
+        assert len(end_events) == 1
+        assert end_events[0]["content"]["content"] == "before_error"
 
 
 class TestNodePrep:

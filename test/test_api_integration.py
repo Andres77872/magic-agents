@@ -17,7 +17,7 @@ import pytest
 from magic_agents import run_agent
 from magic_agents.agt_flow import build
 
-from conftest import skip_if_no_api_keys, _is_placeholder_value
+from test_support import _is_placeholder_value, skip_if_no_api_keys
 
 
 def extract_streamed_content(item):

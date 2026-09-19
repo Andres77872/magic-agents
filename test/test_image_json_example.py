@@ -14,7 +14,7 @@ import asyncio
 
 from magic_agents.agt_flow import build, run_agent
 from magic_agents.execution.event_dispatcher import GraphEventDispatcher
-from conftest import skip_if_no_api_keys
+from test_support import skip_if_no_api_keys
 
 
 @pytest.fixture

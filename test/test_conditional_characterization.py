@@ -12,23 +12,20 @@ Slices covered:
 - 0e: GraphEventDispatcher.propagate_conditional_bypass()
 """
 
-import asyncio
 import pytest
-from typing import Any, Dict, List, Optional
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock
 
 from magic_agents.execution.reactive_executor import (
     execute_graph_reactive,
     execute_graph_loop_reactive,
 )
 from magic_agents.execution.event_dispatcher import GraphEventDispatcher, NodeState
-from magic_agents.execution.input_tracker import NodeInputTracker, InputInfo
 from magic_agents.models.factory.AgentFlowModel import AgentFlowModel
 from magic_agents.models.factory.EdgeNodeModel import EdgeNodeModel
 from magic_agents.node_system.Node import Node
 from magic_agents.node_system.NodeConditional import NodeConditional
 from magic_agents.models.factory.Nodes.ConditionalNodeModel import ConditionalSignalTypes
-from magic_agents.util.const import SYSTEM_EVENT_DEBUG, SYSTEM_EVENT_STREAMING
+from magic_agents.util.const import SYSTEM_EVENT_DEBUG
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -41,23 +38,15 @@ async def _collect_all(async_gen):
     return results
 
 
-def _make_mock_graph(nodes_dict: dict, edges_list: list, debug: bool = True) -> AgentFlowModel:
-    """Build a minimal mock AgentFlowModel for testing."""
-    graph = MagicMock(spec=AgentFlowModel)
-    graph.nodes = nodes_dict
-    graph.edges = edges_list
-    graph.debug = debug
-    graph.resolved_debug_config = None
+def _make_graph(nodes_dict: dict, edges_list: list, debug: bool = True) -> AgentFlowModel:
+    """Build the minimal real graph model required by the executors."""
+    graph = AgentFlowModel(
+        type="graph",
+        nodes=nodes_dict,
+        edges=edges_list,
+        debug=debug,
+    )
     graph._validation_errors = []
-    graph.type = "graph"
-    graph.app_id = None
-    graph.id_app = None
-    return graph
-
-
-def _make_mock_loop_graph(nodes_dict: dict, edges_list: list, debug: bool = True) -> AgentFlowModel:
-    """Build a mock AgentFlowModel for loop executor testing."""
-    graph = _make_mock_graph(nodes_dict, edges_list, debug)
     return graph
 
 
@@ -93,24 +82,15 @@ class _BypassAllNode(Node):
         }
 
 
-def _make_minimal_node(node_class, node_id: str, **kwargs):
-    """Create a minimal node instance with all required Node attributes."""
-    node = node_class.__new__(node_class)
-    node.node_id = node_id
-    node.outputs = {}
-    node.inputs = {}
-    node._response = None
-    node.node_type = kwargs.get('node_type', node_class.__name__.replace('Node', '').lower())
-    node.debug = False
-    node.cost = 0.0
-    node.extra_params = {'node_type': node.node_type}
-    node._debug_info = None
-    node._execution_start = None
-    node._execution_end = None
-    node.generated = ""
-    for key, value in kwargs.items():
-        setattr(node, key, value)
-    return node
+def _make_iteration_node(node_id: str) -> _CollectingNode:
+    """Create a deterministic loop-body node with the canonical parser output."""
+    return _CollectingNode(
+        node_id=node_id,
+        node_type="parser",
+        output_value=node_id,
+        output_handle="handle_parser_output",
+        debug=False,
+    )
 
 
 # ============================================================================
@@ -148,7 +128,7 @@ class TestExecutorNonLoopConditionalBypass:
             EdgeNodeModel(id="e4", source="node_a", target="end", sourceHandle="output", targetHandle="h1"),
         ]
 
-        graph = _make_mock_graph(nodes, edges, debug=False)
+        graph = _make_graph(nodes, edges, debug=False)
         results = await _collect_all(execute_graph_reactive(graph))
 
         # Conditional should have executed and set selected_handle
@@ -192,7 +172,7 @@ class TestExecutorNonLoopConditionalBypass:
             EdgeNodeModel(id="e3", source="node_a", target="end", sourceHandle="output", targetHandle="h1"),
         ]
 
-        graph = _make_mock_graph(nodes, edges, debug=False)
+        graph = _make_graph(nodes, edges, debug=False)
         results = await _collect_all(execute_graph_reactive(graph))
 
         # The fallback should work — node_a should execute
@@ -232,7 +212,7 @@ class TestExecutorNonLoopConditionalBypass:
             EdgeNodeModel(id="e2", source="input", target="end", sourceHandle="output", targetHandle="h1"),
         ]
 
-        graph = _make_mock_graph(nodes, edges, debug=False)
+        graph = _make_graph(nodes, edges, debug=False)
         results = await _collect_all(execute_graph_reactive(graph))
 
         # Conditional should have executed
@@ -267,7 +247,7 @@ class TestExecutorNonLoopConditionalBypass:
             EdgeNodeModel(id="e3", source="input", target="end", sourceHandle="output", targetHandle="h1"),
         ]
 
-        graph = _make_mock_graph(nodes, edges, debug=False)
+        graph = _make_graph(nodes, edges, debug=False)
         results = await _collect_all(execute_graph_reactive(graph))
 
         # Should have debug error event
@@ -307,9 +287,8 @@ class TestNodeConditionalProcessErrorPaths:
         )
         cond.inputs = {"handle_input": '{"other_key": "value"}'}
 
-        chat_log = MagicMock()
         results = []
-        async for item in cond(chat_log):
+        async for item in cond(None):
             results.append(item)
 
         # Jinja2 default Undefined renders to '', triggering EmptyHandleError path
@@ -444,9 +423,8 @@ class TestNodeConditionalProcessErrorPaths:
         )
         cond.inputs = {"handle_input": '{"value": true}'}
 
-        chat_log = MagicMock()
         results = []
-        async for item in cond(chat_log):
+        async for item in cond(None):
             results.append(item)
 
         # Should emit the selected handle event
@@ -597,7 +575,7 @@ class TestExecutorLoopConditionalStaticPhase:
         in node.outputs. The conditional receives input via add_parent which extracts
         content from the wrapped output.
         """
-        from magic_agents.node_system import NodeLoop, NodeText, NodeEND
+        from magic_agents.node_system import NodeLoop, NodeEND
 
         loop_node = NodeLoop(node_id="loop", debug=False)
         loop_node.inputs[loop_node.INPUT_HANDLE_LIST] = '["item1"]'
@@ -619,7 +597,7 @@ class TestExecutorLoopConditionalStaticPhase:
             EdgeNodeModel(id="e1", source="loop", target="end", sourceHandle="handle_end", targetHandle="h1"),
         ]
 
-        graph = _make_mock_loop_graph(nodes, edges, debug=False)
+        graph = _make_graph(nodes, edges, debug=False)
         results = await _collect_all(execute_graph_loop_reactive(graph))
 
         # Since cond has no inputs, it's skipped in static phase (line 805-817)
@@ -635,7 +613,7 @@ class TestExecutorLoopConditionalStaticPhase:
         When a conditional's only input comes from the loop's handle_item,
         it should be skipped in the static phase and executed during iteration.
         """
-        from magic_agents.node_system import NodeLoop, NodeText, NodeParser, NodeEND
+        from magic_agents.node_system import NodeLoop, NodeEND
 
         loop_node = NodeLoop(node_id="loop", debug=False)
         loop_node.inputs[loop_node.INPUT_HANDLE_LIST] = '["item1"]'
@@ -647,8 +625,8 @@ class TestExecutorLoopConditionalStaticPhase:
             condition="{{ 'handle_yes' }}",
         )
 
-        # Parser node in iteration subgraph
-        parser_node = _make_minimal_node(NodeParser, "parser", parser_type="identity")
+        # Deterministic node in the iteration subgraph
+        parser_node = _make_iteration_node("parser")
 
         end_node = NodeEND(node_id="end", debug=False)
 
@@ -661,7 +639,7 @@ class TestExecutorLoopConditionalStaticPhase:
             EdgeNodeModel(id="e4", source="loop", target="end", sourceHandle="handle_end", targetHandle="h1"),
         ]
 
-        graph = _make_mock_loop_graph(nodes, edges, debug=False)
+        graph = _make_graph(nodes, edges, debug=False)
         results = await _collect_all(execute_graph_loop_reactive(graph))
 
         # Conditional should have been executed during iteration (not static phase)
@@ -693,7 +671,7 @@ class TestExecutorLoopConditionalIterationPhase:
         This test verifies the CURRENT behavior: nodes that come after the conditional
         in execution order are properly bypassed.
         """
-        from magic_agents.node_system import NodeLoop, NodeParser, NodeEND
+        from magic_agents.node_system import NodeLoop, NodeEND
 
         loop_node = NodeLoop(node_id="loop", debug=False)
         loop_node.inputs[loop_node.INPUT_HANDLE_LIST] = '["item1"]'
@@ -705,24 +683,9 @@ class TestExecutorLoopConditionalIterationPhase:
             condition="{{ 'handle_yes' }}",
         )
 
-        # Parser nodes on both branches
-        parser_yes = _make_minimal_node(NodeParser, "parser_yes", parser_type="identity")
-        parser_yes.execute_count = 0
-        original_process_yes = parser_yes.process
-        async def counting_process_yes(chat_log):
-            parser_yes.execute_count += 1
-            async for item in original_process_yes(chat_log):
-                yield item
-        parser_yes.process = counting_process_yes
-
-        parser_no = _make_minimal_node(NodeParser, "parser_no", parser_type="identity")
-        parser_no.execute_count = 0
-        original_process_no = parser_no.process
-        async def counting_process_no(chat_log):
-            parser_no.execute_count += 1
-            async for item in original_process_no(chat_log):
-                yield item
-        parser_no.process = counting_process_no
+        # Deterministic nodes on both branches
+        parser_yes = _make_iteration_node("parser_yes")
+        parser_no = _make_iteration_node("parser_no")
 
         end_node = NodeEND(node_id="end", debug=False)
 
@@ -740,7 +703,7 @@ class TestExecutorLoopConditionalIterationPhase:
             EdgeNodeModel(id="e5", source="loop", target="end", sourceHandle="handle_end", targetHandle="h1"),
         ]
 
-        graph = _make_mock_loop_graph(nodes, edges, debug=False)
+        graph = _make_graph(nodes, edges, debug=False)
         results = await _collect_all(execute_graph_loop_reactive(graph))
 
         # Conditional should have executed
@@ -769,7 +732,7 @@ class TestExecutorLoopConditionalIterationPhase:
         comes after parser_no in topological order. If parser_no executes before cond,
         downstream_no will also execute. If cond executes first, both are bypassed.
         """
-        from magic_agents.node_system import NodeLoop, NodeParser, NodeEND
+        from magic_agents.node_system import NodeLoop, NodeEND
 
         loop_node = NodeLoop(node_id="loop", debug=False)
         loop_node.inputs[loop_node.INPUT_HANDLE_LIST] = '["item1"]'
@@ -780,33 +743,11 @@ class TestExecutorLoopConditionalIterationPhase:
             condition="{{ 'handle_yes' }}",
         )
 
-        parser_yes = _make_minimal_node(NodeParser, "parser_yes", parser_type="identity")
-        parser_yes.execute_count = 0
-        original_process_yes = parser_yes.process
-        async def counting_process_yes(chat_log):
-            parser_yes.execute_count += 1
-            async for item in original_process_yes(chat_log):
-                yield item
-        parser_yes.process = counting_process_yes
-
-        parser_no = _make_minimal_node(NodeParser, "parser_no", parser_type="identity")
-        parser_no.execute_count = 0
-        original_process_no = parser_no.process
-        async def counting_process_no(chat_log):
-            parser_no.execute_count += 1
-            async for item in original_process_no(chat_log):
-                yield item
-        parser_no.process = counting_process_no
+        parser_yes = _make_iteration_node("parser_yes")
+        parser_no = _make_iteration_node("parser_no")
 
         # Downstream of non-selected branch
-        downstream_no = _make_minimal_node(NodeParser, "downstream_no", parser_type="identity")
-        downstream_no.execute_count = 0
-        original_process_ds = downstream_no.process
-        async def counting_process_ds(chat_log):
-            downstream_no.execute_count += 1
-            async for item in original_process_ds(chat_log):
-                yield item
-        downstream_no.process = counting_process_ds
+        downstream_no = _make_iteration_node("downstream_no")
 
         end_node = NodeEND(node_id="end", debug=False)
 
@@ -824,7 +765,7 @@ class TestExecutorLoopConditionalIterationPhase:
             EdgeNodeModel(id="e6", source="loop", target="end", sourceHandle="handle_end", targetHandle="h1"),
         ]
 
-        graph = _make_mock_loop_graph(nodes, edges, debug=False)
+        graph = _make_graph(nodes, edges, debug=False)
         results = await _collect_all(execute_graph_loop_reactive(graph))
 
         # parser_yes should execute (selected path, feedback to loop)

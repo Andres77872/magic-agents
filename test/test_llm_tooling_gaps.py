@@ -298,6 +298,7 @@ class TestToolParametersSchema:
         mock_data.json_data = None
         mock_data.tool_mode = True
         mock_data.tool_name = "search"
+        mock_data.tool_description = "Search the product catalog"
         mock_data.tool_parameters = {
             "query": {"type": "string", "description": "Search query"},
         }
@@ -305,6 +306,7 @@ class TestToolParametersSchema:
 
         node = NodeFetch(data=mock_data, node_id="fetch-1")
         assert node.tool_parameters == {"query": {"type": "string", "description": "Search query"}}
+        assert node.tool_description == "Search the product catalog"
 
 
 # ─── Gap 3: handle-tool-calls output handle ─────────────────────────────────

@@ -344,7 +344,7 @@ async def execute_graph_reactive(
         # Only block on structural graph errors that make execution impossible.
         # Conditional routing errors (MissingConditionalEdge, etc.) are handled
         # at runtime via bypass propagation and should NOT block execution.
-        blocking_types = {'GraphValidationError'}
+        blocking_types = {'GraphValidationError', 'HookValidationError'}
         blocking_errors = [
             e for e in graph._validation_errors
             if e.get('error_type') in blocking_types
@@ -493,6 +493,54 @@ async def execute_graph_reactive(
     
     # Output queue for collecting results from parallel tasks
     output_queue: asyncio.Queue = asyncio.Queue()
+
+    def _bypassed_node_ids() -> set[str]:
+        """Snapshot nodes already marked bypassed by the dispatcher."""
+        return {
+            node_id
+            for node_id in nodes
+            if dispatcher.get_state(node_id) == NodeState.BYPASSED
+        }
+
+    async def _notify_conditional_bypasses(previously_bypassed: set[str]) -> None:
+        """Emit observer/hook notifications for newly bypassed static nodes.
+
+        Conditional propagation marks dispatcher state before waiting node tasks
+        resume. Those tasks intentionally return early when they see BYPASSED,
+        so the selecting node owns the single lifecycle notification.
+        """
+        newly_bypassed = _bypassed_node_ids() - previously_bypassed
+        for bypassed_id in sorted(newly_bypassed):
+            bypassed_node = nodes[bypassed_id]
+            node_type = getattr(bypassed_node, 'node_type', 'unknown') or 'unknown'
+            node_class = type(bypassed_node).__name__
+
+            if observer_registry.is_active:
+                bypass_observer = observer_registry.observer_for(
+                    bypassed_id, bypassed_node
+                )
+                await bypass_observer.on_node_bypass(
+                    node_id=bypassed_id,
+                    node_type=node_type,
+                    node_class=node_class,
+                    reason="condition",
+                )
+
+            if hooks is not None and not hooks.is_empty():
+                from magic_agents.hooks.context_factory import HookContextFactory
+
+                bypass_context = HookContextFactory.build_bypass_context(
+                    execution_id=_execution_id,
+                    run_id=run_id or '',
+                    node_id=bypassed_id,
+                    node_type=node_type,
+                    node_class=node_class,
+                    reason="condition",
+                    metadata={"bypass_path": "conditional", "phase": "static"},
+                )
+                await hooks.invoke(
+                    "on_node_bypass", bypass_context, reason="condition"
+                )
     
     async def execute_single_node(node_id: str):
         """Execute a single node when ready."""
@@ -510,7 +558,7 @@ async def execute_graph_reactive(
             
             if not should_execute:
                 # GUARD: If error cascade already bypassed this node via
-                # _propagate_error_bypass_with_hooks, the dispatcher state
+                # _propagate_error_bypass, the dispatcher state
                 # is already BYPASSED and the hook was already fired with
                 # reason="upstream_error". Skip redundant not_ready hook.
                 if dispatcher.get_state(node_id) == NodeState.BYPASSED:
@@ -600,7 +648,9 @@ async def execute_graph_reactive(
             
             # Handle BYPASS_ALL from any node (conditional or non-conditional)
             if bypass_all_signaled:
+                previously_bypassed = _bypassed_node_ids()
                 await dispatcher.handle_bypass_all_signal(node_id)
+                await _notify_conditional_bypasses(previously_bypassed)
             # Handle conditional bypass propagation (skip if BYPASS_ALL was already handled)
             elif isinstance(node, ConditionalRouting):
                 selected_handle = conditional_selected_handle or getattr(node, 'selected_handle', None)
@@ -632,9 +682,13 @@ async def execute_graph_reactive(
                                 "suggestion": "Ensure the condition template evaluates to a handle name that has a corresponding outgoing edge."
                             }
                         ))
+                        previously_bypassed = _bypassed_node_ids()
                         await dispatcher.handle_bypass_all_signal(node_id)
+                        await _notify_conditional_bypasses(previously_bypassed)
                     else:
+                        previously_bypassed = _bypassed_node_ids()
                         await dispatcher.propagate_conditional_bypass(node_id, selected_handle)
+                        await _notify_conditional_bypasses(previously_bypassed)
         
         except asyncio.TimeoutError:
             dispatcher.set_state(node_id, NodeState.ERROR)
@@ -649,9 +703,7 @@ async def execute_graph_reactive(
                     "timestamp": datetime.now(UTC).isoformat()
                 }
             })
-            # Phase 4: Propagate error bypass to downstream nodes
-            if hooks is not None and not hooks.is_empty():
-                await _propagate_error_bypass_with_hooks(node_id)
+            await _propagate_error_bypass(node_id)
         
         except Exception as e:
             dispatcher.set_state(node_id, NodeState.ERROR)
@@ -666,21 +718,23 @@ async def execute_graph_reactive(
                     "timestamp": datetime.now(UTC).isoformat()
                 }
             })
-            # Phase 4: Propagate error bypass to downstream nodes
-            if hooks is not None and not hooks.is_empty():
-                await _propagate_error_bypass_with_hooks(node_id)
+            await _propagate_error_bypass(node_id)
     
-    async def _propagate_error_bypass_with_hooks(failed_node_id: str):
-        """Propagate error bypass to downstream nodes and invoke on_node_bypass hooks.
+    async def _propagate_error_bypass(failed_node_id: str):
+        """Always bypass downstream nodes; notify lifecycle hooks when present.
         
-        Phase 4: Marks downstream nodes as BYPASSED and fires on_node_bypass
-        hooks for each bypassed node with reason="upstream_error".
+        Routing correctness cannot depend on whether a FlowHooks registry was
+        supplied. Declarative edge hooks also rely on this cascade to release
+        their virtual input dependency when the source edge cannot traverse.
         
         Args:
             failed_node_id: The node that encountered an error.
         """
-        from magic_agents.hooks.context_factory import HookContextFactory
         bypassed_nids = await dispatcher.propagate_error_bypass(failed_node_id)
+        if hooks is None or hooks.is_empty():
+            return
+
+        from magic_agents.hooks.context_factory import HookContextFactory
         for bid in bypassed_nids:
             bnode = nodes.get(bid)
             bypass_ctx = HookContextFactory.build_bypass_context(
@@ -803,6 +857,7 @@ async def execute_graph_loop_reactive(
     run_id: Optional[str] = None,         # Phase 0: execution tree identity
     parent_run_id: Optional[str] = None,   # Phase 0: parent run identity
     hooks: Optional[HookRegistry] = None,  # Phase 4: hook registry for graph/node hooks
+    runtime_config: Optional[RuntimeConfig] = None,  # Direct-loop persistence/SSE auto-wiring
     debug_callback=None,                   # Phase 1: optional async callback for debug events
 ) -> AsyncGenerator[ChatCompletionModel, None]:
     """
@@ -831,7 +886,7 @@ async def execute_graph_loop_reactive(
         # Only block on structural graph errors that make execution impossible.
         # Conditional routing errors (MissingConditionalEdge, etc.) are handled
         # at runtime via bypass propagation and should NOT block execution.
-        blocking_types = {'GraphValidationError'}
+        blocking_types = {'GraphValidationError', 'HookValidationError'}
         blocking_errors = [
             e for e in graph._validation_errors
             if e.get('error_type') in blocking_types
@@ -860,6 +915,23 @@ async def execute_graph_loop_reactive(
     
     # Generate execution ID for hooks traceability
     _execution_id = uuid.uuid4().hex
+
+    # ``execute_graph_reactive`` wires before delegating and intentionally does
+    # not pass runtime_config here.  The public direct-loop wrapper does pass it,
+    # so this branch provides identical auto-wiring without duplicate hooks.
+    if hooks is not None and runtime_config is not None:
+        _wire_hooks_to_registry(
+            registry=hooks,
+            runtime_config=runtime_config,
+            graph=graph,
+            id_chat=str(id_chat) if id_chat is not None else '',
+            id_thread=str(id_thread) if id_thread is not None else '',
+            id_user=str(id_user) if id_user is not None else '',
+        )
+
+    if hooks is not None:
+        hooks.execution_id = _execution_id
+        hooks.run_id = run_id or ''
 
     logger.info(
         "Starting reactive loop execution: nodes=%d edges=%d",
@@ -932,11 +1004,13 @@ async def execute_graph_loop_reactive(
     loop_back_edges = [e for e in all_edges if e.target == loop_id and e.targetHandle == loop_node.INPUT_HANDLE_LOOP]
     end_edges = [e for e in all_edges if e.source == loop_id and e.sourceHandle == loop_node.OUTPUT_HANDLE_END]
     static_edges = [e for e in all_edges if e not in item_edges + loop_back_edges + end_edges]
+    iteration_subgraph = find_iteration_subgraph(loop_id, nodes, all_edges)
     
     logger.debug(
         "Loop edges: static=%d item=%d loop_back=%d end=%d",
         len(static_edges), len(item_edges), len(loop_back_edges), len(end_edges)
     )
+    logger.debug("Iteration subgraph nodes: %s", iteration_subgraph)
     
     # Create dispatcher for the full graph with graph-level timeout
     dispatcher = GraphEventDispatcher(
@@ -945,9 +1019,187 @@ async def execute_graph_loop_reactive(
         execution_id=_execution_id,
         run_id=run_id or '',
     )
-    
+
+    failed_node_ids: Set[str] = set()
+
+    def mark_completed(node_id: str) -> None:
+        """Record a unique graph node as successfully executed."""
+        if node_id not in failed_node_ids:
+            dispatcher.set_state(node_id, NodeState.COMPLETED)
+
+    def mark_bypassed(node_id: str) -> None:
+        """Record a bypass unless the node executed or failed in another iteration."""
+        if (
+            node_id not in failed_node_ids
+            and dispatcher.get_state(node_id) != NodeState.COMPLETED
+        ):
+            dispatcher.set_state(node_id, NodeState.BYPASSED)
+
+    def mark_failed(node_id: str) -> None:
+        failed_node_ids.add(node_id)
+        dispatcher.set_state(node_id, NodeState.ERROR)
+
+    # ``NodeLoop`` is an executor-owned orchestration node: invoking its
+    # ``process`` method would iterate independently of the graph phases below.
+    # Mirror ``Node.__call__`` lifecycle delivery around that orchestration so
+    # hooks, persistence, and observers still see the loop as one graph node.
+    _loop_hook_context = None
+    _loop_observer = (
+        observer_registry.observer_for(loop_id, loop_node)
+        if observer_registry.is_active
+        else None
+    )
+    _loop_started_at: Optional[datetime] = None
+    _loop_lifecycle_finished = False
+
+    async def start_loop_lifecycle() -> None:
+        nonlocal _loop_hook_context, _loop_started_at
+        if _loop_started_at is not None:
+            return
+
+        _loop_started_at = datetime.now(UTC)
+        safe_inputs = loop_node._safe_copy_dict(loop_node.inputs)
+
+        if hooks is not None and not hooks.is_empty():
+            from magic_agents.hooks.context_factory import HookContextFactory
+            _loop_hook_context = HookContextFactory.build_node_context(
+                execution_id=_execution_id,
+                run_id=run_id or '',
+                node_id=loop_id,
+                node_type=getattr(loop_node, 'node_type', 'unknown') or 'unknown',
+                node_class=type(loop_node).__name__,
+                inputs=safe_inputs,
+                start_time=_loop_started_at,
+                parent_run_id=parent_run_id,
+            )
+            await hooks.invoke("on_node_start", _loop_hook_context)
+
+        if _loop_observer is not None:
+            await _loop_observer.on_node_start(
+                node_id=loop_id,
+                node_type=getattr(loop_node, 'node_type', 'unknown') or 'unknown',
+                node_class=type(loop_node).__name__,
+                inputs=safe_inputs,
+            )
+
+    async def end_loop_lifecycle() -> None:
+        nonlocal _loop_lifecycle_finished
+        if _loop_lifecycle_finished:
+            return
+        await start_loop_lifecycle()
+
+        ended_at = datetime.now(UTC)
+        duration_ms = (ended_at - _loop_started_at).total_seconds() * 1000
+        safe_outputs = loop_node._safe_copy_dict(loop_node.outputs)
+
+        if _loop_observer is not None:
+            await _loop_observer.on_node_end(
+                node_id=loop_id,
+                node_type=getattr(loop_node, 'node_type', 'unknown') or 'unknown',
+                node_class=type(loop_node).__name__,
+                outputs=safe_outputs,
+                internal_state=loop_node._capture_internal_state(),
+                duration_ms=duration_ms,
+                start_time=_loop_started_at.isoformat(),
+            )
+
+        if _loop_hook_context is not None:
+            _loop_hook_context.timestamp = ended_at
+            _loop_hook_context.end_time = ended_at
+            _loop_hook_context.duration_ms = duration_ms
+            _loop_hook_context.outputs = safe_outputs
+            await hooks.invoke("on_node_end", _loop_hook_context)
+
+        _loop_lifecycle_finished = True
+
+    async def error_loop_lifecycle(error: Exception) -> None:
+        nonlocal _loop_lifecycle_finished
+        if _loop_lifecycle_finished:
+            return
+        await start_loop_lifecycle()
+
+        ended_at = datetime.now(UTC)
+        duration_ms = (ended_at - _loop_started_at).total_seconds() * 1000
+        safe_inputs = loop_node._safe_copy_dict(loop_node.inputs)
+        safe_outputs = loop_node._safe_copy_dict(loop_node.outputs)
+
+        if _loop_observer is not None:
+            await _loop_observer.on_node_error(
+                node_id=loop_id,
+                node_type=getattr(loop_node, 'node_type', 'unknown') or 'unknown',
+                node_class=type(loop_node).__name__,
+                error=str(error),
+                error_type=type(error).__name__,
+                inputs=safe_inputs,
+                outputs=safe_outputs,
+                duration_ms=duration_ms,
+                start_time=_loop_started_at.isoformat(),
+            )
+
+        if _loop_hook_context is not None:
+            _loop_hook_context.timestamp = ended_at
+            _loop_hook_context.end_time = ended_at
+            _loop_hook_context.duration_ms = duration_ms
+            _loop_hook_context.error = error
+            _loop_hook_context.error_type = type(error).__name__
+            _loop_hook_context.error_message = str(error)
+            await hooks.invoke("on_node_error", _loop_hook_context, error=error)
+
+        _loop_lifecycle_finished = True
+
+    async def execute_traversed_edge_hooks(
+        source_node_id: str,
+        outputs: Dict[str, Any],
+        candidate_edges: List,
+        ignored_edge_ids: Optional[Set[str]] = None,
+    ):
+        """Execute NodeHook once for each active edge traversal.
+
+        Loop graphs are scheduled phase-by-phase instead of through tracker
+        tasks.  Edge hooks therefore run inline immediately after their source
+        output becomes available.  Resetting the hook node supports repeated
+        traversals of the same edge across loop iterations.
+        """
+
+        ignored_edge_ids = ignored_edge_ids or set()
+        for edge in candidate_edges:
+            if (
+                edge.id in ignored_edge_ids
+                or edge.source != source_node_id
+                or edge.sourceHandle not in outputs
+            ):
+                continue
+
+            output = outputs[edge.sourceHandle]
+            content = (
+                output["content"]
+                if isinstance(output, dict) and "content" in output
+                else output
+            )
+            hook_node_id = await dispatcher.dispatch_edge_hook(
+                edge,
+                source_node_id,
+                content,
+                notify_tracker=False,
+            )
+            if hook_node_id is None:
+                continue
+
+            hook_node = nodes[hook_node_id]
+            hook_node._response = None
+            hook_node.outputs.clear()
+            async for hook_output in execute_node_inline(
+                hook_node_id,
+                edges_to_process=[],
+            ):
+                yield hook_output
+
     # Helper to execute a single node inline
-    async def execute_node_inline(node_id: str, edges_to_process: List = None):
+    async def execute_node_inline(
+        node_id: str,
+        edges_to_process: List = None,
+        ignored_edge_ids: Optional[Set[str]] = None,
+    ):
         """Execute a node and propagate outputs.
         
         Args:
@@ -961,7 +1213,10 @@ async def execute_graph_loop_reactive(
         edges_for_inputs = edges_to_process if edges_to_process is not None else all_edges
         
         # First apply inputs from edges
+        ignored_edge_ids = ignored_edge_ids or set()
         for edge in edges_for_inputs:
+            if edge.id in ignored_edge_ids:
+                continue
             if edge.target == node_id:
                 source_node = nodes.get(edge.source)
                 if source_node and source_node.outputs:
@@ -971,72 +1226,211 @@ async def execute_graph_loop_reactive(
         if node._response is None:
             logger.debug("Executing loop node %s", node_id)
             _node_obs = observer_registry.observer_for(node_id, node) if observer_registry.is_active else None
-            async for item in node(chat_log, hooks=hooks, observer=_node_obs):
-                item_type = item.get("type", "")
-                
-                # Check if this is streaming content
-                is_streaming = False
-                if hasattr(node, 'OUTPUT_HANDLE_CONTENT'):
-                    is_streaming = item_type == node.OUTPUT_HANDLE_CONTENT
-                elif item_type == SYSTEM_EVENT_STREAMING:
-                    is_streaming = True
-                
-                if is_streaming:
-                    yield {
-                        "type": SYSTEM_EVENT_STREAMING,
-                        "content": item["content"]["content"]
-                    }
-                elif item_type == SYSTEM_EVENT_DEBUG:
-                    yield item
-                else:
-                    # All other outputs stored using their handle name
-                    node.outputs[item_type] = item["content"]
+            if node_id not in failed_node_ids:
+                dispatcher.set_state(node_id, NodeState.EXECUTING)
+            try:
+                async for item in node(chat_log, hooks=hooks, observer=_node_obs):
+                    item_type = item.get("type", "")
+
+                    # Check if this is streaming content
+                    is_streaming = False
+                    if hasattr(node, 'OUTPUT_HANDLE_CONTENT'):
+                        is_streaming = item_type == node.OUTPUT_HANDLE_CONTENT
+                    elif item_type == SYSTEM_EVENT_STREAMING:
+                        is_streaming = True
+
+                    if is_streaming:
+                        yield {
+                            "type": SYSTEM_EVENT_STREAMING,
+                            "content": item["content"]["content"]
+                        }
+                    elif item_type == SYSTEM_EVENT_DEBUG:
+                        yield item
+                    elif ConditionalSignalTypes.is_system_signal(item_type):
+                        logger.debug("Loop node %s emitted system signal: %s", node_id, item_type)
+                    else:
+                        # All other outputs stored using their handle name
+                        node.outputs[item_type] = item["content"]
+            except Exception as exc:
+                mark_failed(node_id)
+                logger.error("Loop node %s failed: %s", node_id, exc)
+                yield {
+                    "type": SYSTEM_EVENT_DEBUG,
+                    "content": {
+                        "node_id": node_id,
+                        "node_type": getattr(node, "node_type", "unknown") or "unknown",
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                        "timestamp": datetime.now(UTC).isoformat(),
+                    },
+                }
+            else:
+                mark_completed(node_id)
+
+                async for hook_output in execute_traversed_edge_hooks(
+                    node_id,
+                    node.outputs,
+                    edges_for_inputs,
+                    ignored_edge_ids,
+                ):
+                    yield hook_output
 
     # Track bypassed nodes during static phase
     bypassed_nodes: Set[str] = set()
+    bypassed_edge_ids: Set[str] = set()
     
     # Pending observer bypass notifications for static phase
     # Collected during sync propagate_bypass_static, flushed asynchronously
     _pending_static_bypasses: List[Tuple[str, str, str, str, str]] = []
     
-    def propagate_bypass_static(node_id: str):
-        """Recursively mark nodes as bypassed in static phase.
-        
-        Calls node.mark_bypassed() for internal node state AND collects
-        observer bypass notifications into _pending_static_bypasses for
-        async drain after the static phase completes.
-        """
-        if node_id in bypassed_nodes:
-            return
-        bypassed_nodes.add(node_id)
+    # Feedback edges do not participate in deciding whether the loop received
+    # its initial list. All other phase boundaries are included so convergence
+    # with an active static/item/end path is preserved.
+    static_bypass_edges = [e for e in all_edges if e not in loop_back_edges]
+
+    def _record_phase_bypass(
+        node_id: str,
+        phase_bypassed_nodes: Set[str],
+        pending: List[Tuple[str, str, str, str, str]],
+    ) -> bool:
+        """Record one phase-local node bypass and its lifecycle notification."""
+        if node_id in phase_bypassed_nodes:
+            return False
+        phase_bypassed_nodes.add(node_id)
+        mark_bypassed(node_id)
         node = nodes.get(node_id)
         if node and hasattr(node, 'mark_bypassed'):
             node.mark_bypassed()
-            # Collect observer notification for async drain
-            _pending_static_bypasses.append((
+            pending.append((
                 node_id,
                 getattr(node, 'node_type', 'unknown') or 'unknown',
                 type(node).__name__,
                 _execution_id,
                 run_id or '',
             ))
-        logger.debug("Static phase: bypassing node %s", node_id)
-        # Propagate to all downstream nodes in static edges
-        for edge in static_edges:
+        return True
+
+    def _propagate_edge_bypass(
+        edge,
+        *,
+        phase_edges: List,
+        phase_bypassed_edges: Set[str],
+        phase_bypassed_nodes: Set[str],
+        pending: List[Tuple[str, str, str, str, str]],
+        allowed_nodes: Optional[Set[str]] = None,
+    ) -> None:
+        """Account for one inactive edge and bypass only fully inactive targets."""
+        if edge.id in phase_bypassed_edges:
+            return
+        phase_bypassed_edges.add(edge.id)
+
+        if edge.hooks and edge.hooks.enabled and edge.hooks.hook_node_id:
+            hook_node_id = edge.hooks.hook_node_id
+            if hook_node_id in nodes:
+                _record_phase_bypass(
+                    hook_node_id,
+                    phase_bypassed_nodes,
+                    pending,
+                )
+
+        target_id = edge.target
+        if target_id not in nodes:
+            return
+        if allowed_nodes is not None and target_id not in allowed_nodes:
+            return
+
+        incoming = [candidate for candidate in phase_edges if candidate.target == target_id]
+        if incoming and any(candidate.id not in phase_bypassed_edges for candidate in incoming):
+            logger.debug(
+                "Preserving converged node %s: at least one incoming edge remains active",
+                target_id,
+            )
+            return
+
+        if not _record_phase_bypass(target_id, phase_bypassed_nodes, pending):
+            return
+
+        logger.debug("Bypassing node %s after all incoming edges were bypassed", target_id)
+        for outgoing in phase_edges:
+            if outgoing.source == target_id:
+                _propagate_edge_bypass(
+                    outgoing,
+                    phase_edges=phase_edges,
+                    phase_bypassed_edges=phase_bypassed_edges,
+                    phase_bypassed_nodes=phase_bypassed_nodes,
+                    pending=pending,
+                    allowed_nodes=allowed_nodes,
+                )
+
+    def propagate_bypass_static(node_id: str) -> None:
+        """Force a phase root to bypass, then account for downstream edges."""
+        if not _record_phase_bypass(node_id, bypassed_nodes, _pending_static_bypasses):
+            return
+        for edge in static_bypass_edges:
             if edge.source == node_id:
-                propagate_bypass_static(edge.target)
+                _propagate_edge_bypass(
+                    edge,
+                    phase_edges=static_bypass_edges,
+                    phase_bypassed_edges=bypassed_edge_ids,
+                    phase_bypassed_nodes=bypassed_nodes,
+                    pending=_pending_static_bypasses,
+                )
     
     def handle_conditional_bypass_static(cond_node_id: str, selected_handle: str):
         """Handle conditional bypass in static phase."""
-        outgoing = [e for e in static_edges if e.source == cond_node_id]
+        outgoing = [e for e in static_bypass_edges if e.source == cond_node_id]
         for edge in outgoing:
             if edge.sourceHandle != selected_handle:
-                # This path is not selected - bypass it
-                propagate_bypass_static(edge.target)
+                _propagate_edge_bypass(
+                    edge,
+                    phase_edges=static_bypass_edges,
+                    phase_bypassed_edges=bypassed_edge_ids,
+                    phase_bypassed_nodes=bypassed_nodes,
+                    pending=_pending_static_bypasses,
+                )
                 logger.debug(
                     "Static conditional bypass: %s.%s -> %s (not selected)",
                     cond_node_id, edge.sourceHandle, edge.target
                 )
+
+    async def flush_static_bypass_notifications(
+        observer_reason: str,
+        phase: str,
+        hook_reason: str = "condition",
+    ) -> None:
+        """Deliver and clear bypass notifications accumulated by sync traversal."""
+        if not _pending_static_bypasses:
+            return
+
+        if hooks is not None and not hooks.is_empty():
+            from magic_agents.hooks.context_factory import HookContextFactory
+            for _nid, _ntype, _nclass, _eid, _rid in _pending_static_bypasses:
+                _bypass_ctx = HookContextFactory.build_bypass_context(
+                    execution_id=_eid,
+                    run_id=_rid,
+                    node_id=_nid,
+                    node_type=_ntype,
+                    node_class=_nclass,
+                    reason=hook_reason,
+                    metadata={"phase": phase},
+                )
+                await hooks.invoke(
+                    "on_node_bypass",
+                    _bypass_ctx,
+                    reason=hook_reason,
+                )
+
+        if observer_registry.is_active:
+            _bypass_observer = observer_registry.graph_observer
+            for _nid, _ntype, _nclass, _eid, _rid in _pending_static_bypasses:
+                await _bypass_observer.on_node_bypass(
+                    node_id=_nid,
+                    node_type=_ntype,
+                    node_class=_nclass,
+                    reason=observer_reason,
+                )
+
+        _pending_static_bypasses.clear()
     
     # Build topological order for static nodes
     def topological_sort_static() -> List[str]:
@@ -1066,6 +1460,10 @@ async def execute_graph_loop_reactive(
         static_nodes.discard(loop_id)
         # Remove post-loop nodes - they will be executed after the loop
         static_nodes -= post_loop_nodes
+        # Branches reached from handle_item belong exclusively to iteration.
+        # Internal conditional edges are otherwise classified as static edges,
+        # which used to execute both branches once before the loop started.
+        static_nodes -= iteration_subgraph
         
         # Build in-degree map
         in_degree = {n: 0 for n in static_nodes}
@@ -1107,6 +1505,8 @@ async def execute_graph_loop_reactive(
 
         # Apply inputs from completed static nodes
         for edge in static_edges:
+            if edge.id in bypassed_edge_ids:
+                continue
             if edge.target == node_id:
                 source_node = nodes.get(edge.source)
                 target_node = nodes.get(node_id)
@@ -1134,8 +1534,24 @@ async def execute_graph_loop_reactive(
                 continue
 
         # Execute the node
-        async for out in execute_node_inline(node_id, static_edges):
+        async for out in execute_node_inline(
+            node_id,
+            static_edges,
+            ignored_edge_ids=bypassed_edge_ids,
+        ):
             yield out
+
+        if dispatcher.get_state(node_id) == NodeState.ERROR:
+            for edge in static_bypass_edges:
+                if edge.source == node_id:
+                    _propagate_edge_bypass(
+                        edge,
+                        phase_edges=static_bypass_edges,
+                        phase_bypassed_edges=bypassed_edge_ids,
+                        phase_bypassed_nodes=bypassed_nodes,
+                        pending=_pending_static_bypasses,
+                    )
+            continue
         
         # Handle conditional bypass propagation
         node = nodes.get(node_id)
@@ -1145,35 +1561,13 @@ async def execute_graph_loop_reactive(
                 handle_conditional_bypass_static(node_id, selected_handle)
                 logger.debug("Conditional %s selected handle: %s", node_id, selected_handle)
     
-    # HOOK: on_node_bypass for static phase conditional bypasses (Phase 4) — reason="condition"
-    if hooks is not None and not hooks.is_empty() and _pending_static_bypasses:
-        from magic_agents.hooks.context_factory import HookContextFactory
-        for _nid, _ntype, _nclass, _eid, _rid in _pending_static_bypasses:
-            _bypass_ctx = HookContextFactory.build_bypass_context(
-                execution_id=_eid,
-                run_id=_rid,
-                node_id=_nid,
-                node_type=_ntype,
-                node_class=_nclass,
-                reason="condition",
-                metadata={"phase": "static"},
-            )
-            await hooks.invoke("on_node_bypass", _bypass_ctx, reason="condition")
-    
-    # Flush pending static bypass observer notifications
-    if observer_registry.is_active and _pending_static_bypasses:
-        _bypass_observer = observer_registry.graph_observer
-        for _nid, _ntype, _nclass, _eid, _rid in _pending_static_bypasses:
-            await _bypass_observer.on_node_bypass(
-                node_id=_nid,
-                node_type=_ntype,
-                node_class=_nclass,
-                reason="static_conditional_bypass",
-            )
-        _pending_static_bypasses.clear()
+    # Deliver static-phase bypass notifications before loop input resolution.
+    await flush_static_bypass_notifications("static_conditional_bypass", "static")
     
     # Transfer final outputs to loop node
     for edge in static_edges:
+        if edge.id in bypassed_edge_ids:
+            continue
         if edge.target == loop_id:
             source_node = nodes.get(edge.source)
             if source_node and source_node.outputs and edge.sourceHandle in source_node.outputs:
@@ -1192,37 +1586,30 @@ async def execute_graph_loop_reactive(
     # Track if loop is bypassed
     loop_bypassed = False
     
-    # Find complete iteration subgraph using BFS (needed for bypass marking)
-    iteration_subgraph = find_iteration_subgraph(loop_id, nodes, all_edges)
-    logger.debug("Iteration subgraph nodes: %s", iteration_subgraph)
-    
     # Handle case where loop input was bypassed
     if raw is None:
-        # Check if the source of loop input was bypassed
-        loop_input_source = None
-        for edge in static_edges:
-            if edge.target == loop_id and edge.targetHandle == loop_node.INPUT_HANDLE_LIST:
-                loop_input_source = edge.source
-                break
-        
-        if loop_input_source and loop_input_source in bypassed_nodes:
+        list_input_edges = [
+            edge for edge in static_edges
+            if edge.target == loop_id
+            and edge.targetHandle == loop_node.INPUT_HANDLE_LIST
+        ]
+        list_path_bypassed = bool(list_input_edges) and all(
+            edge.id in bypassed_edge_ids for edge in list_input_edges
+        )
+
+        if loop_id in bypassed_nodes or list_path_bypassed:
             logger.info("Loop input source was bypassed - skipping loop execution")
-            # The loop path was bypassed by a conditional - skip to end
             loop_bypassed = True
-            bypassed_nodes.add(loop_id)
-            loop_node.mark_bypassed()
-            # Mark all iteration subgraph nodes as bypassed
-            for nid in iteration_subgraph:
-                bypassed_nodes.add(nid)
-                if nid in nodes and hasattr(nodes[nid], 'mark_bypassed'):
-                    nodes[nid].mark_bypassed()
-            # Mark all post-loop nodes that depend on loop output as bypassed
-            for edge in end_edges:
-                propagate_bypass_static(edge.target)
+            propagate_bypass_static(loop_id)
+            # These bypasses are discovered after the initial static-phase
+            # flush, so they need their own delivery before graph finalization.
+            await flush_static_bypass_notifications("loop_input_bypassed", "loop_bypass")
         else:
             # No input and not bypassed - this is an error
             error_msg = f"Loop node '{loop_id}' did not receive input on handle '{loop_node.INPUT_HANDLE_LIST}'"
             logger.error(error_msg)
+            loop_error = ValueError(error_msg)
+            await start_loop_lifecycle()
             yield {
                 "type": SYSTEM_EVENT_DEBUG,
                 "content": {
@@ -1233,10 +1620,23 @@ async def execute_graph_loop_reactive(
                     "timestamp": datetime.now(UTC).isoformat()
                 }
             }
-            return
+            mark_failed(loop_id)
+            await error_loop_lifecycle(loop_error)
+            loop_bypassed = True
+            for edge in item_edges + end_edges:
+                _propagate_edge_bypass(
+                    edge,
+                    phase_edges=static_bypass_edges,
+                    phase_bypassed_edges=bypassed_edge_ids,
+                    phase_bypassed_nodes=bypassed_nodes,
+                    pending=_pending_static_bypasses,
+                )
+            await flush_static_bypass_notifications("loop_input_error", "loop_error")
     elif not isinstance(items, list):
         error_msg = f"Loop node '{loop_id}' expects a list, got {type(items)}"
         logger.error(error_msg)
+        loop_error = ValueError(error_msg)
+        await start_loop_lifecycle()
         yield {
             "type": SYSTEM_EVENT_DEBUG,
             "content": {
@@ -1247,11 +1647,24 @@ async def execute_graph_loop_reactive(
                 "timestamp": datetime.now(UTC).isoformat()
             }
         }
-        return
+        mark_failed(loop_id)
+        await error_loop_lifecycle(loop_error)
+        loop_bypassed = True
+        for edge in item_edges + end_edges:
+            _propagate_edge_bypass(
+                edge,
+                phase_edges=static_bypass_edges,
+                phase_bypassed_edges=bypassed_edge_ids,
+                phase_bypassed_nodes=bypassed_nodes,
+                pending=_pending_static_bypasses,
+            )
+        await flush_static_bypass_notifications("loop_input_error", "loop_error")
     
     # Only execute loop iterations if not bypassed
     if not loop_bypassed:
         logger.info("Loop iterating over %d items", len(items))
+        await start_loop_lifecycle()
+        dispatcher.set_state(loop_id, NodeState.EXECUTING)
         
         # Get topological order for iteration execution
         execution_order = topological_sort_iteration(iteration_subgraph, item_edges, loop_back_edges, all_edges)
@@ -1272,6 +1685,7 @@ async def execute_graph_loop_reactive(
         loop_agg = []
         start_time = time.time()
         total_items = len(items)
+        item_edges_traversed = False
         
         for idx, item in enumerate(items):
             # Check iteration limit
@@ -1321,40 +1735,15 @@ async def execute_graph_loop_reactive(
             # Track bypassed nodes WITHIN this iteration (reset each iteration).
             # When a conditional selects one branch, all other branches and their
             # downstream nodes must be skipped.
-            iteration_bypassed: Set[str] = set()
+            iteration_bypassed: Set[str] = {
+                node_id for node_id in bypassed_nodes if node_id in iteration_subgraph
+            }
+            iteration_bypassed_edges: Set[str] = set(bypassed_edge_ids)
             
             # Pending observer bypass notifications for this iteration.
             # Collected during sync propagate_bypass_iteration, flushed
             # asynchronously at the end of the iteration's node execution phase.
             _pending_iteration_bypasses: List[Tuple[str, str, str, str, str]] = []
-            
-            def propagate_bypass_iteration(from_node_id: str):
-                """Mark downstream nodes as bypassed within the iteration subgraph.
-                
-                Transitively marks all nodes reachable from from_node_id via
-                edges within the iteration subgraph as bypassed.
-                Calls node.mark_bypassed() for internal state AND collects
-                observer notifications for async flush.
-                """
-                if from_node_id in iteration_bypassed:
-                    return
-                iteration_bypassed.add(from_node_id)
-                node = nodes.get(from_node_id)
-                if node and hasattr(node, 'mark_bypassed'):
-                    node.mark_bypassed()
-                    # Collect observer notification for async drain
-                    _pending_iteration_bypasses.append((
-                        from_node_id,
-                        getattr(node, 'node_type', 'unknown') or 'unknown',
-                        type(node).__name__,
-                        _execution_id,
-                        run_id or '',
-                    ))
-                logger.debug("Iteration %d: bypassing node %s", idx, from_node_id)
-                # Propagate to downstream nodes within iteration subgraph
-                for edge in all_edges:
-                    if edge.source == from_node_id and edge.target in iteration_subgraph:
-                        propagate_bypass_iteration(edge.target)
             
             def bypass_non_selected_conditional_branches(cond_node_id: str, selected_handle: str):
                 """After a conditional executes, bypass all non-selected branches."""
@@ -1364,16 +1753,34 @@ async def execute_graph_loop_reactive(
                             "Iteration %d: conditional %s selected '%s', bypassing '%s' -> %s",
                             idx, cond_node_id, selected_handle, edge.sourceHandle, edge.target
                         )
-                        propagate_bypass_iteration(edge.target)
+                        _propagate_edge_bypass(
+                            edge,
+                            phase_edges=all_edges,
+                            phase_bypassed_edges=iteration_bypassed_edges,
+                            phase_bypassed_nodes=iteration_bypassed,
+                            pending=_pending_iteration_bypasses,
+                            allowed_nodes=iteration_subgraph,
+                        )
             
             # Set current item as loop output - PRESERVING TYPE (Issue #4 fix)
             loop_node.outputs[loop_node.OUTPUT_HANDLE_ITEM] = prepare_item_output(item, idx)
+            item_edges_traversed = True
             
             # Process item edges - transfer loop item to first downstream nodes
             for edge in item_edges:
+                if edge.id in iteration_bypassed_edges:
+                    continue
                 target_node = nodes.get(edge.target)
                 if target_node:
                     target_node.add_parent(loop_node.outputs, edge.sourceHandle, edge.targetHandle)
+
+            async for hook_output in execute_traversed_edge_hooks(
+                loop_id,
+                loop_node.outputs,
+                item_edges,
+                iteration_bypassed_edges,
+            ):
+                yield hook_output
             
             # Execute iteration subgraph in TOPOLOGICAL ORDER (Issue #2 fix)
             # This ensures each node completes before its dependents start
@@ -1383,13 +1790,15 @@ async def execute_graph_loop_reactive(
                     continue
                 
                 # Skip nodes bypassed by conditional branch selection in this iteration
-                if node_id in iteration_bypassed:
+                if node_id in iteration_bypassed or node_id in bypassed_nodes:
                     logger.debug("Skipping bypassed iteration node %s", node_id)
                     continue
                 
                 # Apply inputs from any edges where source has completed
                 # Use all_edges to capture conditional branch edges too
                 for edge in all_edges:
+                    if edge.id in iteration_bypassed_edges:
+                        continue
                     if edge.target == node_id:
                         source_node = nodes.get(edge.source)
                         # Source could be loop node or another iteration node
@@ -1402,8 +1811,25 @@ async def execute_graph_loop_reactive(
                             node.add_parent(source_node.outputs, edge.sourceHandle, edge.targetHandle)
                 
                 # Execute the node and WAIT for completion
-                async for out in execute_node_inline(node_id, all_edges):
+                async for out in execute_node_inline(
+                    node_id,
+                    all_edges,
+                    ignored_edge_ids=iteration_bypassed_edges,
+                ):
                     yield out
+
+                if dispatcher.get_state(node_id) == NodeState.ERROR:
+                    for edge in all_edges:
+                        if edge.source == node_id:
+                            _propagate_edge_bypass(
+                                edge,
+                                phase_edges=all_edges,
+                                phase_bypassed_edges=iteration_bypassed_edges,
+                                phase_bypassed_nodes=iteration_bypassed,
+                                pending=_pending_iteration_bypasses,
+                                allowed_nodes=iteration_subgraph,
+                            )
+                    continue
                 
                 # After execution, handle conditional bypass propagation
                 if isinstance(node, ConditionalRouting):
@@ -1420,6 +1846,8 @@ async def execute_graph_loop_reactive(
                 # Also propagate to loop node via loop-back edges (loop is NOT in iteration_subgraph
                 # but needs to receive feedback).
                 for edge in all_edges:
+                    if edge.id in iteration_bypassed_edges:
+                        continue
                     if edge.source == node_id:
                         # Only propagate to nodes in the iteration subgraph or the loop node itself
                         if edge.target not in iteration_subgraph and edge.target != loop_id:
@@ -1478,11 +1906,37 @@ async def execute_graph_loop_reactive(
                     "timestamp": datetime.now(UTC).isoformat(),
                 }
             }
+
+        if not item_edges_traversed:
+            for edge in item_edges:
+                _propagate_edge_bypass(
+                    edge,
+                    phase_edges=all_edges,
+                    phase_bypassed_edges=bypassed_edge_ids,
+                    phase_bypassed_nodes=bypassed_nodes,
+                    pending=_pending_static_bypasses,
+                    allowed_nodes=iteration_subgraph,
+                )
+            await flush_static_bypass_notifications(
+                "loop_no_iterations",
+                "loop_no_iterations",
+                hook_reason="not_ready",
+            )
         
         # Finish loop - set aggregated result
         loop_node._response = None
         loop_node.outputs.clear()
         loop_node.outputs[loop_node.OUTPUT_HANDLE_END] = loop_node.prep(loop_agg)
+        mark_completed(loop_id)
+        await end_loop_lifecycle()
+
+        async for hook_output in execute_traversed_edge_hooks(
+            loop_id,
+            loop_node.outputs,
+            end_edges,
+            bypassed_edge_ids,
+        ):
+            yield hook_output
         
         # Clear response for end nodes so they execute
         for edge in end_edges:
@@ -1564,11 +2018,14 @@ async def execute_graph_loop_reactive(
     
     # Get the execution order for post-loop nodes
     post_loop_order = find_post_loop_nodes()
+    post_loop_node_ids = set(post_loop_order)
     logger.debug("Post-loop execution order: %s", post_loop_order)
     
     # First, transfer loop outputs to direct targets (only if loop wasn't bypassed)
     if not loop_bypassed:
         for edge in end_edges:
+            if edge.id in bypassed_edge_ids:
+                continue
             target_node = nodes.get(edge.target)
             if target_node:
                 target_node.add_parent(loop_node.outputs, edge.sourceHandle, edge.targetHandle)
@@ -1589,15 +2046,49 @@ async def execute_graph_loop_reactive(
         node.outputs.clear()
         
         # Execute the node - execute_node_inline will apply inputs from all_edges
-        async for out in execute_node_inline(node_id):
+        async for out in execute_node_inline(
+            node_id,
+            ignored_edge_ids=bypassed_edge_ids,
+        ):
             yield out
+
+        if dispatcher.get_state(node_id) == NodeState.ERROR:
+            for edge in all_edges:
+                if edge.source == node_id:
+                    _propagate_edge_bypass(
+                        edge,
+                        phase_edges=all_edges,
+                        phase_bypassed_edges=bypassed_edge_ids,
+                        phase_bypassed_nodes=bypassed_nodes,
+                        pending=_pending_static_bypasses,
+                        allowed_nodes=post_loop_node_ids,
+                    )
+            continue
+
+        if isinstance(node, ConditionalRouting):
+            selected_handle = getattr(node, 'selected_handle', None)
+            if selected_handle:
+                for edge in all_edges:
+                    if edge.source == node_id and edge.sourceHandle != selected_handle:
+                        _propagate_edge_bypass(
+                            edge,
+                            phase_edges=all_edges,
+                            phase_bypassed_edges=bypassed_edge_ids,
+                            phase_bypassed_nodes=bypassed_nodes,
+                            pending=_pending_static_bypasses,
+                            allowed_nodes=post_loop_node_ids,
+                        )
         
         # Propagate outputs to downstream nodes within post_loop
         for edge in all_edges:
+            if edge.id in bypassed_edge_ids:
+                continue
             if edge.source == node_id:
                 target = nodes.get(edge.target)
                 if target and node.outputs:
                     target.add_parent(node.outputs, edge.sourceHandle, edge.targetHandle)
+
+    await flush_static_bypass_notifications("post_loop_conditional_bypass", "post_loop")
     
     # === HOOK: on_graph_end / on_graph_error (Phase 4) ===
     # Spec requirement: on_graph_end fires for successful execution only.

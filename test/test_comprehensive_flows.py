@@ -1,15 +1,12 @@
 import json
 import os
-import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import pytest
 import asyncio
 
 from magic_agents import run_agent
 from magic_agents.agt_flow import build
-from conftest import collect_all_from_generator
+from test_support import collect_all_from_generator
 
 # Try to load API keys from environment or configured file path
 _API_KEYS = None
@@ -1363,4 +1360,4 @@ def run_all_tests():
 
 
 if __name__ == "__main__":
-    run_all_tests() 
+    run_all_tests()

@@ -1,5 +1,5 @@
 """
-Unit tests for the centralized env loader in conftest.py.
+Unit tests for the centralized test-support environment loader.
 
 Tests cover:
 - _parse_dotenv() parsing behavior (basic, comments, blanks, quotes, edge cases)
@@ -13,8 +13,8 @@ from pathlib import Path
 
 import pytest
 
-# Import internal helpers from conftest
-from conftest import (
+# Import non-fixture helpers from a normal module, never from conftest.
+from test_support import (
     _parse_dotenv,
     _is_placeholder_value,
     _load_env_test,
@@ -155,46 +155,28 @@ class TestIsPlaceholderValue:
 class TestResolveApiKeys:
     """Tests for the priority-based API key resolution."""
 
-    def test_prefers_real_env_over_dotenv_test(self, monkeypatch, tmp_path):
+    def test_prefers_real_env_over_dotenv_test(self, monkeypatch):
         """Real environment variables take priority over .env.test values."""
-        # Create a .env.test with a different value
-        env_file = tmp_path / ".env.test"
-        env_file.write_text("OPENAI_API_KEY=dotenv-test-value\n")
-
-        # Monkeypatch the project root resolution
-        monkeypatch.setattr(Path, "__new__", lambda cls, *args, **kwargs:
-            tmp_path / ".env.test" if args and str(args[0]).endswith("conftest.py")
-            else object.__new__(cls))
-
-        # Set real env var
+        monkeypatch.setattr(
+            "test_support._load_env_test",
+            lambda: {"OPENAI_API_KEY": "dotenv-test-value"},
+        )
         monkeypatch.setenv("OPENAI_API_KEY", "real-env-key")
         monkeypatch.delenv("SERPER_API_KEY", raising=False)
 
-        # _resolve_api_keys uses its own _load_env_test which finds project root
-        # from __file__. We need to test the priority logic differently.
-        # Since _resolve_api_keys calls _load_env_test which uses Path(__file__),
-        # we can't easily mock the file location. Instead, test the priority
-        # by ensuring real env vars win when they exist.
         result = _resolve_api_keys()
 
-        # Real env var should be present
         assert result.get("openai_key") == "real-env-key"
 
     def test_returns_empty_when_no_env_and_no_dotenv(self, monkeypatch):
         """When no env vars and no .env.test, returns empty dict."""
-        # Clear any real env vars
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("SERPER_API_KEY", raising=False)
+        monkeypatch.setattr("test_support._load_env_test", lambda: {})
 
-        # The actual .env.test file exists at project root with placeholder values
-        # but those ARE placeholder values, so they'll be loaded but detected as placeholders
-        # at the skip level, not at the resolve level.
-        # _resolve_api_keys loads whatever is there (placeholder or not).
         result = _resolve_api_keys()
 
-        # Since .env.test exists with placeholder values, they will be loaded
-        # This test verifies the function doesn't crash and returns a dict
-        assert isinstance(result, dict)
+        assert result == {}
 
     def test_includes_serper_key_when_available(self, monkeypatch):
         """Serper key is included when set in environment."""
@@ -215,6 +197,30 @@ class TestResolveApiKeys:
         assert result.get("openai_key") == "real-openai-key"
         assert result.get("serper_key") == "real-serper-key"
 
+    @pytest.mark.parametrize(
+        ("environment_name", "resolved_name"),
+        [
+            ("OPENAI_API_KEY", "openai_key"),
+            ("SERPER_API_KEY", "serper_key"),
+        ],
+    )
+    def test_explicit_empty_env_suppresses_dotenv_fallback(
+        self,
+        monkeypatch,
+        environment_name,
+        resolved_name,
+    ):
+        """Credential-free empty exports must override developer-local keys."""
+        monkeypatch.setattr(
+            "test_support._load_env_test",
+            lambda: {environment_name: "real-looking-dotenv-secret-1234567890"},
+        )
+        monkeypatch.setenv(environment_name, "")
+
+        result = _resolve_api_keys()
+
+        assert resolved_name not in result
+
 
 # ─── _populate_os_environ_from_dotenv() Tests ──────────────────────────────
 
@@ -225,7 +231,7 @@ class TestPopulateOsEnvironFromDotenv:
         """Keys absent from os.environ are filled in from .env.test."""
         monkeypatch.delenv("TEST_API_KEY", raising=False)
         monkeypatch.delenv("ANOTHER_KEY", raising=False)
-        monkeypatch.setattr("conftest._load_env_test", lambda: {
+        monkeypatch.setattr("test_support._load_env_test", lambda: {
             "TEST_API_KEY": "from-dotenv",
             "ANOTHER_KEY": "also-from-dotenv",
         })
@@ -238,7 +244,7 @@ class TestPopulateOsEnvironFromDotenv:
     def test_shell_env_vars_take_priority(self, monkeypatch):
         """Existing os.environ values are NOT overwritten by .env.test."""
         monkeypatch.setenv("TEST_API_KEY", "from-shell")
-        monkeypatch.setattr("conftest._load_env_test", lambda: {
+        monkeypatch.setattr("test_support._load_env_test", lambda: {
             "TEST_API_KEY": "from-dotenv",
         })
 
@@ -249,7 +255,7 @@ class TestPopulateOsEnvironFromDotenv:
     def test_handles_missing_dotenv_gracefully(self, monkeypatch):
         """Missing .env.test does not raise an error."""
         monkeypatch.delenv("NONEXISTENT_TEST_KEY", raising=False)
-        monkeypatch.setattr("conftest._load_env_test", lambda: {})
+        monkeypatch.setattr("test_support._load_env_test", lambda: {})
 
         # Should not raise
         _populate_os_environ_from_dotenv()

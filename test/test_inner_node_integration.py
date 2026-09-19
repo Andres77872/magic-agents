@@ -1,26 +1,29 @@
 """
-Slice 15 — Inner node integration tests (mocked / no API keys).
+Slice 15 — Inner node integration tests (deterministic / no API keys).
 
 Tests inner node basic execution and nested inner graphs.
 Uses text/send_message nodes inside inner graphs to avoid LLM dependency.
 
 Phase 5 additions:
 - extras propagation from build() → UserInput → NodeInner
-- streaming forwarding (mocked)
+- streaming forwarding through a deterministic child node
 - flow state isolation
 - parent state exposure (default and selective mapping)
 - child completion and output propagation
 """
 import pytest
-from unittest.mock import patch
 
 from magic_agents import run_agent
-from magic_agents.agt_flow import build, execute_graph
+from magic_agents.agt_flow import build
+from magic_agents.debug.events import DebugEventType
+from magic_agents.hooks.hook_registry import HookRegistry
+from magic_agents.models.factory.AgentFlowModel import AgentFlowModel
 from magic_agents.node_system import NodeInner
+from magic_agents.node_system.Node import Node
 from magic_agents.models.model_agent_run_log import ModelAgentRunLog
 from magic_agents.models.factory.Nodes.InnerNodeModel import InnerNodeModel
 from magic_agents.node_system.NodeInner import _get_nested_value
-from magic_llm.model.ModelChatStream import DeltaModel
+from magic_llm.model.ModelChatStream import ChatCompletionModel, ChoiceModel, DeltaModel
 
 
 def extract_streamed_content(item):
@@ -50,6 +53,74 @@ def get_executed_nodes(debug_summary: dict) -> set:
     return executed
 
 
+async def run_with_debug_summary(graph):
+    """Execute a graph and return its stream plus the observer-owned summary."""
+    streamed = []
+    debug_events = []
+
+    async def record_debug_event(event):
+        debug_events.append(event)
+
+    async for item in run_agent(graph, debug_callback=record_debug_event):
+        streamed.append(item)
+
+    summaries = [
+        event.payload
+        for event in debug_events
+        if event.event_type == DebugEventType.GRAPH_END
+    ]
+    assert len(summaries) == 1
+    return streamed, summaries[0]
+
+
+class DeterministicStreamingNode(Node):
+    """Local source node used to exercise the real nested streaming pipeline."""
+
+    OUTPUT_HANDLE_CONTENT = "handle_stream"
+
+    async def process(self, chat_log):
+        for index, text in enumerate(("first ", "second")):
+            chunk = ChatCompletionModel(
+                id=f"chunk-{index}",
+                model="deterministic-test-node",
+                choices=[ChoiceModel(delta=DeltaModel(content=text))],
+            )
+            yield self.yield_static(chunk, content_type="handle_stream")
+
+
+class FlowStateProbeNode(Node):
+    """Records and mutates the child log to prove parent/child state isolation."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.initial_state = None
+        self.mutated_state = None
+
+    async def process(self, chat_log):
+        self.initial_state = dict(chat_log.flow_state)
+        chat_log.flow_state["child_only"] = True
+        self.mutated_state = dict(chat_log.flow_state)
+        yield self.yield_static("done", content_type="probe_output")
+
+
+def inner_node_with_child(child_node):
+    """Create a real NodeInner around a deterministic in-memory child graph."""
+    node = NodeInner(
+        data=InnerNodeModel(magic_flow={"nodes": [], "edges": []}),
+        load_chat=lambda: None,
+        node_id="inner",
+        node_type="inner",
+        debug=True,
+    )
+    node.inner_graph = AgentFlowModel(
+        nodes={child_node.node_id: child_node},
+        edges=[],
+        debug=False,
+    )
+    node.inputs[node.INPUT_HANDLE] = "parent message"
+    return node
+
+
 class TestInnerNodeBasicExecution:
     """Tests for basic inner node execution."""
 
@@ -67,9 +138,9 @@ class TestInnerNodeBasicExecution:
             ],
             "edges": [
                 {"id": "ie1", "source": "inner_input", "target": "inner_text",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
                 {"id": "ie2", "source": "inner_text", "target": "inner_end",
-                 "sourceHandle": "handle_text_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_text_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
@@ -90,7 +161,7 @@ class TestInnerNodeBasicExecution:
                 {"id": "e2", "source": "inner", "target": "send",
                  "sourceHandle": "handle_execution_content", "targetHandle": "handle_send_extra"},
                 {"id": "e3", "source": "send", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
@@ -103,17 +174,17 @@ class TestInnerNodeBasicExecution:
         assert inner_node.inner_graph is not None
         assert len(inner_node.inner_graph.nodes) > 0
 
-        content_output = []
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
-            text = extract_streamed_content(item)
-            if text:
-                content_output.append(text)
+        streamed, debug_summary = await run_with_debug_summary(graph)
+        content_output = [
+            text
+            for item in streamed
+            if (text := extract_streamed_content(item))
+        ]
 
         content_str = "".join(content_output)
         assert "OUTER" in content_str
+        assert graph.nodes["inner"].outputs["handle_execution_content"]["content"] == "INNER_RESULT"
+        assert graph.nodes["send"].inputs == {"handle_send_extra": "INNER_RESULT"}
         executed = get_executed_nodes(debug_summary)
         assert "inner" in executed
         assert "send" in executed
@@ -132,9 +203,9 @@ class TestInnerNodeBasicExecution:
             ],
             "edges": [
                 {"id": "ie1", "source": "innermost_input", "target": "innermost_text",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
                 {"id": "ie2", "source": "innermost_text", "target": "innermost_end",
-                 "sourceHandle": "handle_text_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_text_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
@@ -153,7 +224,7 @@ class TestInnerNodeBasicExecution:
                 {"id": "me1", "source": "middle_input", "target": "middle_inner",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_user_message"},
                 {"id": "me2", "source": "middle_inner", "target": "middle_end",
-                 "sourceHandle": "handle_execution_content", "targetHandle": "h1"},
+                 "sourceHandle": "handle_execution_content", "targetHandle": "handle_flow_input"},
             ],
         }
 
@@ -175,7 +246,7 @@ class TestInnerNodeBasicExecution:
                 {"id": "e2", "source": "outer_inner", "target": "send",
                  "sourceHandle": "handle_execution_content", "targetHandle": "handle_send_extra"},
                 {"id": "e3", "source": "send", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
@@ -193,14 +264,12 @@ class TestInnerNodeBasicExecution:
         assert isinstance(middle_inner, NodeInner)
         assert middle_inner.inner_graph is not None
 
-        content_output = []
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
-            text = extract_streamed_content(item)
-            if text:
-                content_output.append(text)
+        streamed, debug_summary = await run_with_debug_summary(graph)
+        content_output = [
+            text
+            for item in streamed
+            if (text := extract_streamed_content(item))
+        ]
 
         content_str = "".join(content_output)
         assert "NESTED_DONE" in content_str
@@ -225,7 +294,7 @@ class TestInnerNodeBasicExecution:
                 {"id": "e1", "source": "input", "target": "inner",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_user_message"},
                 {"id": "e2", "source": "inner", "target": "end",
-                 "sourceHandle": "handle_execution_content", "targetHandle": "h1"},
+                 "sourceHandle": "handle_execution_content", "targetHandle": "handle_flow_input"},
             ],
         }
 
@@ -260,7 +329,7 @@ class TestInnerNodeBasicExecution:
                 {"id": "e1", "source": "input", "target": "inner",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_user_message"},
                 {"id": "e2", "source": "inner", "target": "end",
-                 "sourceHandle": "handle_execution_content", "targetHandle": "h1"},
+                 "sourceHandle": "handle_execution_content", "targetHandle": "handle_flow_input"},
             ],
         }
 
@@ -303,7 +372,7 @@ class TestInnerGraphWithConditional:
             ],
             "edges": [
                 {"id": "ie0", "source": "inner_input", "target": "inner_text",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
                 {"id": "ie1", "source": "inner_text", "target": "inner_cond",
                  "sourceHandle": "handle_text_output", "targetHandle": "handle_input"},
                 {"id": "ie2", "source": "inner_cond", "target": "parser_hello",
@@ -311,9 +380,9 @@ class TestInnerGraphWithConditional:
                 {"id": "ie3", "source": "inner_cond", "target": "parser_other",
                  "sourceHandle": "other", "targetHandle": "handle_parser_input"},
                 {"id": "ie4", "source": "parser_hello", "target": "inner_end",
-                 "sourceHandle": "handle_parser_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
                 {"id": "ie5", "source": "parser_other", "target": "inner_end",
-                 "sourceHandle": "handle_parser_output", "targetHandle": "h2"},
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
@@ -334,19 +403,17 @@ class TestInnerGraphWithConditional:
                 {"id": "e2", "source": "inner", "target": "send",
                  "sourceHandle": "handle_execution_content", "targetHandle": "handle_send_extra"},
                 {"id": "e3", "source": "send", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="hello")
-        content_output = []
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
-            text = extract_streamed_content(item)
-            if text:
-                content_output.append(text)
+        streamed, debug_summary = await run_with_debug_summary(graph)
+        content_output = [
+            text
+            for item in streamed
+            if (text := extract_streamed_content(item))
+        ]
 
         content_str = "".join(content_output)
         assert "OUTER_DONE" in content_str
@@ -384,6 +451,7 @@ class TestInnerGraphErrorPropagation:
         inner_graph = {
             "type": "graph",
             "debug": True,
+            "timeout": 1,
             "nodes": [
                 {"id": "inner_input", "type": "user_input"},
                 {"id": "bad_parser", "type": "parser", "data": {
@@ -396,7 +464,7 @@ class TestInnerGraphErrorPropagation:
                 {"id": "ie1", "source": "inner_input", "target": "bad_parser",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_parser_input"},
                 {"id": "ie2", "source": "bad_parser", "target": "inner_end",
-                 "sourceHandle": "handle_parser_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
@@ -417,29 +485,20 @@ class TestInnerGraphErrorPropagation:
                 {"id": "e2", "source": "inner", "target": "send",
                  "sourceHandle": "handle_execution_content", "targetHandle": "handle_send_extra"},
                 {"id": "e3", "source": "send", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
 
-        # Patch dispatcher timeout to avoid 60s wait — the inner_end node will timeout
-        # waiting for bad_parser's output (which never arrives due to the exception)
-        from magic_agents.execution.event_dispatcher import GraphEventDispatcher
-        original_init = GraphEventDispatcher.__init__
-
-        def patched_init(self, nodes, edges, timeout=2.0):
-            original_init(self, nodes, edges, timeout=timeout)
-
         debug_items = []
         content_output = []
-        with patch.object(GraphEventDispatcher, '__init__', patched_init):
-            async for item in run_agent(graph):
-                if isinstance(item, dict) and item.get("type") == "debug":
-                    debug_items.append(item)
-                text = extract_streamed_content(item)
-                if text:
-                    content_output.append(text)
+        async for item in run_agent(graph):
+            if isinstance(item, dict) and item.get("type") == "debug":
+                debug_items.append(item)
+            text = extract_streamed_content(item)
+            if text:
+                content_output.append(text)
 
         content_str = "".join(content_output)
         # The outer graph completes (doesn't hang). Since NodeInner emits BYPASS_ALL
@@ -490,9 +549,9 @@ class TestInnerNodeFlowIntegration:
             ],
             "edges": [
                 {"id": "ie1", "source": "inner_input", "target": "inner_text",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
                 {"id": "ie2", "source": "inner_text", "target": "inner_end",
-                 "sourceHandle": "handle_text_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_text_output", "targetHandle": "handle_flow_input"},
             ],
         }
         
@@ -513,7 +572,7 @@ class TestInnerNodeFlowIntegration:
                 {"id": "e3", "source": "inner", "target": "send",
                  "sourceHandle": "handle_execution_content", "targetHandle": "handle_send_extra"},
                 {"id": "e4", "source": "send", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
         
@@ -560,7 +619,7 @@ class TestInnerNodeFlowIntegration:
                 {"id": "e3", "source": "parser", "target": "send",
                  "sourceHandle": "handle_parser_output", "targetHandle": "handle_send_extra"},
                 {"id": "e4", "source": "send", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
         
@@ -602,7 +661,7 @@ class TestInnerNodeFlowIntegration:
                 {"id": "e2", "source": "parser", "target": "send",
                  "sourceHandle": "handle_parser_output", "targetHandle": "handle_send_extra"},
                 {"id": "e3", "source": "send", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
         
@@ -622,202 +681,120 @@ class TestInnerNodeFlowIntegration:
         content_str = "".join(content_output)
         assert "BACKWARD_COMPAT" in content_str
 
-    # ========== Tests 5.4-5.5: Streaming Forwarding (Mocked) ==========
+    # ========== Tests 5.4-5.7: Streaming and Flow State Isolation ==========
 
     @pytest.mark.asyncio
-    async def test_nodeinner_streaming_forwarding_mocked(self):
-        """5.4: Child LLM streaming chunks yield to parent via OUTPUT_HANDLE_CONTENT (mocked)."""
-        # Create a mock streaming ChatCompletionChunkModel
-        def create_streaming_chunk(content: str):
-            delta = DeltaModel(content=content)
-            chunk = ChatCompletionChunkModel(choices=[{"delta": delta, "index": 0, "finish_reason": None}])
-            return chunk
-        
-        inner_graph = {
-            "type": "graph",
-            "debug": False,
-            "nodes": [
-                {"id": "inner_input", "type": "user_input"},
-                {"id": "inner_text", "type": "text", "data": {"text": "STREAM_DONE"}},
-                {"id": "inner_end", "type": "end"},
-            ],
-            "edges": [
-                {"id": "ie1", "source": "inner_input", "target": "inner_text",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
-                {"id": "ie2", "source": "inner_text", "target": "inner_end",
-                 "sourceHandle": "handle_text_output", "targetHandle": "h1"},
-            ],
-        }
-        
-        agt = {
-            "type": "graph",
-            "debug": True,
-            "nodes": [
-                {"id": "input", "type": "user_input"},
-                {"id": "inner", "type": "inner", "data": {"magic_flow": inner_graph}},
-                {"id": "end", "type": "end"},
-            ],
-            "edges": [
-                {"id": "e1", "source": "input", "target": "inner",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_user_message"},
-                {"id": "e2", "source": "inner", "target": "end",
-                 "sourceHandle": "handle_execution_content", "targetHandle": "h1"},
-            ],
-        }
-        
-        graph = build(agt, message="test")
-        inner_node = graph.nodes.get("inner")
-        
-        # Verify OUTPUT_HANDLE_CONTENT constant exists
-        assert hasattr(inner_node, 'OUTPUT_HANDLE_CONTENT')
-        assert inner_node.OUTPUT_HANDLE_CONTENT == 'handle_content_stream'
-        
-        # Execute and verify completion (actual streaming needs real LLM)
-        async for item in run_agent(graph):
-            pass  # Just verify execution completes without error
+    async def test_nodeinner_forwards_child_chunks_before_final_output(self):
+        """Child chunks traverse NodeInner in order before its aggregate output."""
+        child = DeterministicStreamingNode(
+            node_id="stream-source",
+            node_type="stream-source",
+            debug=False,
+        )
+        inner = inner_node_with_child(child)
+
+        events = [event async for event in inner.process(ModelAgentRunLog())]
+        chunks = [
+            event["content"]["content"].choices[0].delta.content
+            for event in events
+            if event["type"] == inner.OUTPUT_HANDLE_CONTENT
+        ]
+        final_index = next(
+            index
+            for index, event in enumerate(events)
+            if event["type"] == inner.HANDLER_EXECUTION_CONTENT
+        )
+        chunk_indexes = [
+            index
+            for index, event in enumerate(events)
+            if event["type"] == inner.OUTPUT_HANDLE_CONTENT
+        ]
+
+        assert chunks == ["first ", "second"]
+        assert max(chunk_indexes) < final_index
+        assert events[final_index]["content"]["content"] == "first second"
+        subgraph_events = [
+            event["content"]
+            for event in events
+            if event["type"] == "debug"
+            and event["content"].get("event_type", "").startswith("SUBGRAPH_")
+        ]
+        assert [event["event_type"] for event in subgraph_events] == [
+            "SUBGRAPH_START",
+            "SUBGRAPH_END",
+        ]
+        assert {event["parent_execution_id"] for event in subgraph_events} == {None}
 
     @pytest.mark.asyncio
-    async def test_nodeinner_streaming_real_time_order_mocked(self):
-        """5.5: Streaming events arrive before final output (mechanism verification)."""
-        # This test verifies the mechanism is in place
-        # Real streaming behavior requires actual LLM integration
-        
-        inner_graph = {
-            "type": "graph",
-            "debug": False,
-            "nodes": [
-                {"id": "inner_input", "type": "user_input"},
-                {"id": "inner_text", "type": "text", "data": {"text": "FINAL_OUTPUT"}},
-                {"id": "inner_end", "type": "end"},
-            ],
-            "edges": [
-                {"id": "ie1", "source": "inner_input", "target": "inner_text",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
-                {"id": "ie2", "source": "inner_text", "target": "inner_end",
-                 "sourceHandle": "handle_text_output", "targetHandle": "h1"},
-            ],
-        }
-        
-        agt = {
-            "type": "graph",
-            "debug": True,
-            "nodes": [
-                {"id": "input", "type": "user_input"},
-                {"id": "inner", "type": "inner", "data": {"magic_flow": inner_graph}},
-                {"id": "end", "type": "end"},
-            ],
-            "edges": [
-                {"id": "e1", "source": "input", "target": "inner",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_user_message"},
-                {"id": "e2", "source": "inner", "target": "end",
-                 "sourceHandle": "handle_execution_content", "targetHandle": "h1"},
-            ],
-        }
-        
-        graph = build(agt, message="test")
-        
-        events_order = []
-        async for item in run_agent(graph):
-            events_order.append(item.get("type"))
-        
-        # Verify execution completes without error
-        assert "content" in events_order
+    async def test_subgraph_debug_uses_parent_execution_and_run_domains(self):
+        """A runtime run ID is never mislabeled as a parent execution span."""
+        child = DeterministicStreamingNode(
+            node_id="stream-source",
+            node_type="stream-source",
+            debug=False,
+        )
+        inner = inner_node_with_child(child)
+        registry = HookRegistry()
+        registry.execution_id = "parent-execution-123"
+        registry.run_id = "parent-run-456"
+        inner._hooks = registry
 
-    # ========== Tests 5.6-5.7: Flow State Isolation ==========
+        events = [
+            event
+            async for event in inner.process(
+                ModelAgentRunLog(run_id="chat-log-run-must-not-be-an-execution")
+            )
+        ]
+        subgraph_events = [
+            event["content"]
+            for event in events
+            if event["type"] == "debug"
+            and event["content"].get("event_type", "").startswith("SUBGRAPH_")
+        ]
+
+        assert [event["event_type"] for event in subgraph_events] == [
+            "SUBGRAPH_START",
+            "SUBGRAPH_END",
+        ]
+        assert {
+            event["parent_execution_id"]
+            for event in subgraph_events
+        } == {"parent-execution-123"}
+        child_graph_start = next(
+            event["content"]
+            for event in events
+            if event["type"] == "debug"
+            and event["content"].get("event_type") == "GRAPH_START"
+        )
+        assert child_graph_start["parent_run_id"] == "parent-run-456"
 
     @pytest.mark.asyncio
-    async def test_flow_state_isolation(self):
-        """5.6: Parent flow_state unchanged after child modifies its own flow_state."""
-        # Use a Python exec node in child to modify flow_state
-        inner_graph = {
-            "type": "graph",
-            "debug": True,
-            "nodes": [
-                {"id": "inner_input", "type": "user_input"},
-                {"id": "inner_modify", "type": "python_exec", "data": {
-                    "code": "def run(handler): return {'ok': True}"
-                }},
-                {"id": "inner_end", "type": "end"},
-            ],
-            "edges": [
-                {"id": "ie1", "source": "inner_input", "target": "inner_modify",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
-                {"id": "ie2", "source": "inner_modify", "target": "inner_end",
-                 "sourceHandle": "handle-python_exec-result", "targetHandle": "h1"},
-            ],
-        }
-        
-        agt = {
-            "type": "graph",
-            "debug": True,
-            "nodes": [
-                {"id": "input", "type": "user_input"},
-                {"id": "inner", "type": "inner", "data": {"magic_flow": inner_graph}},
-                {"id": "end", "type": "end"},
-            ],
-            "edges": [
-                {"id": "e1", "source": "input", "target": "inner",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_user_message"},
-                {"id": "e2", "source": "inner", "target": "end",
-                 "sourceHandle": "handle_execution_content", "targetHandle": "h1"},
-            ],
-        }
-        
-        graph = build(agt, message="test")
-        
-        # Execute with parent flow_state
-        parent_state_before = {"parent_counter": 5}
-        
-        # We can't directly access parent flow_state after execution in this test setup,
-        # but we verify the mechanism: child gets flow_state=None (isolated)
-        inner_node = graph.nodes.get("inner")
-        assert inner_node is not None
-        
-        async for item in run_agent(graph):
-            pass  # Execute without error
+    async def test_child_flow_state_is_empty_and_isolated_from_parent(self):
+        """The child receives a fresh state mapping and cannot mutate the parent."""
+        child = FlowStateProbeNode(
+            node_id="state-probe",
+            node_type="state-probe",
+            debug=False,
+        )
+        inner = inner_node_with_child(child)
+        parent_state = {"parent_counter": 5}
 
-    @pytest.mark.asyncio
-    async def test_flow_state_child_empty(self):
-        """5.7: Child starts with empty flow_state (isolated)."""
-        inner_graph = {
-            "type": "graph",
-            "debug": False,
-            "nodes": [
-                {"id": "inner_input", "type": "user_input"},
-                {"id": "inner_text", "type": "text", "data": {"text": "CHILD_OK"}},
-                {"id": "inner_end", "type": "end"},
-            ],
-            "edges": [
-                {"id": "ie1", "source": "inner_input", "target": "inner_text",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
-                {"id": "ie2", "source": "inner_text", "target": "inner_end",
-                 "sourceHandle": "handle_text_output", "targetHandle": "h1"},
-            ],
-        }
-        
-        agt = {
-            "type": "graph",
-            "debug": True,
-            "nodes": [
-                {"id": "input", "type": "user_input"},
-                {"id": "inner", "type": "inner", "data": {"magic_flow": inner_graph}},
-                {"id": "end", "type": "end"},
-            ],
-            "edges": [
-                {"id": "e1", "source": "input", "target": "inner",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_user_message"},
-                {"id": "e2", "source": "inner", "target": "end",
-                 "sourceHandle": "handle_execution_content", "targetHandle": "h1"},
-            ],
-        }
-        
-        graph = build(agt, message="test")
-        inner_node = graph.nodes.get("inner")
-        
-        # Verify the inner node mechanism: it passes flow_state=None to child
-        # This is enforced by the execute_graph call in NodeInner.process()
-        async for item in run_agent(graph):
-            pass  # Execute without error
+        events = [
+            event
+            async for event in inner.process(
+                ModelAgentRunLog(flow_state=parent_state)
+            )
+        ]
+
+        assert child.initial_state == {}
+        assert child.mutated_state == {"child_only": True}
+        assert parent_state == {"parent_counter": 5}
+        assert any(
+            event["type"] == "debug"
+            and event["content"].get("event_type") == "SUBGRAPH_END"
+            and event["content"]["status"] == "completed"
+            for event in events
+        )
 
     # ========== Tests 5.8-5.11: Parent State Exposure ==========
 
@@ -907,9 +884,9 @@ class TestInnerNodeFlowIntegration:
             ],
             "edges": [
                 {"id": "ie1", "source": "inner_input", "target": "inner_text",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
                 {"id": "ie2", "source": "inner_text", "target": "inner_end",
-                 "sourceHandle": "handle_text_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_text_output", "targetHandle": "handle_flow_input"},
             ],
         }
         
@@ -927,20 +904,16 @@ class TestInnerNodeFlowIntegration:
                 {"id": "e1", "source": "input", "target": "inner",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_user_message"},
                 {"id": "e2", "source": "inner", "target": "after_inner",
-                 "sourceHandle": "handle_execution_content", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_execution_content", "targetHandle": "handle_flow_input"},
                 {"id": "e3", "source": "after_inner", "target": "send",
                  "sourceHandle": "handle_text_output", "targetHandle": "handle_send_extra"},
                 {"id": "e4", "source": "send", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
         
         graph = build(agt, message="test")
-        debug_summary = None
-        
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
+        _, debug_summary = await run_with_debug_summary(graph)
         
         # Verify parent continued after child END
         executed = get_executed_nodes(debug_summary)
@@ -961,9 +934,9 @@ class TestInnerNodeFlowIntegration:
             ],
             "edges": [
                 {"id": "ie1", "source": "inner_input", "target": "inner_text",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
                 {"id": "ie2", "source": "inner_text", "target": "inner_end",
-                 "sourceHandle": "handle_text_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_text_output", "targetHandle": "handle_flow_input"},
             ],
         }
         
@@ -985,7 +958,7 @@ class TestInnerNodeFlowIntegration:
                 {"id": "e3", "source": "parser", "target": "send",
                  "sourceHandle": "handle_parser_output", "targetHandle": "handle_send_extra"},
                 {"id": "e4", "source": "send", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
         
@@ -1000,63 +973,10 @@ class TestInnerNodeFlowIntegration:
         content_str = "".join(content_output)
         # Parser should receive child output and pass to send_message
         assert "OUTPUT_OK" in content_str
-
-    @pytest.mark.asyncio
-    async def test_child_flow_error_propagation(self):
-        """5.14: Child error propagates as debug event to parent."""
-        # This is already covered by TestInnerGraphErrorPropagation.test_inner_graph_error_propagates_as_debug_event
-        # We verify the mechanism here again for completeness
-        inner_graph = {
-            "type": "graph",
-            "debug": True,
-            "nodes": [
-                {"id": "inner_input", "type": "user_input"},
-                {"id": "bad_parser", "type": "parser", "data": {
-                    "text": "{{ undefined_var.some_method() }}"
-                }},
-                {"id": "inner_end", "type": "end"},
-            ],
-            "edges": [
-                {"id": "ie1", "source": "inner_input", "target": "bad_parser",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_parser_input"},
-                {"id": "ie2", "source": "bad_parser", "target": "inner_end",
-                 "sourceHandle": "handle_parser_output", "targetHandle": "h1"},
-            ],
-        }
-        
-        agt = {
-            "type": "graph",
-            "debug": True,
-            "nodes": [
-                {"id": "input", "type": "user_input"},
-                {"id": "inner", "type": "inner", "data": {"magic_flow": inner_graph}},
-                {"id": "end", "type": "end"},
-            ],
-            "edges": [
-                {"id": "e1", "source": "input", "target": "inner",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_user_message"},
-                {"id": "e2", "source": "inner", "target": "end",
-                 "sourceHandle": "handle_execution_content", "targetHandle": "h1"},
-            ],
-        }
-        
-        graph = build(agt, message="test")
-        
-        # Patch dispatcher timeout for faster test
-        from magic_agents.execution.event_dispatcher import GraphEventDispatcher
-        original_init = GraphEventDispatcher.__init__
-        
-        def patched_init(self, nodes, edges, timeout=2.0):
-            original_init(self, nodes, edges, timeout=timeout)
-        
-        debug_items = []
-        with patch.object(GraphEventDispatcher, '__init__', patched_init):
-            async for item in run_agent(graph):
-                if isinstance(item, dict) and item.get("type") == "debug":
-                    debug_items.append(item)
-        
-        # Verify error propagated
-        assert len(debug_items) > 0
+        assert graph.nodes["inner"].outputs["handle_execution_content"]["content"] == "CHILD_VALUE_123"
+        assert graph.nodes["parser"].inputs == {"handle_parser_input": "CHILD_VALUE_123"}
+        assert graph.nodes["parser"].outputs["handle_parser_output"]["content"] == "RECEIVED: CHILD_VALUE_123"
+        assert graph.nodes["send"].inputs == {"handle_send_extra": "RECEIVED: CHILD_VALUE_123"}
 
     # ========== Tests 5.15-5.16: Extras Merge and Edge Cases ==========
 
@@ -1112,9 +1032,9 @@ class TestInnerNodeFlowIntegration:
             ],
             "edges": [
                 {"id": "ie1", "source": "inner_input", "target": "inner_text",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
                 {"id": "ie2", "source": "inner_text", "target": "inner_end",
-                 "sourceHandle": "handle_text_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_text_output", "targetHandle": "handle_flow_input"},
             ],
         }
         
@@ -1133,21 +1053,19 @@ class TestInnerNodeFlowIntegration:
                 {"id": "e2", "source": "inner", "target": "send",
                  "sourceHandle": "handle_execution_content", "targetHandle": "handle_send_extra"},
                 {"id": "e3", "source": "send", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
         
         # Test with extras=None (backward compat)
         graph = build(agt, message="test", extras=None)
         
-        content_output = []
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
-            text = extract_streamed_content(item)
-            if text:
-                content_output.append(text)
+        streamed, debug_summary = await run_with_debug_summary(graph)
+        content_output = [
+            text
+            for item in streamed
+            if (text := extract_streamed_content(item))
+        ]
         
         content_str = "".join(content_output)
         assert "REGRESSION_OK" in content_str
@@ -1278,7 +1196,7 @@ class TestRunAgentExtrasInjection:
                 {"id": "e3", "source": "parser", "target": "send",
                  "sourceHandle": "handle_parser_output", "targetHandle": "handle_send_extra"},
                 {"id": "e4", "source": "send", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
         
@@ -1325,7 +1243,7 @@ class TestRunAgentExtrasInjection:
                 {"id": "e3", "source": "parser", "target": "send",
                  "sourceHandle": "handle_parser_output", "targetHandle": "handle_send_extra"},
                 {"id": "e4", "source": "send", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
         
@@ -1377,7 +1295,7 @@ class TestMalformedMagicFlowHandling:
                 {"id": "e1", "source": "input", "target": "inner",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_user_message"},
                 {"id": "e2", "source": "inner", "target": "end",
-                 "sourceHandle": "handle_execution_content", "targetHandle": "h1"},
+                 "sourceHandle": "handle_execution_content", "targetHandle": "handle_flow_input"},
             ],
         }
         
@@ -1422,7 +1340,7 @@ class TestMalformedMagicFlowHandling:
                 {"id": "e1", "source": "input", "target": "inner",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_user_message"},
                 {"id": "e2", "source": "inner", "target": "end",
-                 "sourceHandle": "handle_execution_content", "targetHandle": "h1"},
+                 "sourceHandle": "handle_execution_content", "targetHandle": "handle_flow_input"},
             ],
         }
         
@@ -1460,7 +1378,7 @@ class TestMalformedMagicFlowHandling:
                 {"id": "e1", "source": "input", "target": "inner",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_user_message"},
                 {"id": "e2", "source": "inner", "target": "end",
-                 "sourceHandle": "handle_execution_content", "targetHandle": "h1"},
+                 "sourceHandle": "handle_execution_content", "targetHandle": "handle_flow_input"},
             ],
         }
         

@@ -170,7 +170,6 @@ class HookContext:
         Use HookContextFactory.build_*_context() methods for schema-validated
         contexts instead.
         """
-        import traceback
         # Only warn if this is a direct HookContext construction,
         # not from a subclass
         if type(self) is HookContext:

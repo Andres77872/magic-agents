@@ -33,6 +33,7 @@ Perform an HTTP request, or expose an HTTP request as a callable tool.
 
 - `tool_mode`
 - `tool_name`
+- `tool_description` — optional explicit description exposed in the tool schema
 - `tool_parameters`
 
 ## Gotchas

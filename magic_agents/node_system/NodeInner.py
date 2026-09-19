@@ -1,4 +1,5 @@
 from typing import Callable, Optional, TYPE_CHECKING, Any
+import json
 import logging
 import uuid
 from datetime import datetime, UTC
@@ -119,7 +120,19 @@ class NodeInner(Node):
         
         # Phase 0: generate child run_id for execution tree persistence
         child_run_id = f"run-{uuid.uuid4().hex}"
-        parent_execution_id = getattr(chat_log, 'run_id', None) or self.node_id
+        # Execution and run identities are different correlation domains.  The
+        # active registry carries the executor's real execution ID; chat_log
+        # only carries run IDs and must not be mislabeled as an execution span.
+        parent_execution_id = (
+            getattr(self._hooks, 'execution_id', None)
+            if self._hooks is not None
+            else None
+        ) or None
+        parent_run_id = (
+            getattr(self._hooks, 'run_id', None)
+            if self._hooks is not None
+            else None
+        ) or getattr(chat_log, 'run_id', None) or None
         
         # NOTE: We intentionally do NOT mutate chat_log.run_id / parent_run_id here.
         # The child graph receives a brand-new ModelAgentRunLog built from the
@@ -152,7 +165,14 @@ class NodeInner(Node):
         # callback, once via the forwarded yield). See P0_REGRESSION_ANALYSIS.md
         # (Option γ) for full rationale.
         from magic_agents.hooks.hook_registry import HookRegistry
-        _child_hooks = self._hooks.clone() if self._hooks is not None else HookRegistry()
+        _child_hooks = (
+            self._hooks.fork_for_child(
+                child_run_id=child_run_id,
+                parent_node_id=self.node_id,
+            )
+            if self._hooks is not None
+            else HookRegistry()
+        )
         if self._hooks is not None:
             _child_hooks.execution_id = self._hooks.execution_id
             _child_hooks.run_id = self._hooks.run_id
@@ -167,7 +187,7 @@ class NodeInner(Node):
                 extras=child_extras,
                 flow_state=None,  # Child gets isolated empty state
                 run_id=child_run_id,           # Phase 0
-                parent_run_id=parent_execution_id,  # Phase 0
+                parent_run_id=parent_run_id,   # Phase 0
                 hooks=_child_hooks,
         ):
             # Propagate debug/error events from inner graph to outer graph
@@ -197,6 +217,42 @@ class NodeInner(Node):
                 # For now, we'll skip non-ChatCompletionModel outputs
                 # In a full implementation, you might want to handle these differently
                 pass
+
+        # A child graph may terminate with a non-streaming value (for example
+        # Text -> END). The child executor routes that value into the END node,
+        # while END itself intentionally emits only an empty terminal marker.
+        # Use those terminal inputs as the aggregate when no streaming content
+        # was produced so the public handle_execution_content contract does not
+        # silently discard valid child results.
+        if not content:
+            terminal_values = []
+            for child_node_id in sorted(self.inner_graph.nodes):
+                child_node = self.inner_graph.nodes[child_node_id]
+                if getattr(child_node, 'node_type', None) != 'end':
+                    continue
+                inputs = getattr(child_node, 'inputs', {}) or {}
+                values = (
+                    [inputs['handle_flow_input']]
+                    if 'handle_flow_input' in inputs
+                    else list(inputs.values())
+                )
+                terminal_values.extend(value for value in values if value is not None)
+
+            def terminal_text(value: Any) -> str:
+                if isinstance(value, str):
+                    return value
+                if isinstance(value, bytes):
+                    return value.decode('utf-8', errors='replace')
+                if hasattr(value, 'choices') and value.choices:
+                    delta = getattr(value.choices[0], 'delta', None)
+                    return getattr(delta, 'content', '') or ''
+                if isinstance(value, (dict, list, tuple, bool, int, float)):
+                    return json.dumps(value, ensure_ascii=False, default=str)
+                return str(value)
+
+            content = "\n".join(
+                text for value in terminal_values if (text := terminal_text(value))
+            )
 
         # Phase 0: yield SUBGRAPH_END debug event
         yield {

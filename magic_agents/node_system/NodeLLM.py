@@ -713,6 +713,9 @@ class NodeLLM(Node):
         }
 
     async def process(self, chat_log):
+        # ``process`` may run repeatedly inside a loop. Generated content belongs
+        # to one invocation and must never bleed into the next iteration.
+        self.generated = ''
         self.stream = self._resolve_runtime_value(self.INPUT_HANDLER_STREAM, self._default_stream, 'bool')
         self.iterate = self._resolve_runtime_value(self.INPUT_HANDLER_ITERATE, self._default_iterate, 'bool')
         self.json_output = self._resolve_runtime_value(self.INPUT_HANDLER_JSON_OUTPUT, self._default_json_output, 'bool')
@@ -782,6 +785,7 @@ class NodeLLM(Node):
                 logger.debug("NodeLLM:%s no inputs provided; yielding empty content", self.node_id)
                 yield self.yield_static('', content_type=self.OUTPUT_HANDLE_GENERATED)
                 return
+
             sys_context = params.get(self.INPUT_HANDLER_SYSTEM_CONTEXT)
             chat = ModelChat(extract_message(sys_context) if sys_context else None)
             # BACKEND-AUTHORITATIVE: Inject history_messages when no CHAT node provides them
@@ -826,6 +830,36 @@ class NodeLLM(Node):
                 )
                 return
 
+        def agent_loop_inputs(chat_obj: ModelChat) -> tuple[Any, str | None, list[dict]]:
+            """Translate the assembled ModelChat without dropping its history."""
+
+            messages = list(chat_obj.get_messages())
+            current_user_index = next(
+                (
+                    index
+                    for index in range(len(messages) - 1, -1, -1)
+                    if messages[index].get('role') == 'user'
+                ),
+                None,
+            )
+            user_input = (
+                messages[current_user_index].get('content', '')
+                if current_user_index is not None
+                else extract_message(self.get_input(self.INPUT_HANDLER_USER_MESSAGE, ''))
+            )
+            system_parts = [
+                extract_message(message.get('content', ''))
+                for message in messages
+                if message.get('role') == 'system'
+            ]
+            system_prompt = "\n\n".join(part for part in system_parts if part) or None
+            extra_messages = [
+                dict(message)
+                for index, message in enumerate(messages)
+                if message.get('role') != 'system' and index != current_user_index
+            ]
+            return user_input, system_prompt, extra_messages
+
         # Collect tools from tool-prefixed input handles
         tools_schemas, tool_functions, mcp_instructions = await self._collect_tools()
         schema_only_tools_present = self._has_schema_only_tools(tools_schemas, tool_functions)
@@ -854,20 +888,19 @@ class NodeLLM(Node):
             # NOTE: tool_functions NOT merged — magic-llm routes via TaskExecutor
             # which wraps callables with safeguards (depth, timeout, semaphore)
 
+        agent_loop_required = bool(tool_functions) or subagent_bundle.registered_count > 0
+
         # Track tool calls for the handle-tool-calls output
         final_tool_calls: list = []
 
         if not self.stream:
             logger.info("NodeLLM:%s generating (non-stream) with model=%s", self.node_id, client.llm.model)
 
-            if tool_functions:
+            if agent_loop_required:
                 # Tool-enabled path: delegate to magic-llm's canonical agent loop
                 self._warn_unsupported_engine(client)
 
-                user_msg = extract_message(self.get_input(self.INPUT_HANDLER_USER_MESSAGE, ''))
-                sys_msg = None
-                if sys_ctx := self.get_input(self.INPUT_HANDLER_SYSTEM_CONTEXT):
-                    sys_msg = extract_message(sys_ctx)
+                user_msg, sys_msg, extra_messages = agent_loop_inputs(chat)
 
                 # Inject tool manifest into system prompt when tools exist
                 if tools_schemas or (subagent_bundle and subagent_bundle.registered_count > 0):
@@ -895,28 +928,34 @@ class NodeLLM(Node):
                             f"provide client.run_agent_async() or client.run_agent(). Upgrade magic-llm."
                         )
                     hook_relay = self._create_hook_relay(client=client)
-                    intention = await asyncio.to_thread(
-                        client.run_agent,
-                        user_input=user_msg,
-                        system_prompt=sys_msg,
-                        tools=tools_schemas,
-                        tool_functions=tool_functions,
-                        hooks=hook_relay,
-                        **self.extra_data
-                    )
-                    await hook_relay.flush_pending_hooks()
+                    try:
+                        intention = await asyncio.to_thread(
+                            client.run_agent,
+                            user_input=user_msg,
+                            system_prompt=sys_msg,
+                            tools=tools_schemas,
+                            tool_functions=tool_functions,
+                            hooks=hook_relay,
+                            extra_messages=extra_messages or None,
+                            **self.extra_data
+                        )
+                    finally:
+                        await hook_relay.flush_pending_hooks()
                 else:
                     hook_relay = self._create_hook_relay(client=client)
-                    intention = await client.run_agent_async(
-                        user_input=user_msg,
-                        system_prompt=sys_msg,
-                        tools=tools_schemas,
-                        tool_functions=tool_functions,
-                        hooks=hook_relay,
-                        task_executor=None,
-                        **self.extra_data
-                    )
-                    await hook_relay.flush_pending_hooks()
+                    try:
+                        intention = await client.run_agent_async(
+                            user_input=user_msg,
+                            system_prompt=sys_msg,
+                            tools=tools_schemas,
+                            tool_functions=tool_functions,
+                            hooks=hook_relay,
+                            task_executor=None,
+                            extra_messages=extra_messages or None,
+                            **self.extra_data
+                        )
+                    finally:
+                        await hook_relay.flush_pending_hooks()
                 self.generated = intention.content
                 # Use REAL collected tool calls, not intention.tool_calls (always empty for callable-tool path)
                 if hook_relay is not None and hook_relay.collected_tool_calls:
@@ -1045,14 +1084,11 @@ class NodeLLM(Node):
         else:
             logger.info("NodeLLM:%s streaming generation with model=%s", self.node_id, client.llm.model)
 
-            if tool_functions:
+            if agent_loop_required:
                 # Streaming tool-enabled path
                 self._warn_unsupported_engine(client)
 
-                user_msg = extract_message(self.get_input(self.INPUT_HANDLER_USER_MESSAGE, ''))
-                sys_msg = None
-                if sys_ctx := self.get_input(self.INPUT_HANDLER_SYSTEM_CONTEXT):
-                    sys_msg = extract_message(sys_ctx)
+                user_msg, sys_msg, extra_messages = agent_loop_inputs(chat)
 
                 # Inject tool manifest into system prompt when tools exist
                 if tools_schemas or (subagent_bundle and subagent_bundle.registered_count > 0):
@@ -1090,6 +1126,7 @@ class NodeLLM(Node):
                             tools=tools_schemas,
                             tool_functions=tool_functions,
                             hooks=hook_relay,
+                            extra_messages=extra_messages or None,
                             **self.extra_data
                         ):
                             self.generated += chunk.choices[0].delta.content or ''
@@ -1124,6 +1161,7 @@ class NodeLLM(Node):
                             tool_functions=tool_functions,
                             hooks=hook_relay,
                             task_executor=None,
+                            extra_messages=extra_messages or None,
                             **self.extra_data
                         ):
                             self.generated += chunk.choices[0].delta.content or ''
@@ -1357,7 +1395,10 @@ class NodeLLM(Node):
         state['json_output'] = self.json_output
         state['iterate'] = self.iterate
         generated = "" if self.generated is None else self.generated
-        state['generated'] = generated[:500] if len(generated) > 500 else generated  # Truncate long outputs
+        if isinstance(generated, str):
+            state['generated'] = generated[:500] if len(generated) > 500 else generated
+        else:
+            state['generated'] = self._safe_value(generated)
         state['extra_data'] = self.extra_data
         
         # STM windowing diagnostics (no-CHAT path) (M3)

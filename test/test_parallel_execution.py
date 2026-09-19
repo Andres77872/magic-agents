@@ -1,19 +1,16 @@
-"""
-Slice 16 — Parallel execution verification (mocked / no API keys).
+"""Parallel execution verification without external services.
 
-Proves that independent nodes execute concurrently via the reactive executor.
-Two types of proof:
-1. Concurrent launch: tasks start within a small window (timing-based)
-2. Event-loop interleaving: tasks actually interleave at await points (Event-based)
+The concurrency test runs coordinated Node instances through the production
+reactive executor, so it proves graph scheduling rather than asyncio itself.
 """
 import asyncio
-import time
-from datetime import datetime
 import pytest
 
 from magic_agents import run_agent
 from magic_agents.agt_flow import build
+from magic_agents.debug.events import DebugEventType
 from magic_agents.execution.event_dispatcher import GraphEventDispatcher
+from magic_agents.node_system.Node import Node
 
 
 def get_executed_nodes(debug_summary: dict) -> set:
@@ -27,20 +24,41 @@ def get_executed_nodes(debug_summary: dict) -> set:
     return executed
 
 
-def get_node_execution_times(debug_summary: dict) -> dict:
-    """Extract execution start/end times for each node."""
-    times = {}
-    if not debug_summary:
-        return times
-    for node in debug_summary.get("nodes", []):
-        if node.get("was_executed"):
-            nid = node.get("node_id")
-            times[nid] = {
-                "start": node.get("start_time"),
-                "end": node.get("end_time"),
-                "duration_ms": node.get("execution_duration_ms"),
-            }
-    return times
+class DebugCapture:
+    """Collect observer events delivered through run_agent's callback API."""
+
+    def __init__(self):
+        self.events = []
+
+    async def __call__(self, event):
+        self.events.append(event)
+
+    @property
+    def summary(self) -> dict:
+        for event in reversed(self.events):
+            if event.event_type == DebugEventType.GRAPH_END:
+                return event.payload
+        return {}
+
+
+class CoordinatedNode(Node):
+    """A real executor node that cannot finish until its peer has started."""
+
+    def __init__(self, node_id, own_started, peer_started, order):
+        super().__init__(node_id=node_id, node_type="parser", debug=True)
+        self._own_started = own_started
+        self._peer_started = peer_started
+        self._order = order
+
+    async def process(self, chat_log):
+        self._order.append(f"{self.node_id}_start")
+        self._own_started.set()
+        await asyncio.wait_for(self._peer_started.wait(), timeout=1)
+        self._order.append(f"{self.node_id}_end")
+        yield self.yield_static(
+            {"source": self.node_id},
+            content_type="handle_parser_output",
+        )
 
 
 class TestParallelExecution:
@@ -48,148 +66,57 @@ class TestParallelExecution:
 
     @pytest.mark.asyncio
     async def test_parallel_execution_concurrent_launch(self):
-        """Two independent parsers are launched as concurrent tasks.
-
-        Both parser receive input from user_input and have no dependency
-        on each other. In the reactive executor, they should both be
-        ready and have tasks created simultaneously.
-
-        What this proves:
-        - Both parsers execute (not just one)
-        - Their start times are within a small window (< 50ms), proving
-          concurrent task creation by asyncio.create_task()
-
-        What this does NOT prove:
-        - Wall-clock overlap of execution. Parser nodes complete in <1ms,
-          so there is no measurable overlap. For interleaving proof, see
-          test_parallel_execution_event_loop_interleaving.
-        """
+        """Independent graph nodes both start before either can complete."""
         agt = {
             "type": "graph",
             "debug": True,
             "nodes": [
                 {"id": "input", "type": "user_input"},
-                {"id": "parser_a", "type": "parser", "data": {
-                    "text": "A: {{ handle_parser_input }}"
+                {"id": "branch_a", "type": "parser", "data": {"text": "A"}},
+                {"id": "branch_b", "type": "parser", "data": {"text": "B"}},
+                {"id": "merge", "type": "parser", "data": {
+                    "text": "{{ handle_parser_input_0.source }} + {{ handle_parser_input_1.source }}"
                 }},
-                {"id": "parser_b", "type": "parser", "data": {
-                    "text": "B: {{ handle_parser_input }}"
-                }},
-                {"id": "send", "type": "send_message", "data": {"message": "", "json_extras": "DONE"}},
                 {"id": "end", "type": "end"},
             ],
             "edges": [
-                {"id": "e1", "source": "input", "target": "parser_a",
+                {"id": "e1", "source": "input", "target": "branch_a",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_parser_input"},
-                {"id": "e2", "source": "input", "target": "parser_b",
+                {"id": "e2", "source": "input", "target": "branch_b",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_parser_input"},
-                {"id": "e3", "source": "parser_a", "target": "send",
-                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_send_extra"},
-                {"id": "e4", "source": "parser_b", "target": "send",
-                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_send_extra_2"},
-                {"id": "e5", "source": "send", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                {"id": "e3", "source": "branch_a", "target": "merge",
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_parser_input_0"},
+                {"id": "e4", "source": "branch_b", "target": "merge",
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_parser_input_1"},
+                {"id": "e5", "source": "merge", "target": "end",
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
-
-        executed = get_executed_nodes(debug_summary)
-        assert "parser_a" in executed, "parser_a should have executed"
-        assert "parser_b" in executed, "parser_b should have executed"
-
-        # Prove concurrent launch: start times should be within 50ms of each other
-        times = get_node_execution_times(debug_summary)
-        assert "parser_a" in times, "parser_a should have timing data"
-        assert "parser_b" in times, "parser_b should have timing data"
-
-        start_a = times["parser_a"]["start"]
-        start_b = times["parser_b"]["start"]
-        assert start_a is not None, "parser_a should have start_time"
-        assert start_b is not None, "parser_b should have start_time"
-
-        # Parse ISO timestamps and compute difference
-        if isinstance(start_a, str):
-            start_a = datetime.fromisoformat(start_a).timestamp()
-        if isinstance(start_b, str):
-            start_b = datetime.fromisoformat(start_b).timestamp()
-
-        # Both parsers should have started within 50ms of each other
-        # (proving they were launched as concurrent tasks, not sequentially)
-        time_diff_ms = abs(start_b - start_a) * 1000
-        assert time_diff_ms < 50, (
-            f"Parsers should have started within 50ms of each other "
-            f"(concurrent launch), but diff was {time_diff_ms:.1f}ms. "
-            f"start_a={start_a}, start_b={start_b}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_parallel_execution_event_loop_interleaving(self):
-        """Prove the event loop actually interleaves concurrent async tasks.
-
-        This test uses asyncio Events to demonstrate that two independent
-        async generators can both reach a 'started' state before either
-        completes — proving true interleaving, not just concurrent launch.
-
-        This is the mechanism the reactive executor relies on: all node
-        tasks are created via asyncio.create_task() in a tight loop, and
-        the event loop interleaves them at each await point.
-        """
-        # Two async generators that signal when they start and wait for each other
         started_a = asyncio.Event()
         started_b = asyncio.Event()
         order = []
-
-        async def slow_generator_a():
-            order.append("a_start")
-            started_a.set()
-            await started_b.wait()  # Wait for B to start too
-            order.append("a_end")
-            yield {"type": "content", "content": "A"}
-
-        async def slow_generator_b():
-            order.append("b_start")
-            started_b.set()
-            await started_a.wait()  # Wait for A to start too
-            order.append("b_end")
-            yield {"type": "content", "content": "B"}
-
-        async def collect(gen):
-            items = []
-            async for item in gen:
-                items.append(item)
-            return items
-
-        # Run both generators concurrently as tasks (same pattern as the executor)
-        task_a = asyncio.create_task(collect(slow_generator_a()))
-        task_b = asyncio.create_task(collect(slow_generator_b()))
-        results_a, results_b = await asyncio.gather(task_a, task_b)
-
-        # Both must have started before either completed
-        # If sequential: order would be ["a_start", "a_end", "b_start", "b_end"] or vice versa
-        # If interleaved: both starts come before both ends
-        a_start_idx = order.index("a_start")
-        b_start_idx = order.index("b_start")
-        a_end_idx = order.index("a_end")
-        b_end_idx = order.index("b_end")
-
-        # Both starts must happen before both ends (interleaving proof)
-        assert a_start_idx < a_end_idx, "A should start before it ends"
-        assert b_start_idx < b_end_idx, "B should start before it ends"
-        # The key assertion: at least one start happens before the other ends
-        # This proves interleaving — in sequential execution, one would fully complete first
-        assert (a_start_idx < b_end_idx and b_start_idx < a_end_idx), (
-            f"Expected interleaving (both starts before both ends), got order: {order}. "
-            f"This means tasks ran sequentially, not concurrently."
+        graph.nodes["branch_a"] = CoordinatedNode(
+            "branch_a", started_a, started_b, order
+        )
+        graph.nodes["branch_b"] = CoordinatedNode(
+            "branch_b", started_b, started_a, order
         )
 
-        # Both should have produced output
-        assert len(results_a) == 1
-        assert len(results_b) == 1
+        debug_capture = DebugCapture()
+        async for _item in run_agent(graph, debug_callback=debug_capture):
+            pass
+
+        assert set(order[:2]) == {"branch_a_start", "branch_b_start"}
+        assert set(order[2:]) == {"branch_a_end", "branch_b_end"}
+
+        executed = get_executed_nodes(debug_capture.summary)
+        assert {"branch_a", "branch_b", "merge"} <= executed
+        assert graph.nodes["merge"].inputs == {
+            "handle_parser_input_0": {"source": "branch_a"},
+            "handle_parser_input_1": {"source": "branch_b"},
+        }
 
     @pytest.mark.asyncio
     async def test_parallel_execution_combined_output(self):
@@ -223,16 +150,14 @@ class TestParallelExecution:
                 {"id": "e5", "source": "merge", "target": "send",
                  "sourceHandle": "handle_parser_output", "targetHandle": "handle_send_extra"},
                 {"id": "e6", "source": "send", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
         content_output = []
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
+        debug_capture = DebugCapture()
+        async for item in run_agent(graph, debug_callback=debug_capture):
             if item.get("type") == "content" and hasattr(item.get("content"), "choices"):
                 choices = item["content"].choices
                 if choices and choices[0].delta.content:
@@ -240,7 +165,7 @@ class TestParallelExecution:
 
         content_str = "".join(content_output)
         assert "MERGED" in content_str
-        executed = get_executed_nodes(debug_summary)
+        executed = get_executed_nodes(debug_capture.summary)
         assert "parser_a" in executed
         assert "parser_b" in executed
         assert "merge" in executed
@@ -266,11 +191,11 @@ class TestParallelExecution:
                 {"id": "e3", "source": "input", "target": "parser_c",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_parser_input"},
                 {"id": "e4", "source": "parser_a", "target": "end",
-                 "sourceHandle": "handle_parser_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
                 {"id": "e5", "source": "parser_b", "target": "end",
-                 "sourceHandle": "handle_parser_output", "targetHandle": "h2"},
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
                 {"id": "e6", "source": "parser_c", "target": "end",
-                 "sourceHandle": "handle_parser_output", "targetHandle": "h3"},
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
@@ -318,20 +243,18 @@ class TestParallelExecution:
                 {"id": "e6", "source": "branch_c", "target": "send_c",
                  "sourceHandle": "handle_parser_output", "targetHandle": "handle_send_extra"},
                 {"id": "e7", "source": "send_a", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
                 {"id": "e8", "source": "send_b", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h2"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
                 {"id": "e9", "source": "send_c", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h3"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
         content_output = []
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
+        debug_capture = DebugCapture()
+        async for item in run_agent(graph, debug_callback=debug_capture):
             text = extract_streamed_content(item)
             if text:
                 content_output.append(text)
@@ -340,7 +263,7 @@ class TestParallelExecution:
         assert "A" in content_str
         assert "B" in content_str
         assert "C" in content_str
-        executed = get_executed_nodes(debug_summary)
+        executed = get_executed_nodes(debug_capture.summary)
         assert "branch_a" in executed
         assert "branch_b" in executed
         assert "branch_c" in executed

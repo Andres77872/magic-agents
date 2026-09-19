@@ -50,11 +50,16 @@ class NodeSendMessage(Node):
         else:
             output = {}
         logger.info("NodeSendMessage:%s sending message with extras", self.node_id)
+
+        # ``message`` is the canonical user-facing content.  Older graphs used
+        # ``json_extras`` as the visible text while leaving ``message`` empty,
+        # so keep that as a compatibility fallback.
+        content = self.message if self.message else self.json_extras
         
         message = ChatCompletionModel(
             id='',
             model='',
-            choices=[ChoiceModel(delta=DeltaModel(content=self.json_extras))],
+            choices=[ChoiceModel(delta=DeltaModel(content=content))],
             extras=output
         )
         

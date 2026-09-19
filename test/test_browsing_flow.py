@@ -314,15 +314,11 @@ class TestSearchResultsParsing:
 
 
 class TestBrowsingFlowExecution:
-    """Integration tests for the browsing flow execution.
-    
-    Note: These tests require API keys and make real API calls.
-    Skip if keys are not available.
-    """
+    """Credential-free build and routing-contract tests for the browsing flow."""
 
     @pytest.fixture
-    def flow_with_mock_client(self):
-        """Create flow with modified client for testing."""
+    def flow_config(self):
+        """Load the flow, using a configured key when one is already present."""
         flow = load_browsing_flow()
         
         # Replace API key with test key if available
@@ -335,11 +331,10 @@ class TestBrowsingFlowExecution:
         return flow
 
     @pytest.mark.asyncio
-    @pytest.mark.skipif('openai_key' not in VAR_ENV, reason="OpenAI API key not available")
-    async def test_flow_builds_successfully(self, flow_with_mock_client):
+    async def test_flow_builds_successfully(self, flow_config):
         """Test that the flow can be built without errors."""
         graph = build(
-            agt_data=flow_with_mock_client,
+            agt_data=flow_config,
             message="Hello",
             load_chat=None
         )
@@ -349,23 +344,23 @@ class TestBrowsingFlowExecution:
         assert len(graph.nodes) > 0
 
     @pytest.mark.asyncio
-    @pytest.mark.skipif('openai_key' not in VAR_ENV, reason="OpenAI API key not available")
-    async def test_greeting_routes_to_no_search(self, flow_with_mock_client):
+    async def test_greeting_routes_to_no_search(self, flow_config):
         """Test that a greeting message bypasses search."""
         # This is a conceptual test - in real execution, the LLM decides
         # Here we verify the flow can handle such routing
         graph = build(
-            agt_data=flow_with_mock_client,
+            agt_data=flow_config,
             message="Hi there!",
             load_chat=None
         )
         
         # Flow should build without validation errors for valid structure
-        validation_errors = getattr(graph, '_validation_errors', None)
-        if validation_errors:
-            # Filter out warnings
-            errors_only = [e for e in validation_errors if e.get('severity') != 'warning']
-            assert len(errors_only) == 0, f"Unexpected validation errors: {errors_only}"
+        validation_errors = getattr(graph, '_validation_errors', None) or []
+        errors_only = [
+            error for error in validation_errors
+            if error.get('severity') != 'warning'
+        ]
+        assert errors_only == []
 
 
 class TestEdgeCases:

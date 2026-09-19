@@ -47,6 +47,20 @@ At `event_dispatcher.py:251-275`:
 5. Set `hook_node.inputs[INPUT_HANDLE_HOOK_CONTEXT] = _hook_ctx`
 6. Call `self.dispatch_input(hook_node_id, handle, ctx)` to trigger `NodeHook.process()`
 
+## Binding Rule and Loop Traversals
+
+Each `NodeHook` may be referenced by at most one enabled edge. Reusing the same
+hook node ID on multiple enabled edges is rejected with `HookValidationError`;
+execution is blocked, and disabled references do not count toward the limit.
+Use a distinct hook node for each separately configured edge.
+
+`hook_node_id` must reference an existing node whose type is `hook`; pointing
+at another node type is also a blocking `HookValidationError`.
+
+The bound edge can still traverse more than once. In a loop graph, the hook runs
+once per real traversal and receives a fresh context and sequence number for
+each iteration.
+
 ## Edge Hook Context Payload
 
 `context.inputs` contains (`contracts.py:130-140`):

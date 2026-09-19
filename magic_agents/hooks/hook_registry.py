@@ -8,6 +8,7 @@ Dies with execution (no module-level global state).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from typing import List, Optional, Dict, Any
 
@@ -105,6 +106,37 @@ class HookRegistry:
         cloned.run_id = self.run_id
         return cloned
 
+    def fork_for_child(
+        self,
+        *,
+        child_run_id: str,
+        parent_node_id: str,
+    ) -> "HookRegistry":
+        """Clone registry membership while isolating stateful child hooks.
+
+        Hooks can implement ``fork_for_child`` to return an execution-local
+        instance. Hooks without that optional contract remain shared, matching
+        the historical nested-observer behavior.
+        """
+        def fork(hook: FlowHooks) -> FlowHooks:
+            factory = getattr(hook, "fork_for_child", None)
+            if callable(factory):
+                return factory(
+                    child_run_id=child_run_id,
+                    parent_node_id=parent_node_id,
+                )
+            return hook
+
+        cloned = HookRegistry(global_hooks=[fork(h) for h in self._global_hooks])
+        cloned._graph_hooks = [fork(h) for h in self._graph_hooks]
+        cloned._node_hooks = {
+            node_id: [fork(h) for h in hooks]
+            for node_id, hooks in self._node_hooks.items()
+        }
+        cloned.execution_id = self.execution_id
+        cloned.run_id = self.run_id
+        return cloned
+
     def export_hooks(self) -> Dict[str, Any]:
         """Export registered hook lists for tests/introspection."""
         return {
@@ -178,7 +210,7 @@ class HookRegistry:
         """
         tasks = []
         for hook, method in hooks_methods:
-            if asyncio.iscoroutinefunction(method):
+            if inspect.iscoroutinefunction(method):
                 tasks.append(self._invoke_async_safe(hook, method, context, **kwargs))
             else:
                 # Wrap sync hooks in asyncio.to_thread for async-safe execution

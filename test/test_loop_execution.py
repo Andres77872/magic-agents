@@ -1,23 +1,19 @@
-"""
-Slice 14 — Loop execution tests (mocked / no API keys).
+"""Loop execution tests using real local nodes and no external services.
 
-Tests loop iteration, aggregation, empty list, max iterations, static phase,
-post-loop execution, and conditional bypass of loop — all without real API calls.
-Uses parser nodes and text nodes to avoid LLM dependency.
+Tests iteration, aggregation, limits, phase ordering, and conditional bypass
+through the production loop executor.
 """
 import json
 import pytest
-from unittest.mock import MagicMock, patch, AsyncMock
 
 from magic_agents import run_agent
 from magic_agents.agt_flow import build
 from magic_agents.execution.reactive_executor import (
-    execute_graph_loop_reactive,
     find_iteration_subgraph,
     prepare_item_output,
     emit_loop_progress,
-    reset_iteration_nodes,
 )
+from magic_agents.debug.events import DebugEventType
 
 
 def extract_streamed_content(item):
@@ -58,6 +54,30 @@ def get_bypassed_nodes(debug_summary: dict) -> set:
     return bypassed
 
 
+class DebugCapture:
+    """Collect observer events delivered through run_agent's debug callback."""
+
+    def __init__(self):
+        self.events = []
+
+    async def __call__(self, event):
+        self.events.append(event)
+
+    @property
+    def summary(self) -> dict:
+        for event in reversed(self.events):
+            if event.event_type == DebugEventType.GRAPH_END:
+                return event.payload
+        return {}
+
+    def events_for(self, event_type: DebugEventType, node_id: str | None = None):
+        return [
+            event for event in self.events
+            if event.event_type == event_type
+            and (node_id is None or event.node_id == node_id)
+        ]
+
+
 class TestLoopSimpleIteration:
     """Tests for basic loop iteration with parser nodes (no LLM)."""
 
@@ -82,7 +102,7 @@ class TestLoopSimpleIteration:
             ],
             "edges": [
                 {"id": "e1", "source": "input", "target": "list_text",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
                 {"id": "e2", "source": "list_text", "target": "loop",
                  "sourceHandle": "handle_text_output", "targetHandle": "handle_list"},
                 {"id": "e3", "source": "loop", "target": "transform",
@@ -94,23 +114,21 @@ class TestLoopSimpleIteration:
                 {"id": "e6", "source": "format", "target": "send",
                  "sourceHandle": "handle_parser_output", "targetHandle": "handle_send_extra"},
                 {"id": "e7", "source": "send", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
         content_output = []
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
+        debug_capture = DebugCapture()
+        async for item in run_agent(graph, debug_callback=debug_capture):
             text = extract_streamed_content(item)
             if text:
                 content_output.append(text)
 
         content_str = "".join(content_output)
         assert "DONE" in content_str
-        executed = get_executed_nodes(debug_summary)
+        executed = get_executed_nodes(debug_capture.summary)
         # Note: loop node itself is not tracked in debug because the loop executor
         # handles iteration directly without calling node.__call__. We verify
         # loop execution indirectly by checking that iteration nodes executed.
@@ -139,7 +157,7 @@ class TestLoopSimpleIteration:
             ],
             "edges": [
                 {"id": "e1", "source": "input", "target": "list_text",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
                 {"id": "e2", "source": "list_text", "target": "loop",
                  "sourceHandle": "handle_text_output", "targetHandle": "handle_list"},
                 {"id": "e3", "source": "loop", "target": "transform",
@@ -151,23 +169,21 @@ class TestLoopSimpleIteration:
                 {"id": "e6", "source": "format", "target": "send",
                  "sourceHandle": "handle_parser_output", "targetHandle": "handle_send_extra"},
                 {"id": "e7", "source": "send", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
         content_output = []
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
+        debug_capture = DebugCapture()
+        async for item in run_agent(graph, debug_callback=debug_capture):
             text = extract_streamed_content(item)
             if text:
                 content_output.append(text)
 
         content_str = "".join(content_output)
         assert "EMPTY_DONE" in content_str
-        executed = get_executed_nodes(debug_summary)
+        executed = get_executed_nodes(debug_capture.summary)
         # Loop node not tracked in debug (executor handles iteration directly)
         assert "format" in executed
         assert "send" in executed
@@ -194,7 +210,7 @@ class TestLoopSimpleIteration:
             ],
             "edges": [
                 {"id": "e1", "source": "input", "target": "list_text",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
                 {"id": "e2", "source": "list_text", "target": "loop",
                  "sourceHandle": "handle_text_output", "targetHandle": "handle_list"},
                 {"id": "e3", "source": "loop", "target": "transform",
@@ -204,17 +220,16 @@ class TestLoopSimpleIteration:
                 {"id": "e5", "source": "loop", "target": "aggregate",
                  "sourceHandle": "handle_end", "targetHandle": "handle_parser_input"},
                 {"id": "e6", "source": "aggregate", "target": "end",
-                 "sourceHandle": "handle_parser_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
+        debug_capture = DebugCapture()
+        async for _item in run_agent(graph, debug_callback=debug_capture):
+            pass
 
-        executed = get_executed_nodes(debug_summary)
+        executed = get_executed_nodes(debug_capture.summary)
         assert "aggregate" in executed
         # The aggregate node should have received 3 items
         agg_node = graph.nodes.get("aggregate")
@@ -247,7 +262,7 @@ class TestLoopStaticPhase:
                 {"id": "e1", "source": "input", "target": "static_parser",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_parser_input"},
                 {"id": "e2", "source": "input", "target": "list_text",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
                 {"id": "e3", "source": "list_text", "target": "loop",
                  "sourceHandle": "handle_text_output", "targetHandle": "handle_list"},
                 {"id": "e4", "source": "loop", "target": "transform",
@@ -255,17 +270,16 @@ class TestLoopStaticPhase:
                 {"id": "e5", "source": "transform", "target": "loop",
                  "sourceHandle": "handle_parser_output", "targetHandle": "handle_loop"},
                 {"id": "e6", "source": "loop", "target": "end",
-                 "sourceHandle": "handle_end", "targetHandle": "h1"},
+                 "sourceHandle": "handle_end", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="hello")
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
+        debug_capture = DebugCapture()
+        async for _item in run_agent(graph, debug_callback=debug_capture):
+            pass
 
-        executed = get_executed_nodes(debug_summary)
+        executed = get_executed_nodes(debug_capture.summary)
         # Static parser should execute before loop
         assert "static_parser" in executed
         # Loop node not tracked in debug (executor handles iteration directly)
@@ -299,7 +313,7 @@ class TestLoopConditionalBypass:
                 {"id": "e1", "source": "input", "target": "cond",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
                 {"id": "e2", "source": "cond", "target": "list_text",
-                 "sourceHandle": "run_loop", "targetHandle": "handle_input"},
+                 "sourceHandle": "run_loop", "targetHandle": "handle_flow_input"},
                 {"id": "e3", "source": "cond", "target": "fallback",
                  "sourceHandle": "skip_loop", "targetHandle": "handle_send_extra"},
                 {"id": "e4", "source": "list_text", "target": "loop",
@@ -309,27 +323,25 @@ class TestLoopConditionalBypass:
                 {"id": "e6", "source": "transform", "target": "loop",
                  "sourceHandle": "handle_parser_output", "targetHandle": "handle_loop"},
                 {"id": "e7", "source": "loop", "target": "end",
-                 "sourceHandle": "handle_end", "targetHandle": "h1"},
+                 "sourceHandle": "handle_end", "targetHandle": "handle_flow_input"},
                 {"id": "e8", "source": "fallback", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h2"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
         content_output = []
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
+        debug_capture = DebugCapture()
+        async for item in run_agent(graph, debug_callback=debug_capture):
             text = extract_streamed_content(item)
             if text:
                 content_output.append(text)
 
         content_str = "".join(content_output)
         assert "FALLBACK" in content_str
-        executed = get_executed_nodes(debug_summary)
+        executed = get_executed_nodes(debug_capture.summary)
         assert "fallback" in executed
-        bypassed = get_bypassed_nodes(debug_summary)
+        bypassed = get_bypassed_nodes(debug_capture.summary)
         # Loop and its subgraph should be bypassed
         assert "loop" in bypassed
         assert "transform" in bypassed
@@ -367,7 +379,7 @@ class TestLoopConditionalBypass:
                 {"id": "e1", "source": "input", "target": "cond",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
                 {"id": "e2", "source": "cond", "target": "list_text",
-                 "sourceHandle": "run_loop", "targetHandle": "handle_input"},
+                 "sourceHandle": "run_loop", "targetHandle": "handle_flow_input"},
                 {"id": "e3", "source": "cond", "target": "fallback",
                  "sourceHandle": "skip_loop", "targetHandle": "handle_send_extra"},
                 {"id": "e4", "source": "list_text", "target": "loop",
@@ -379,18 +391,16 @@ class TestLoopConditionalBypass:
                 {"id": "e7", "source": "loop", "target": "post_format",
                  "sourceHandle": "handle_end", "targetHandle": "handle_parser_input"},
                 {"id": "e8", "source": "post_format", "target": "end",
-                 "sourceHandle": "handle_parser_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
                 {"id": "e9", "source": "fallback", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h2"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
         content_output = []
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
+        debug_capture = DebugCapture()
+        async for item in run_agent(graph, debug_callback=debug_capture):
             text = extract_streamed_content(item)
             if text:
                 content_output.append(text)
@@ -398,7 +408,7 @@ class TestLoopConditionalBypass:
         content_str = "".join(content_output)
         assert "FALLBACK" in content_str
 
-        bypassed = get_bypassed_nodes(debug_summary)
+        bypassed = get_bypassed_nodes(debug_capture.summary)
         # Loop, its subgraph, AND post_format (depends on loop output) should all be bypassed
         assert "loop" in bypassed, f"loop should be bypassed, got: {bypassed}"
         assert "transform" in bypassed, f"transform should be bypassed, got: {bypassed}"
@@ -438,7 +448,7 @@ class TestLoopConditionalBypass:
                 {"id": "e1", "source": "input", "target": "cond",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
                 {"id": "e2", "source": "cond", "target": "list_text",
-                 "sourceHandle": "use_list", "targetHandle": "handle_input"},
+                 "sourceHandle": "use_list", "targetHandle": "handle_flow_input"},
                 {"id": "e3", "source": "cond", "target": "fallback",
                  "sourceHandle": "skip_list", "targetHandle": "handle_send_extra"},
                 {"id": "e4", "source": "list_text", "target": "loop",
@@ -450,18 +460,16 @@ class TestLoopConditionalBypass:
                 {"id": "e7", "source": "loop", "target": "post_format",
                  "sourceHandle": "handle_end", "targetHandle": "handle_parser_input"},
                 {"id": "e8", "source": "post_format", "target": "end",
-                 "sourceHandle": "handle_parser_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
                 {"id": "e9", "source": "fallback", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h2"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
         content_output = []
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
+        debug_capture = DebugCapture()
+        async for item in run_agent(graph, debug_callback=debug_capture):
             text = extract_streamed_content(item)
             if text:
                 content_output.append(text)
@@ -469,7 +477,7 @@ class TestLoopConditionalBypass:
         content_str = "".join(content_output)
         assert "NO_LIST" in content_str
 
-        bypassed = get_bypassed_nodes(debug_summary)
+        bypassed = get_bypassed_nodes(debug_capture.summary)
         # list_text is bypassed → loop has no input → loop and its subgraph bypassed
         assert "list_text" in bypassed, f"list_text should be bypassed, got: {bypassed}"
         assert "loop" in bypassed, f"loop should be bypassed (input source bypassed), got: {bypassed}"
@@ -503,7 +511,7 @@ class TestLoopMaxIterations:
             ],
             "edges": [
                 {"id": "e1", "source": "input", "target": "list_text",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
                 {"id": "e2", "source": "list_text", "target": "loop",
                  "sourceHandle": "handle_text_output", "targetHandle": "handle_list"},
                 {"id": "e3", "source": "loop", "target": "transform",
@@ -513,16 +521,14 @@ class TestLoopMaxIterations:
                 {"id": "e5", "source": "loop", "target": "format",
                  "sourceHandle": "handle_end", "targetHandle": "handle_parser_input"},
                 {"id": "e6", "source": "format", "target": "end",
-                 "sourceHandle": "handle_parser_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
         debug_items = []
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
+        debug_capture = DebugCapture()
+        async for item in run_agent(graph, debug_callback=debug_capture):
             if isinstance(item, dict) and item.get("type") == "debug":
                 debug_items.append(item)
 
@@ -534,7 +540,7 @@ class TestLoopMaxIterations:
         assert len(max_iter_events) > 0
 
         # The format node should have received only 100 items
-        executed = get_executed_nodes(debug_summary)
+        executed = get_executed_nodes(debug_capture.summary)
         assert "format" in executed
         format_node = graph.nodes.get("format")
         agg = format_node.inputs.get("handle_parser_input", [])
@@ -587,7 +593,7 @@ class TestMultipleLoopNodes:
             ],
             "edges": [
                 {"id": "e1", "source": "input", "target": "list1",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
                 # First loop
                 {"id": "e2", "source": "list1", "target": "loop1",
                  "sourceHandle": "handle_text_output", "targetHandle": "handle_list"},
@@ -605,30 +611,23 @@ class TestMultipleLoopNodes:
                 {"id": "e8", "source": "transform2", "target": "loop2",
                  "sourceHandle": "handle_parser_output", "targetHandle": "handle_loop"},
                 {"id": "e9", "source": "loop2", "target": "end",
-                 "sourceHandle": "handle_end", "targetHandle": "h1"},
+                 "sourceHandle": "handle_end", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
 
-        # Collect ALL events — not just debug, because loop_progress has its own type
-        all_events = []
+        debug_capture = DebugCapture()
         debug_items = []
         loop_progress_events = []
-        debug_summary = None
 
-        async for item in run_agent(graph):
-            all_events.append(item)
+        async for item in run_agent(graph, debug_callback=debug_capture):
             if isinstance(item, dict):
                 evt_type = item.get("type")
-                if evt_type == "debug_summary":
-                    debug_summary = item.get("content", {})
-                elif evt_type == "debug":
+                if evt_type == "debug":
                     debug_items.append(item)
                 elif evt_type == "loop_progress":
                     loop_progress_events.append(item)
-
-        executed = get_executed_nodes(debug_summary)
 
         # === PROOF: loop1 iterates correctly ===
         loop1_progress = [
@@ -643,9 +642,8 @@ class TestMultipleLoopNodes:
         assert loop1_progress[1]["content"]["current"] == 1
 
         # transform1 runs twice (once per iteration)
-        transform1_debug_count = sum(
-            1 for d in debug_items
-            if d.get("content", {}).get("node_id") == "transform1"
+        transform1_debug_count = len(
+            debug_capture.events_for(DebugEventType.NODE_END, "transform1")
         )
         assert transform1_debug_count == 2, (
             f"transform1 should run twice (once per loop1 iteration), "
@@ -667,9 +665,8 @@ class TestMultipleLoopNodes:
         )
 
         # 2. transform2 runs only ONCE in post-loop phase, NOT per-item
-        transform2_debug_count = sum(
-            1 for d in debug_items
-            if d.get("content", {}).get("node_id") == "transform2"
+        transform2_debug_count = len(
+            debug_capture.events_for(DebugEventType.NODE_END, "transform2")
         )
         assert transform2_debug_count == 1, (
             f"transform2 should run exactly once in post-loop phase (loop2 doesn't "
@@ -731,7 +728,7 @@ class TestConditionalInsideLoop:
             ],
             "edges": [
                 {"id": "e1", "source": "input", "target": "list_text",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
                 {"id": "e2", "source": "list_text", "target": "loop",
                  "sourceHandle": "handle_text_output", "targetHandle": "handle_list"},
                 {"id": "e3", "source": "loop", "target": "cond",
@@ -752,17 +749,15 @@ class TestConditionalInsideLoop:
                 {"id": "e9", "source": "format", "target": "send",
                  "sourceHandle": "handle_parser_output", "targetHandle": "handle_send_extra"},
                 {"id": "e10", "source": "send", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
         content_output = []
-        debug_summary = None
         debug_events = []
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
+        debug_capture = DebugCapture()
+        async for item in run_agent(graph, debug_callback=debug_capture):
             if isinstance(item, dict) and item.get("type") == "debug":
                 debug_events.append(item.get("content", {}))
             text = extract_streamed_content(item)
@@ -783,7 +778,7 @@ class TestConditionalInsideLoop:
         content_str = "".join(content_output)
         assert "DONE" in content_str
 
-        executed = get_executed_nodes(debug_summary)
+        executed = get_executed_nodes(debug_capture.summary)
         # The conditional and both parser branches should be in the iteration subgraph
         assert "cond" in executed, f"conditional should execute, got: {executed}"
         # At least one of the branch parsers should execute
@@ -833,7 +828,7 @@ class TestConditionalInsideLoop:
             ],
             "edges": [
                 {"id": "e1", "source": "input", "target": "list_text",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
                 {"id": "e2", "source": "list_text", "target": "loop",
                  "sourceHandle": "handle_text_output", "targetHandle": "handle_list"},
                 {"id": "e3", "source": "loop", "target": "cond",
@@ -851,23 +846,16 @@ class TestConditionalInsideLoop:
                 {"id": "e9", "source": "format", "target": "send",
                  "sourceHandle": "handle_parser_output", "targetHandle": "handle_send_extra"},
                 {"id": "e10", "source": "send", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
-        content_output = []
-        debug_summary = None
-        debug_events = []
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
-            if isinstance(item, dict) and item.get("type") == "debug":
-                debug_events.append(item.get("content", {}))
-            text = extract_streamed_content(item)
-            if text:
-                content_output.append(text)
+        debug_capture = DebugCapture()
+        async for _item in run_agent(graph, debug_callback=debug_capture):
+            pass
 
+        debug_summary = debug_capture.summary
         executed = get_executed_nodes(debug_summary)
         bypassed = get_bypassed_nodes(debug_summary)
 
@@ -891,10 +879,10 @@ class TestConditionalInsideLoop:
             f"Bypassed nodes: {bypassed}"
         )
 
-        # Verify data flow through debug_summary node info.
+        # Verify data flow through the observer's graph-end summary.
         # The send_message node with message="" only outputs json_extras ("DONE"),
         # so we check the format node's output to verify correct routing.
-        assert debug_summary is not None, "debug_summary must be present"
+        assert debug_summary, "graph-end debug summary must be present"
         node_infos = {n["node_id"]: n for n in debug_summary.get("nodes", [])}
 
         # format node should have received YES outputs from the loop aggregation
@@ -961,7 +949,7 @@ class TestConditionalInsideLoop:
             ],
             "edges": [
                 {"id": "e1", "source": "input", "target": "list_text",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
                 {"id": "e2", "source": "list_text", "target": "loop",
                  "sourceHandle": "handle_text_output", "targetHandle": "handle_list"},
                 {"id": "e3", "source": "loop", "target": "cond",
@@ -979,16 +967,16 @@ class TestConditionalInsideLoop:
                 {"id": "e9", "source": "format", "target": "send",
                  "sourceHandle": "handle_parser_output", "targetHandle": "handle_send_extra"},
                 {"id": "e10", "source": "send", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
+        debug_capture = DebugCapture()
+        async for _item in run_agent(graph, debug_callback=debug_capture):
+            pass
 
+        debug_summary = debug_capture.summary
         executed = get_executed_nodes(debug_summary)
         bypassed = get_bypassed_nodes(debug_summary)
 
@@ -1010,7 +998,7 @@ class TestConditionalInsideLoop:
             f"Bypassed nodes: {bypassed}"
         )
 
-        # Verify data flow through debug_summary
+        # Verify data flow through the observer's graph-end summary.
         node_infos = {n["node_id"]: n for n in debug_summary.get("nodes", [])}
         format_info = node_infos.get("format", {})
         format_outputs = format_info.get("outputs", {})
@@ -1069,7 +1057,7 @@ class TestConditionalControlsLoop:
                 {"id": "e1", "source": "input", "target": "cond",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
                 {"id": "e2", "source": "cond", "target": "list_text",
-                 "sourceHandle": "run_loop", "targetHandle": "handle_input"},
+                 "sourceHandle": "run_loop", "targetHandle": "handle_flow_input"},
                 {"id": "e3", "source": "cond", "target": "fallback",
                  "sourceHandle": "skip_loop", "targetHandle": "handle_send_extra"},
                 {"id": "e4", "source": "list_text", "target": "loop",
@@ -1083,18 +1071,16 @@ class TestConditionalControlsLoop:
                 {"id": "e8", "source": "format", "target": "send",
                  "sourceHandle": "handle_parser_output", "targetHandle": "handle_send_extra"},
                 {"id": "e9", "source": "send", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
                 {"id": "e10", "source": "fallback", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h2"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
         content_output = []
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
+        debug_capture = DebugCapture()
+        async for item in run_agent(graph, debug_callback=debug_capture):
             text = extract_streamed_content(item)
             if text:
                 content_output.append(text)
@@ -1104,8 +1090,8 @@ class TestConditionalControlsLoop:
         assert "LOOP_DONE" in content_str
         assert "SKIPPED" not in content_str
 
-        executed = get_executed_nodes(debug_summary)
-        bypassed = get_bypassed_nodes(debug_summary)
+        executed = get_executed_nodes(debug_capture.summary)
+        bypassed = get_bypassed_nodes(debug_capture.summary)
 
         # Loop iteration subgraph should execute
         assert "transform" in executed
@@ -1140,7 +1126,7 @@ class TestConditionalControlsLoop:
                 {"id": "e1", "source": "input", "target": "cond",
                  "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
                 {"id": "e2", "source": "cond", "target": "list_text",
-                 "sourceHandle": "run_loop", "targetHandle": "handle_input"},
+                 "sourceHandle": "run_loop", "targetHandle": "handle_flow_input"},
                 {"id": "e3", "source": "cond", "target": "fallback",
                  "sourceHandle": "skip_loop", "targetHandle": "handle_send_extra"},
                 {"id": "e4", "source": "list_text", "target": "loop",
@@ -1152,18 +1138,16 @@ class TestConditionalControlsLoop:
                 {"id": "e7", "source": "loop", "target": "format",
                  "sourceHandle": "handle_end", "targetHandle": "handle_parser_input"},
                 {"id": "e8", "source": "format", "target": "end",
-                 "sourceHandle": "handle_parser_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
                 {"id": "e9", "source": "fallback", "target": "end",
-                 "sourceHandle": "handle_message_output", "targetHandle": "h2"},
+                 "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
             ],
         }
 
         graph = build(agt, message="test")
         content_output = []
-        debug_summary = None
-        async for item in run_agent(graph):
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
+        debug_capture = DebugCapture()
+        async for item in run_agent(graph, debug_callback=debug_capture):
             text = extract_streamed_content(item)
             if text:
                 content_output.append(text)
@@ -1171,13 +1155,227 @@ class TestConditionalControlsLoop:
         content_str = "".join(content_output)
         assert "SKIPPED" in content_str
 
-        bypassed = get_bypassed_nodes(debug_summary)
+        bypassed = get_bypassed_nodes(debug_capture.summary)
         # Loop and its subgraph should be bypassed
         assert "loop" in bypassed, f"loop should be bypassed, got: {bypassed}"
         assert "transform" in bypassed, f"transform should be bypassed, got: {bypassed}"
 
 
 
+
+
+class TestLoopEdgeAwareConvergence:
+    """Real graph regressions for edge-aware loop phase bypass accounting."""
+
+    @staticmethod
+    async def run_graph(agt):
+        graph = build(agt, message="route")
+        capture = DebugCapture()
+        async for _item in run_agent(graph, debug_callback=capture):
+            pass
+        return graph, capture.summary
+
+    @pytest.mark.asyncio
+    async def test_static_conditional_branches_can_converge_before_loop(self):
+        agt = {
+            "type": "graph",
+            "debug": True,
+            "nodes": [
+                {"id": "input", "type": "user_input"},
+                {"id": "cond", "type": "conditional", "data": {
+                    "condition": "{{ 'yes' }}", "output_handles": ["yes", "no"],
+                }},
+                {"id": "yes", "type": "text", "data": {"text": '["selected"]'}},
+                {"id": "no", "type": "text", "data": {"text": '["wrong"]'}},
+                {"id": "merge", "type": "parser", "data": {
+                    "text": "{{ handle_parser_input_active }}",
+                }},
+                {"id": "static_end", "type": "end"},
+                {"id": "items", "type": "text", "data": {"text": '["selected"]'}},
+                {"id": "loop", "type": "loop", "data": {}},
+                {"id": "transform", "type": "parser", "data": {
+                    "text": "{{ handle_parser_input }}",
+                }},
+                {"id": "end", "type": "end"},
+            ],
+            "edges": [
+                {"id": "s1", "source": "input", "target": "cond",
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                {"id": "s2", "source": "cond", "target": "yes",
+                 "sourceHandle": "yes", "targetHandle": "handle_flow_input"},
+                {"id": "s3", "source": "cond", "target": "no",
+                 "sourceHandle": "no", "targetHandle": "handle_flow_input"},
+                {"id": "s4", "source": "yes", "target": "merge",
+                 "sourceHandle": "handle_text_output", "targetHandle": "handle_parser_input_active"},
+                {"id": "s5", "source": "no", "target": "merge",
+                 "sourceHandle": "handle_text_output", "targetHandle": "handle_parser_input_inactive"},
+                {"id": "s6", "source": "merge", "target": "static_end",
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
+                {"id": "s7", "source": "input", "target": "items",
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
+                {"id": "s8", "source": "items", "target": "loop",
+                 "sourceHandle": "handle_text_output", "targetHandle": "handle_list"},
+                {"id": "s9", "source": "loop", "target": "transform",
+                 "sourceHandle": "handle_item", "targetHandle": "handle_parser_input"},
+                {"id": "s10", "source": "transform", "target": "loop",
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_loop"},
+                {"id": "s11", "source": "loop", "target": "end",
+                 "sourceHandle": "handle_end", "targetHandle": "handle_flow_input"},
+            ],
+        }
+
+        graph, summary = await self.run_graph(agt)
+        executed = get_executed_nodes(summary)
+        bypassed = get_bypassed_nodes(summary)
+
+        assert "merge" in executed
+        assert "no" in bypassed
+        assert "merge" not in bypassed
+        assert graph.nodes["static_end"].inputs["handle_flow_input"] == "['selected']"
+        assert graph.nodes["end"].inputs["handle_flow_input"]
+        assert summary["executed_nodes"] == len(graph.nodes) - 1
+        assert summary["bypassed_nodes"] == 1
+        assert summary["failed_nodes"] == 0
+
+    @pytest.mark.asyncio
+    async def test_iteration_conditional_branches_can_converge_before_feedback(self):
+        agt = {
+            "type": "graph", "debug": True,
+            "nodes": [
+                {"id": "input", "type": "user_input"},
+                {"id": "items", "type": "text", "data": {"text": '["one"]'}},
+                {"id": "loop", "type": "loop", "data": {}},
+                {"id": "cond", "type": "conditional", "data": {
+                    "condition": "{{ 'yes' }}", "output_handles": ["yes", "no"],
+                }},
+                {"id": "yes", "type": "parser", "data": {"text": "selected"}},
+                {"id": "no", "type": "parser", "data": {"text": "wrong"}},
+                {"id": "merge", "type": "parser", "data": {
+                    "text": "{{ handle_parser_input_active }}",
+                }},
+                {"id": "end", "type": "end"},
+            ],
+            "edges": [
+                {"id": "i1", "source": "input", "target": "items",
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
+                {"id": "i2", "source": "items", "target": "loop",
+                 "sourceHandle": "handle_text_output", "targetHandle": "handle_list"},
+                {"id": "i3", "source": "loop", "target": "cond",
+                 "sourceHandle": "handle_item", "targetHandle": "handle_input"},
+                {"id": "i4", "source": "cond", "target": "yes",
+                 "sourceHandle": "yes", "targetHandle": "handle_parser_input"},
+                {"id": "i5", "source": "cond", "target": "no",
+                 "sourceHandle": "no", "targetHandle": "handle_parser_input"},
+                {"id": "i6", "source": "yes", "target": "merge",
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_parser_input_active"},
+                {"id": "i7", "source": "no", "target": "merge",
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_parser_input_inactive"},
+                {"id": "i8", "source": "merge", "target": "loop",
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_loop"},
+                {"id": "i9", "source": "loop", "target": "end",
+                 "sourceHandle": "handle_end", "targetHandle": "handle_flow_input"},
+            ],
+        }
+
+        graph, summary = await self.run_graph(agt)
+        assert "merge" in get_executed_nodes(summary)
+        assert "no" in get_bypassed_nodes(summary)
+        assert "merge" not in get_bypassed_nodes(summary)
+        assert graph.nodes["end"].inputs["handle_flow_input"] == ["selected"]
+
+    @pytest.mark.asyncio
+    async def test_post_loop_conditional_branches_can_converge(self):
+        agt = {
+            "type": "graph", "debug": True,
+            "nodes": [
+                {"id": "input", "type": "user_input"},
+                {"id": "items", "type": "text", "data": {"text": '["one"]'}},
+                {"id": "loop", "type": "loop", "data": {}},
+                {"id": "transform", "type": "parser", "data": {"text": "done"}},
+                {"id": "cond", "type": "conditional", "data": {
+                    "condition": "{{ 'yes' }}", "output_handles": ["yes", "no"],
+                }},
+                {"id": "yes", "type": "parser", "data": {"text": "selected"}},
+                {"id": "no", "type": "parser", "data": {"text": "wrong"}},
+                {"id": "merge", "type": "parser", "data": {
+                    "text": "{{ handle_parser_input_active }}",
+                }},
+                {"id": "end", "type": "end"},
+            ],
+            "edges": [
+                {"id": "p1", "source": "input", "target": "items",
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
+                {"id": "p2", "source": "items", "target": "loop",
+                 "sourceHandle": "handle_text_output", "targetHandle": "handle_list"},
+                {"id": "p3", "source": "loop", "target": "transform",
+                 "sourceHandle": "handle_item", "targetHandle": "handle_parser_input"},
+                {"id": "p4", "source": "transform", "target": "loop",
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_loop"},
+                {"id": "p5", "source": "loop", "target": "cond",
+                 "sourceHandle": "handle_end", "targetHandle": "handle_input"},
+                {"id": "p6", "source": "cond", "target": "yes",
+                 "sourceHandle": "yes", "targetHandle": "handle_parser_input"},
+                {"id": "p7", "source": "cond", "target": "no",
+                 "sourceHandle": "no", "targetHandle": "handle_parser_input"},
+                {"id": "p8", "source": "yes", "target": "merge",
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_parser_input_active"},
+                {"id": "p9", "source": "no", "target": "merge",
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_parser_input_inactive"},
+                {"id": "p10", "source": "merge", "target": "end",
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
+            ],
+        }
+
+        graph, summary = await self.run_graph(agt)
+        assert "merge" in get_executed_nodes(summary)
+        assert "no" in get_bypassed_nodes(summary)
+        assert "merge" not in get_bypassed_nodes(summary)
+        assert graph.nodes["end"].inputs["handle_flow_input"] == "selected"
+
+    @pytest.mark.asyncio
+    async def test_graph_end_counts_real_inline_failure(self):
+        from magic_agents.node_system.Node import Node
+
+        class FailingNode(Node):
+            async def process(self, chat_log):
+                raise RuntimeError("iteration failed")
+                yield  # pragma: no cover - keeps this an async generator
+
+        agt = {
+            "type": "graph", "debug": True,
+            "nodes": [
+                {"id": "input", "type": "user_input"},
+                {"id": "items", "type": "text", "data": {"text": '["one"]'}},
+                {"id": "loop", "type": "loop", "data": {}},
+                {"id": "fail", "type": "parser", "data": {"text": "unused"}},
+                {"id": "end", "type": "end"},
+            ],
+            "edges": [
+                {"id": "f1", "source": "input", "target": "items",
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
+                {"id": "f2", "source": "items", "target": "loop",
+                 "sourceHandle": "handle_text_output", "targetHandle": "handle_list"},
+                {"id": "f3", "source": "loop", "target": "fail",
+                 "sourceHandle": "handle_item", "targetHandle": "handle_parser_input"},
+                {"id": "f4", "source": "fail", "target": "loop",
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_loop"},
+                {"id": "f5", "source": "loop", "target": "end",
+                 "sourceHandle": "handle_end", "targetHandle": "handle_flow_input"},
+            ],
+        }
+        graph = build(agt, message="route")
+        graph.nodes["fail"] = FailingNode(node_id="fail", node_type="parser", debug=True)
+        capture = DebugCapture()
+        async for _item in run_agent(graph, debug_callback=capture):
+            pass
+
+        assert capture.summary["failed_nodes"] == 1
+        assert capture.summary["bypassed_nodes"] == 0
+        assert capture.summary["executed_nodes"] == len(graph.nodes) - 1
+        fail_info = next(
+            node for node in capture.summary["nodes"] if node["node_id"] == "fail"
+        )
+        assert "RuntimeError: iteration failed" in fail_info["error"]
 
 
 class TestLoopHelperFunctions:
@@ -1252,7 +1450,7 @@ class TestLoopHelperFunctions:
                           targetHandle=loop_node.INPUT_HANDLE_LOOP),
             EdgeNodeModel(id="e3", source="loop", target="end",
                           sourceHandle=loop_node.OUTPUT_HANDLE_END,
-                          targetHandle="h1"),
+                          targetHandle="handle_flow_input"),
         ]
 
         subgraph = find_iteration_subgraph("loop", nodes, edges)

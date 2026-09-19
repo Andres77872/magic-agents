@@ -12,16 +12,17 @@ Tests cover:
 - Slice 10: BYPASS_ALL from non-conditional node
 - Slice 11: Validation error blocking vs non-blocking
 
-All tests use mocked nodes — no API keys required.
+Tests use small deterministic Node subclasses and the real executor/dispatcher;
+no API keys are required.
 """
 
 import asyncio
 import pytest
 from typing import Any, Dict, List, Optional
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock, AsyncMock
 
 from magic_agents.execution.reactive_executor import execute_graph_reactive
-from magic_agents.execution.event_dispatcher import GraphEventDispatcher, NodeState
+from magic_agents.execution.event_dispatcher import NodeState
 from magic_agents.execution.input_tracker import NodeInputTracker, InputInfo
 from magic_agents.models.factory.AgentFlowModel import AgentFlowModel
 from magic_agents.models.factory.EdgeNodeModel import EdgeNodeModel
@@ -367,15 +368,9 @@ class TestErrorHandling:
         ]
 
         graph = _make_mock_graph(nodes, edges)
+        graph.timeout = 0.01
 
-        # Create a real dispatcher
-        dispatcher = GraphEventDispatcher(nodes, edges)
-        # Set a tiny timeout for the test
-        dispatcher.timeout = 0.01
-
-        # Patch the dispatcher creation to return our pre-configured one
-        with patch('magic_agents.execution.reactive_executor.GraphEventDispatcher', return_value=dispatcher):
-            results = await _collect_all(execute_graph_reactive(graph))
+        results = await _collect_all(execute_graph_reactive(graph))
 
         # Should have a debug event with timeout error
         debug_events = [

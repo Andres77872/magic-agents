@@ -20,7 +20,6 @@ Mirrors style and fixtures from `test/test_inner_node_integration.py`.
 """
 from __future__ import annotations
 
-import asyncio
 from typing import Any, List
 
 import pytest
@@ -28,11 +27,10 @@ import pytest
 from magic_agents import run_agent
 from magic_agents.agt_flow import build
 from magic_agents.execution.reactive_executor import execute_graph_reactive
-from magic_agents.hooks.flow_hooks import HookContext
-from magic_agents.hooks.hook_registry import HookRegistry
 from magic_agents.hooks.runtime_config import RuntimeConfig
 from magic_agents.models.model_agent_run_log import ModelAgentRunLog
 from magic_agents.node_system import NodeInner
+from tests.hooks.conftest import RecordingHook
 
 # Helpers copied verbatim from test/test_inner_node_integration.py — the test
 # directory is not a Python package so cross-file imports aren't available.
@@ -52,55 +50,6 @@ def extract_streamed_content(item):
     return ""
 
 
-def get_executed_nodes(debug_summary: dict) -> set:
-    """Extract set of executed node IDs from debug summary."""
-    executed = set()
-    if not debug_summary:
-        return executed
-    for node in debug_summary.get("nodes", []):
-        if node.get("was_executed"):
-            executed.add(node.get("node_id"))
-    return executed
-
-
-# ─── Recording hook (mirrors patterns from tests/integration/test_3_tier_hooks.py) ──
-
-class _RecordingHook:
-    """FlowHooks-protocol implementation that captures every invocation.
-
-    Intentionally not a pytest test class. Stateful: holds a per-instance list
-    of (hook_name, node_id, run_id, parent_run_id) tuples.
-    """
-
-    __test__ = False
-
-    def __init__(self, label: str = "rec"):
-        self.label = label
-        self.calls: List[dict] = []
-
-    async def on_graph_start(self, context: HookContext) -> None:
-        self.calls.append(self._snap("on_graph_start", context))
-
-    async def on_graph_end(self, context: HookContext) -> None:
-        self.calls.append(self._snap("on_graph_end", context))
-
-    async def on_node_start(self, context: HookContext) -> None:
-        self.calls.append(self._snap("on_node_start", context))
-
-    async def on_node_end(self, context: HookContext) -> None:
-        self.calls.append(self._snap("on_node_end", context))
-
-    @staticmethod
-    def _snap(name: str, ctx: HookContext) -> dict:
-        return {
-            "hook_name": name,
-            "node_id": ctx.node_id,
-            "run_id": ctx.run_id,
-            "parent_run_id": ctx.parent_run_id,
-            "execution_id": ctx.execution_id,
-        }
-
-
 # ─── Graph builders (kept tiny — we only care about lifecycle wiring) ─────────
 
 def _simple_inner_graph() -> dict:
@@ -115,9 +64,9 @@ def _simple_inner_graph() -> dict:
         ],
         "edges": [
             {"id": "ie1", "source": "inner_input", "target": "inner_text",
-             "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+             "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
             {"id": "ie2", "source": "inner_text", "target": "inner_end",
-             "sourceHandle": "handle_text_output", "targetHandle": "h1"},
+             "sourceHandle": "handle_text_output", "targetHandle": "handle_flow_input"},
         ],
     }
 
@@ -140,7 +89,7 @@ def _outer_graph_with_inner(inner_graph: dict, inner_id: str = "inner") -> dict:
             {"id": "e2", "source": inner_id, "target": "send",
              "sourceHandle": "handle_execution_content", "targetHandle": "handle_send_extra"},
             {"id": "e3", "source": "send", "target": "end",
-             "sourceHandle": "handle_message_output", "targetHandle": "h1"},
+             "sourceHandle": "handle_message_output", "targetHandle": "handle_flow_input"},
         ],
     }
 
@@ -252,7 +201,7 @@ class TestP0_2_HookPropagation:
     @pytest.mark.asyncio
     async def test_hooks_propagate_to_child_graph(self):
         """A parent-registered hook must observe child-graph node events."""
-        rec = _RecordingHook(label="parent")
+        rec = RecordingHook()
         RuntimeConfig.register_global_hook(rec)
         config = RuntimeConfig()
 
@@ -261,8 +210,8 @@ class TestP0_2_HookPropagation:
         async for _ in run_agent(graph, hooks=config):
             pass
 
-        node_starts = [c for c in rec.calls if c["hook_name"] == "on_node_start"]
-        observed_ids = {c["node_id"] for c in node_starts}
+        node_starts = rec.get_invocations("on_node_start")
+        observed_ids = {call["context"].node_id for call in node_starts}
 
         # Outer nodes
         assert "input" in observed_ids
@@ -278,8 +227,8 @@ class TestP0_2_HookPropagation:
     @pytest.mark.asyncio
     async def test_inner_graph_own_hooks_merged_with_parent(self):
         """Both parent hooks and inner_graph.hooks must observe child events."""
-        parent_hook = _RecordingHook(label="parent")
-        inner_hook = _RecordingHook(label="inner_graph")
+        parent_hook = RecordingHook()
+        inner_hook = RecordingHook()
 
         RuntimeConfig.register_global_hook(parent_hook)
         config = RuntimeConfig()
@@ -293,12 +242,12 @@ class TestP0_2_HookPropagation:
             pass
 
         parent_child_obs = {
-            c["node_id"] for c in parent_hook.calls
-            if c["hook_name"] == "on_node_start"
+            call["context"].node_id
+            for call in parent_hook.get_invocations("on_node_start")
         }
         inner_obs = {
-            c["node_id"] for c in inner_hook.calls
-            if c["hook_name"] == "on_node_start"
+            call["context"].node_id
+            for call in inner_hook.get_invocations("on_node_start")
         }
 
         # Parent hook sees outer + inner nodes
@@ -313,7 +262,7 @@ class TestP0_2_HookPropagation:
     @pytest.mark.asyncio
     async def test_parent_run_id_correlation_in_child_hook_context(self):
         """Child hook contexts must carry parent_run_id matching the outer run_id."""
-        rec = _RecordingHook(label="parent")
+        rec = RecordingHook()
         RuntimeConfig.register_global_hook(rec)
         config = RuntimeConfig()
 
@@ -340,19 +289,20 @@ class TestP0_2_HookPropagation:
         # OUTER_RUN_ID as its run_id (it has the child's run_id), but its
         # parent_run_id must equal OUTER_RUN_ID.
         child_starts = [
-            c for c in rec.calls
-            if c["hook_name"] == "on_node_start" and c["node_id"] in ("inner_input", "inner_text")
+            call["context"]
+            for call in rec.get_invocations("on_node_start")
+            if call["context"].node_id in ("inner_input", "inner_text")
         ]
         assert child_starts, "no child-node hook events were captured"
 
-        for c in child_starts:
-            assert c["parent_run_id"] == OUTER_RUN_ID, (
-                f"child hook for {c['node_id']} has parent_run_id={c['parent_run_id']!r}, "
+        for context in child_starts:
+            assert context.parent_run_id == OUTER_RUN_ID, (
+                f"child hook for {context.node_id} has parent_run_id={context.parent_run_id!r}, "
                 f"expected {OUTER_RUN_ID!r}"
             )
-            assert c["run_id"] != OUTER_RUN_ID, (
-                f"child hook for {c['node_id']} run_id collides with outer run_id "
-                f"({c['run_id']!r}); child must have its own run_id"
+            assert context.run_id != OUTER_RUN_ID, (
+                f"child hook for {context.node_id} run_id collides with outer run_id "
+                f"({context.run_id!r}); child must have its own run_id"
             )
 
     @pytest.mark.asyncio
@@ -392,15 +342,12 @@ class TestP0_2_HookPropagation:
         graph = build(_outer_graph_with_inner(_simple_inner_graph()), message="hi")
 
         content = []
-        debug_summary = None
         async for item in run_agent(graph):  # NO hooks kwarg, NO debug_callback
-            if item.get("type") == "debug_summary":
-                debug_summary = item.get("content", {})
             text = extract_streamed_content(item)
             if text:
                 content.append(text)
 
         assert "OUTER_OK" in "".join(content)
-        executed = get_executed_nodes(debug_summary)
-        assert "inner" in executed
-        assert "send" in executed
+        assert graph.nodes["inner"].outputs["handle_execution_content"]["content"] == "INNER"
+        assert graph.nodes["send"].response is not None
+        assert graph.nodes["end"].response is not None

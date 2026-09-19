@@ -7,6 +7,7 @@ protocol and that the protocol correctly identifies conditional-like nodes.
 
 import pytest
 
+from magic_agents.models.model_agent_run_log import ModelAgentRunLog
 from magic_agents.node_system import NodeConditional
 from magic_agents.execution.conditional_routing import ConditionalRouting
 
@@ -14,11 +15,9 @@ from magic_agents.execution.conditional_routing import ConditionalRouting
 class TestConditionalRoutingProtocol:
     """Test ConditionalRouting protocol conformance."""
 
-    def test_node_conditional_implements_protocol_after_execution(self):
+    @pytest.mark.asyncio
+    async def test_node_conditional_implements_protocol_after_execution(self):
         """NodeConditional implements ConditionalRouting after process() sets selected_handle."""
-        from unittest.mock import MagicMock
-        import asyncio
-
         cond = NodeConditional(
             node_id="cond-test",
             node_type="conditional",
@@ -30,13 +29,9 @@ class TestConditionalRoutingProtocol:
         assert not isinstance(cond, ConditionalRouting), \
             "Protocol check should fail before selected_handle is set"
 
-        # Execute the conditional
-        async def run():
-            chat_log = MagicMock()
-            async for _ in cond(chat_log):
-                pass
-
-        asyncio.get_event_loop().run_until_complete(run())
+        # Execute with the real runtime log; no event-loop or chat-log mock is needed.
+        async for _ in cond(ModelAgentRunLog()):
+            pass
 
         # After execution: selected_handle is set, protocol check passes
         assert isinstance(cond, ConditionalRouting), \

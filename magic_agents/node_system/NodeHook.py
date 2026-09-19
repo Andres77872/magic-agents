@@ -12,6 +12,7 @@ Phase 6.3: Hook function template compilation (Phase 1 safety: exec with
 constrained namespace, no sandboxing yet).
 """
 import asyncio
+import inspect
 import logging
 import re
 from datetime import datetime, UTC
@@ -206,7 +207,7 @@ class NodeHook(Node):
         Returns:
             Optional result dict from the function, or None.
         """
-        if asyncio.iscoroutinefunction(func):
+        if inspect.iscoroutinefunction(func):
             return await func(hook_context, chat_log)
         else:
             return await asyncio.to_thread(func, hook_context, chat_log)

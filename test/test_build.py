@@ -17,7 +17,7 @@ from unittest.mock import patch
 from magic_agents.agt_flow import build, validate_graph
 from magic_agents.models.factory.Nodes import ModelAgentFlowTypesModel
 from magic_agents.models.factory.AgentFlowModel import AgentFlowModel
-from magic_agents.node_system import NodeUserInput, NodeChat, NodeEND, NodeText, NodeInner
+from magic_agents.node_system import NodeUserInput, NodeChat, NodeEND, NodeVoid, NodeText, NodeInner
 from magic_agents.util.const import HANDLE_VOID
 
 
@@ -256,10 +256,10 @@ class TestBuildVoidSentinelNode:
         result = build(agt, message="hello", load_chat=None)
         # 2 user nodes + 1 void = 3
         assert len(result.nodes) == 3
-        # Find the void node (it's a NodeEND with no user-facing id)
+        # Find the dedicated silent void sink.
         void_nodes = [
             nid for nid, n in result.nodes.items()
-            if isinstance(n, NodeEND) and nid not in ("ui", "end")
+            if isinstance(n, NodeVoid)
         ]
         assert len(void_nodes) == 1
 
@@ -283,7 +283,7 @@ class TestBuildVoidSentinelNode:
         # Both END nodes should have auto-edges to void
         void_id = [
             nid for nid, n in result.nodes.items()
-            if isinstance(n, NodeEND) and nid not in ("ui", "end1", "end2")
+            if isinstance(n, NodeVoid)
         ][0]
         end_edges = [e for e in result.edges if e.source in ("end1", "end2")]
         void_edges = [e for e in end_edges if e.target == void_id]
@@ -303,7 +303,7 @@ class TestBuildVoidSentinelNode:
         # The edge without targetHandle should be routed to void
         void_id = [
             nid for nid, n in result.nodes.items()
-            if isinstance(n, NodeEND) and nid not in ("ui", "end")
+            if isinstance(n, NodeVoid)
         ][0]
         void_edge = [e for e in result.edges if e.target == void_id and e.source == "ui"]
         assert len(void_edge) == 1
@@ -556,16 +556,16 @@ class TestBuildValidationFailFast:
             "nodes": [
                 {"id": "input", "type": ModelAgentFlowTypesModel.USER_INPUT},
                 {"id": "node-a", "type": ModelAgentFlowTypesModel.TEXT,
-                 "data": {"text": "hello {{ handle_input }}"}},
+                 "data": {"text": "hello"}},
                 {"id": "end", "type": ModelAgentFlowTypesModel.END},
             ],
             "edges": [
                 {"id": "e0", "source": "input", "target": "node-a",
-                 "sourceHandle": "handle_user_message", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_user_message", "targetHandle": "handle_flow_input"},
                 {"id": "e-self", "source": "node-a", "target": "node-a",
-                 "sourceHandle": "handle_text_output", "targetHandle": "handle_input"},
+                 "sourceHandle": "handle_text_output", "targetHandle": "handle_flow_input"},
                 {"id": "e1", "source": "node-a", "target": "end",
-                 "sourceHandle": "handle_text_output", "targetHandle": "h1"},
+                 "sourceHandle": "handle_text_output", "targetHandle": "handle_flow_input"},
             ],
         }
         result = build(agt, message="test", load_chat=None)
@@ -584,10 +584,25 @@ class TestBuildValidationFailFast:
 
         # Running the agent should complete quickly (no hang from self-loop)
         events = []
+        debug_events = []
+
+        async def capture_debug(event):
+            debug_events.append(event)
+
         async with asyncio.timeout(10.0):
-            async for item in run_agent(result):
+            async for item in run_agent(result, debug_callback=capture_debug):
                 events.append(item)
 
-        # Should have completed without timeout
-        event_types = [e.get("type") for e in events]
-        assert "debug_summary" in event_types, "Should have completed with debug summary"
+        # Direct run_agent consumers receive typed observer events through the
+        # callback; the API transport is responsible for SSE normalization.
+        from magic_agents.debug.events import DebugEventType
+
+        assert any(e.event_type == DebugEventType.GRAPH_END for e in debug_events)
+        assert result.nodes["node-a"].inputs["handle_flow_input"] == "test"
+        assert result.nodes["node-a"].response == "hello"
+        assert result.nodes["end"].response is not None
+        assert not [
+            e for e in events
+            if e.get("type") == "debug"
+            and e.get("content", {}).get("error_type") == "TimeoutError"
+        ]

@@ -77,7 +77,7 @@ class TestAdvancedFlows:
                     "id": "send-to-llm",
                     "source": "send-msg",
                     "target": "llm-node",
-                    "sourceHandle": "handle_generated_end",
+                    "sourceHandle": "handle_message_output",
                     "targetHandle": "handle_user_message"
                 },
                 {
@@ -91,8 +91,8 @@ class TestAdvancedFlows:
                     "id": "llm-to-end",
                     "source": "llm-node",
                     "target": "end-node",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle-5"
+                    "sourceHandle": "handle_generated_content",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -160,6 +160,7 @@ class TestAdvancedFlows:
         assert len(response) > 0
     
     @pytest.mark.asyncio
+    @pytest.mark.timeout(5)
     async def test_deeply_nested_inner_flows(self):
         """Test deeply nested inner flows (3 levels)."""
         # Level 3 - innermost flow
@@ -178,8 +179,8 @@ class TestAdvancedFlows:
                     "id": "l3-parser-to-end",
                     "source": "l3-parser",
                     "target": "l3-end",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle-5"
+                    "sourceHandle": "handle_parser_output",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -224,8 +225,8 @@ class TestAdvancedFlows:
                     "id": "l2-parser-to-end",
                     "source": "l2-parser",
                     "target": "l2-end",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle-5"
+                    "sourceHandle": "handle_parser_output",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -277,8 +278,8 @@ class TestAdvancedFlows:
                     "id": "parser-to-end",
                     "source": "final-parser",
                     "target": "end-node",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle-5"
+                    "sourceHandle": "handle_parser_output",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -308,18 +309,37 @@ class TestAdvancedFlows:
         }
         
         graph = build(agt_data=agt, message='nested test', load_chat=self.load_chat)
-        response = ""
-        async for i in run_agent(graph=graph):
-            if isinstance(i, dict) and 'content' in i:
-                content = i['content']
-                if hasattr(content, 'choices') and content.choices and content.choices[0].delta.content:
-                    response += content.choices[0].delta.content
-        
-        print(f"\nDeeply Nested Response: {response}")
-        # Parser nodes produce content that flows through the graph;
-        # verify the nested structure executed without errors by checking
-        # that the graph was built and the response is a valid string.
-        assert isinstance(response, str)
+        assert not graph._validation_errors
+
+        events = []
+        async for event in run_agent(graph=graph):
+            events.append(event)
+
+        errors = [
+            event["content"]
+            for event in events
+            if event.get("type") == "debug"
+            and isinstance(event.get("content"), dict)
+            and (event["content"].get("error_type") or event["content"].get("error"))
+        ]
+        assert not errors
+
+        completed_subgraphs = {
+            event["content"].get("node_id")
+            for event in events
+            if event.get("type") == "debug"
+            and isinstance(event.get("content"), dict)
+            and event["content"].get("event_type") == "SUBGRAPH_END"
+            and event["content"].get("status") == "completed"
+        }
+        assert {"l2-inner", "inner-node"}.issubset(completed_subgraphs)
+
+        middle_graph = graph.nodes["inner-node"].inner_graph
+        level3_graph = middle_graph.nodes["l2-inner"].inner_graph
+        assert level3_graph.nodes["l3-parser"].response == "[L3: nested test]"
+        assert level3_graph.nodes["l3-end"].response is not None
+        assert middle_graph.nodes["l2-end"].response is not None
+        assert graph.nodes["end-node"].response is not None
     
     @pytest.mark.asyncio
     @pytest.mark.needs_api
@@ -376,8 +396,8 @@ class TestAdvancedFlows:
                     "id": "final-to-end",
                     "source": "final-parser",
                     "target": "end-node",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle-5"
+                    "sourceHandle": "handle_parser_output",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -494,7 +514,7 @@ Task {{ loop.index }}: {{ result | truncate(50) }}
                     "id": "fetch-to-parser",
                     "source": "fetch-node",
                     "target": "result-parser",
-                    "sourceHandle": "handle_response_json",
+                    "sourceHandle": "handle_fetch_output",
                     "targetHandle": "handle_parser_input"
                 },
                 {
@@ -530,8 +550,8 @@ Task {{ loop.index }}: {{ result | truncate(50) }}
                     "id": "aggregator-to-end",
                     "source": "aggregator-llm",
                     "target": "end-node",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle-5"
+                    "sourceHandle": "handle_generated_content",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -662,7 +682,7 @@ Task {{ loop.index }}: {{ result | truncate(50) }}
                     "id": "config-to-llm",
                     "source": "config-parser",
                     "target": "dynamic-llm",
-                    "sourceHandle": "handle_system",
+                    "sourceHandle": "handle_parser_output",
                     "targetHandle": "handle-system-context"
                 },
                 {
@@ -683,8 +703,8 @@ Task {{ loop.index }}: {{ result | truncate(50) }}
                     "id": "llm-to-end",
                     "source": "dynamic-llm",
                     "target": "end-node",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle-5"
+                    "sourceHandle": "handle_generated_content",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -774,8 +794,8 @@ Task {{ loop.index }}: {{ result | truncate(50) }}
                     "id": "user-images-to-parser",
                     "source": "user-input",
                     "target": "image-parser",
-                    "sourceHandle": "handle_images",
-                    "targetHandle": "handle_images"
+                    "sourceHandle": "handle_user_images",
+                    "targetHandle": "handle_parser_input_images"
                 },
                 {
                     "id": "parser-to-llm",
@@ -795,8 +815,8 @@ Task {{ loop.index }}: {{ result | truncate(50) }}
                     "id": "llm-to-end",
                     "source": "llm-node",
                     "target": "end-node",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle-5"
+                    "sourceHandle": "handle_generated_content",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -809,8 +829,8 @@ Task {{ loop.index }}: {{ result | truncate(50) }}
                     "type": "parser",
                     "data": {
                         "text": """User message: {{ handle_parser_input }}
-{% if handle_images %}
-Images provided: {{ handle_images | length }} image(s)
+{% if handle_parser_input_images %}
+Images provided: {{ handle_parser_input_images | length }} image(s)
 Please describe what you would see in these images based on the user's question.
 {% else %}
 No images provided.
@@ -918,8 +938,8 @@ No images provided.
                     "id": "llm-to-end",
                     "source": "llm-node",
                     "target": "end-node",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle-5"
+                    "sourceHandle": "handle_generated_content",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -1081,8 +1101,8 @@ Steps: {{ state.transformations | join(" → ") }}"""
                     "id": "final-to-end",
                     "source": "final-summarizer",
                     "target": "end-node",
-                    "sourceHandle": "handle_generated_end",
-                    "targetHandle": "handle-5"
+                    "sourceHandle": "handle_generated_content",
+                    "targetHandle": "handle_flow_input"
                 }
             ],
             "nodes": [
@@ -1212,4 +1232,4 @@ def run_advanced_tests():
 
 
 if __name__ == "__main__":
-    run_advanced_tests() 
+    run_advanced_tests()

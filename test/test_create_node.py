@@ -17,7 +17,7 @@ from pydantic import ValidationError
 from magic_agents.agt_flow import create_node
 from magic_agents.models.factory.Nodes import ModelAgentFlowTypesModel
 from magic_agents.node_system import (
-    NodeChat, NodeCodex, NodeLLM, NodeMemory, NodeEND, NodeText, NodeConstant, NodeUserInput,
+    NodeChat, NodeCodex, NodeLLM, NodeMemory, NodeEND, NodeVoid, NodeText, NodeConstant, NodeUserInput,
     NodeFetch, NodeClientLLM, NodeSendMessage, NodeParser,
     NodeLoop, NodeInner, NodeConditional,
 )
@@ -41,6 +41,7 @@ class TestCreateNodeAllTypes:
         (ModelAgentFlowTypesModel.LOOP, NodeLoop),
         (ModelAgentFlowTypesModel.INNER, NodeInner),
         (ModelAgentFlowTypesModel.END, NodeEND),
+        (ModelAgentFlowTypesModel.VOID, NodeVoid),
         (ModelAgentFlowTypesModel.CODEX, NodeCodex),
         (ModelAgentFlowTypesModel.MEMORY, NodeMemory),
     ])

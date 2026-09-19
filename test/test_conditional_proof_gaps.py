@@ -8,9 +8,8 @@ Tests for:
 - Issue proofs: default_handle fallback bug, topological sort ordering
 """
 
-import asyncio
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from magic_agents.execution.reactive_executor import (
     execute_graph_reactive,
@@ -36,15 +35,14 @@ async def _collect_all(async_gen):
 
 
 def _make_mock_graph(nodes_dict: dict, edges_list: list, debug: bool = True) -> AgentFlowModel:
-    graph = MagicMock(spec=AgentFlowModel)
-    graph.nodes = nodes_dict
-    graph.edges = edges_list
-    graph.debug = debug
-    graph.resolved_debug_config = None
+    """Build the real graph envelope around focused test nodes and edges."""
+    graph = AgentFlowModel(
+        type="graph",
+        nodes=nodes_dict,
+        edges=edges_list,
+        debug=debug,
+    )
     graph._validation_errors = []
-    graph.type = "graph"
-    graph.app_id = None
-    graph.id_app = None
     return graph
 
 
@@ -228,7 +226,6 @@ class TestCustomHandleOverrides:
         edges = [
             EdgeNodeModel(id="e1", source="input", target="cond", sourceHandle="output", targetHandle="my_custom_input"),
             EdgeNodeModel(id="e2", source="cond", target="node_a", sourceHandle="branch_a", targetHandle="input"),
-            EdgeNodeModel(id="e3", source="cond", target="node_a", sourceHandle="branch_b", targetHandle="input"),
             EdgeNodeModel(id="e4", source="node_a", target="end", sourceHandle="output", targetHandle="h1"),
         ]
 
@@ -334,11 +331,9 @@ class TestCaptureInternalState:
         # context_data may not be present if merge fails
         assert 'context_data' not in state or state.get('context_data') is None
 
-    def test_capture_internal_state_after_execution(self):
+    @pytest.mark.asyncio
+    async def test_capture_internal_state_after_execution(self):
         """_capture_internal_state() includes selected_handle after execution."""
-        from unittest.mock import MagicMock
-        import asyncio
-
         cond = NodeConditional(
             node_id="cond-test",
             node_type="conditional",
@@ -346,12 +341,9 @@ class TestCaptureInternalState:
         )
         cond.inputs = {"handle_input": '{"value": true}'}
 
-        async def run():
-            chat_log = MagicMock()
-            async for _ in cond(chat_log):
-                pass
-
-        asyncio.get_event_loop().run_until_complete(run())
+        chat_log = MagicMock()
+        async for _ in cond(chat_log):
+            pass
 
         state = cond._capture_internal_state()
 
@@ -513,11 +505,11 @@ class TestTopologicalSortConditionalEdges:
     conditional can bypass them.
     """
 
-    def test_topo_sort_does_not_include_conditional_branch_edges(self):
-        """topological_sort_iteration does NOT include conditional branch edges in in-degree.
-        
-        This means nodes that only receive input from the conditional have in_degree=0
-        and execute BEFORE the conditional, before bypass can happen.
+    def test_topo_sort_orders_conditional_before_branches_with_loop_edges(self):
+        """Conditional branch edges participate in iteration ordering.
+
+        The loop entry and feedback edges must not obscure the two internal
+        conditional dependencies: both branch parsers execute after ``cond``.
         """
         # Simulate iteration subgraph with conditional
         iteration_nodes = {"cond", "parser_yes", "parser_no"}
@@ -540,23 +532,10 @@ class TestTopologicalSortConditionalEdges:
 
         order = topological_sort_iteration(iteration_nodes, item_edges, loop_back_edges, all_edges)
 
-        # parser_yes and parser_no only have edges FROM cond, not TO cond.
-        # In the topological sort, they should come AFTER cond.
-        # But the sort only considers edges where BOTH source and target are in iteration_nodes.
-        # The conditional branch edges (e3, e4) ARE included via all_edges.
-        # Let's verify the actual order:
-        cond_idx = order.index("cond") if "cond" in order else -1
-        parser_yes_idx = order.index("parser_yes") if "parser_yes" in order else -1
-        parser_no_idx = order.index("parser_no") if "parser_no" in order else -1
-
-        # If topological sort works correctly, cond should come before both parsers
-        # (since parsers depend on cond via branch edges)
-        # But the current implementation may not include these edges properly.
-        # We characterize the actual behavior:
-        if cond_idx >= 0 and parser_yes_idx >= 0:
-            # If cond comes before parser_yes, the sort IS working
-            # If parser_yes comes before cond, the sort is NOT working
-            pass  # Characterization complete - order is: {order}
+        assert set(order) == iteration_nodes
+        cond_idx = order.index("cond")
+        assert cond_idx < order.index("parser_yes"), order
+        assert cond_idx < order.index("parser_no"), order
 
     def test_topo_sort_includes_conditional_branch_edges_via_all_edges(self):
         """Verify that all_edges parameter includes conditional branch edges in the sort."""
