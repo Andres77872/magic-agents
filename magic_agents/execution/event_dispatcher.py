@@ -261,12 +261,19 @@ class GraphEventDispatcher:
         tracker = self._trackers[target_node_id]
         node = self.nodes.get(target_node_id)
         
-        # Store in node's inputs dict
-        if node:
-            node.inputs[handle] = content
-        
-        # Notify tracker
+        # Record each edge before assembling variadic tool inputs. Assigning
+        # directly by handle would silently replace another tool on that slot.
         await tracker.receive_input(handle, content, edge_id=edge_id)
+        if node:
+            tool_prefix = getattr(node, 'INPUT_TOOL_PREFIX', '')
+            if getattr(node, 'node_type', None) == 'llm' and tool_prefix and handle.startswith(tool_prefix):
+                received = tracker.get_all_inputs_by_edge()
+                values = [received[edge.id] for edge in self._incoming.get(target_node_id, [])
+                          if edge.targetHandle == handle and edge.id in received]
+                if values:
+                    node.inputs[handle] = values[0] if len(values) == 1 else values
+            else:
+                node.inputs[handle] = content
     
     async def dispatch_bypass(self, target_node_id: str, handle: str = None):
         """
@@ -328,6 +335,8 @@ class GraphEventDispatcher:
             source_handle=edge.sourceHandle,
             target_handle=edge.targetHandle,
         )
+        if edge.hooks.timeout_override is not None:
+            hook_context.metadata['timeout_override'] = edge.hooks.timeout_override
         hook_node.inputs[hook_node.INPUT_HANDLE_HOOK_CONTEXT] = hook_context
 
         if notify_tracker:

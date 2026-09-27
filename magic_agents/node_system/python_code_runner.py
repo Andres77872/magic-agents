@@ -15,7 +15,10 @@ import asyncio
 import builtins
 import logging
 import multiprocessing
+import os
+import signal
 import time
+import threading
 from multiprocessing.connection import Connection
 from typing import Any, Callable
 
@@ -111,10 +114,16 @@ def _compile_run_function(code: str, namespace_builtins: Any) -> Callable:
     return run_func
 
 
-def _subprocess_entrypoint(connection: Connection, code: str, handler: dict) -> None:
+def _subprocess_entrypoint(connection: Connection, code: str, handler: dict, ready, proceed) -> None:
     """Execute a handler in a spawned child and return one tagged payload."""
 
     try:
+        if os.name == "posix":
+            os.setsid()
+        # The parent must know this group is owned before user code can spawn
+        # descendants. Cancellation before this handshake kills only the worker.
+        ready.set()
+        proceed.wait()
         run_func = _compile_run_function(code, builtins.__dict__)
         connection.send(("result", run_func(handler)))
     except BaseException as exc:  # The child must report failures, then exit.
@@ -192,24 +201,34 @@ class CodeRunner:
         return value
 
     @staticmethod
-    def _stop_process(process: multiprocessing.Process) -> None:
-        if not process.is_alive():
-            process.join(timeout=0.1)
+    def _stop_process(process: multiprocessing.Process, ready) -> None:
+        if process.pid is None:
             return
-        process.terminate()
+        try:
+            if os.name == "posix" and ready.is_set():
+                # Kill the owned group even when its leader already returned
+                # or crashed: descendants may still be running.
+                os.killpg(process.pid, signal.SIGKILL)
+            elif process.is_alive():
+                # Without the ready/proceed handshake, user code cannot have
+                # started. Do not signal the parent's inherited process group.
+                process.kill()
+        except ProcessLookupError:
+            pass
         process.join(timeout=0.5)
         if process.is_alive():
             process.kill()
             process.join(timeout=0.5)
 
-    def _execute_subprocess_sync(self, code: str, handler: dict) -> dict:
+    def _execute_subprocess_sync(self, code: str, handler: dict, cancelled: threading.Event | None = None) -> dict:
         """Run code in a spawned child, receiving or timing out synchronously."""
 
         context = multiprocessing.get_context("spawn")
         parent_connection, child_connection = context.Pipe(duplex=False)
+        ready, proceed = context.Event(), context.Event()
         process = context.Process(
             target=_subprocess_entrypoint,
-            args=(child_connection, code, handler),
+            args=(child_connection, code, handler, ready, proceed),
             name="magic-agents-python-exec",
         )
         try:
@@ -218,10 +237,14 @@ class CodeRunner:
             deadline = time.monotonic() + self._timeout
 
             while True:
+                if cancelled is not None and cancelled.is_set():
+                    return {"error": "execution cancelled"}
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    self._stop_process(process)
                     return {"error": f"execution timed out after {self._timeout} seconds"}
+
+                if ready.is_set():
+                    proceed.set()
 
                 if parent_connection.poll(min(remaining, 0.05)):
                     try:
@@ -229,8 +252,6 @@ class CodeRunner:
                     except EOFError:
                         kind, payload = "error", "Python worker exited without a result"
                     process.join(timeout=0.5)
-                    if process.is_alive():
-                        self._stop_process(process)
                     if kind == "result":
                         return {"result": self._truncate_result(payload)}
                     return {"error": str(payload)}
@@ -239,9 +260,11 @@ class CodeRunner:
                     process.join(timeout=0.1)
                     return {"error": "Python worker exited without a result"}
         except Exception as exc:
-            self._stop_process(process)
             return {"error": str(exc)}
         finally:
+            # Also clean up descendants after a successful return or a worker
+            # crash. Result delivery alone does not imply the group is empty.
+            self._stop_process(process, ready)
             parent_connection.close()
             child_connection.close()
 
@@ -272,7 +295,16 @@ class CodeRunner:
         """
         try:
             if self.safety_mode == "subprocess":
-                return await asyncio.to_thread(self._execute_subprocess_sync, code, handler)
+                cancelled = threading.Event()
+                worker = asyncio.create_task(asyncio.to_thread(self._execute_subprocess_sync, code, handler, cancelled))
+                try:
+                    return await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    # The worker terminates and joins its child before this
+                    # invocation is considered cancelled by the tool executor.
+                    await asyncio.shield(worker)
+                    raise
             return await self._execute_local(code, handler)
 
         except asyncio.TimeoutError:

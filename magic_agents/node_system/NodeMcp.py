@@ -71,9 +71,9 @@ class NodeMcp(Node):
         7. Cleanup session in finally
         
         Errors:
-        - Configuration errors: yield debug error, no bundle
-        - Protocol/transport errors: yield debug error, no bundle
-        - Tool discovery failure: yield debug error, no bundle
+        - Configuration, connection and discovery failures emit a diagnostic,
+          then raise so the executor marks failure and bypasses dependents.
+        - Cleanup runs before errors leave the node.
         """
         # Validate v1 constraint: exactly one server
         if len(self._config.servers) != 1:
@@ -90,7 +90,7 @@ class NodeMcp(Node):
                     "node_id": self.node_id
                 }
             )
-            return
+            raise ValueError("MCP node requires exactly 1 server in v1")
         
         server_config = self._config.servers[0]
         
@@ -183,6 +183,7 @@ class NodeMcp(Node):
                     "node_id": self.node_id
                 }
             )
+            raise
             
         except MCPTransportError as e:
             logger.error(
@@ -199,6 +200,7 @@ class NodeMcp(Node):
                     "node_id": self.node_id
                 }
             )
+            raise
             
         except Exception as e:
             logger.error(
@@ -215,6 +217,7 @@ class NodeMcp(Node):
                     "node_id": self.node_id
                 }
             )
+            raise
             
         finally:
             # Step 6: Cleanup session (guaranteed)

@@ -392,6 +392,12 @@ def validate_edge_target_handles(
         if getattr(target_node, 'accepts_dynamic_input_handles', False):
             continue
         
+        # A configured LLM tool prefix declares a family of variadic ports.
+        # Validate against this instance rather than only the canonical prefix.
+        tool_prefix = getattr(target_node, 'INPUT_TOOL_PREFIX', '')
+        if target_node_type == 'llm' and tool_prefix and target_handle.startswith(tool_prefix):
+            continue
+
         # Get input handles from the node instance (if available)
         instance_handles = get_node_input_handles_from_instance(target_node)
         
@@ -516,7 +522,7 @@ def validate_edge_fan_in_compatibility(
                 continue
             
             # Get cardinality info for this port
-            cardinality = get_port_cardinality(target_node_type, target_handle)
+            cardinality = get_port_cardinality(target_node_type, target_handle, target_node)
             
             # Case 1: Exclusive port with multiple edges
             if cardinality.exclusive and cardinality.cardinality == "one":

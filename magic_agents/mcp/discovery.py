@@ -3,6 +3,7 @@
 Handles paginated tools/list requests and tool caching.
 """
 import logging
+from pydantic import BaseModel
 from typing import Optional, Any
 
 from magic_agents.mcp.session import MCPSessionManager
@@ -133,6 +134,8 @@ class MCPToolDiscovery:
         
         Handles both SDK types and dict-like objects.
         """
+        if isinstance(result, BaseModel):
+            result = result.model_dump(by_alias=True)
         if hasattr(result, 'tools'):
             # SDK ListToolsResult type
             tools = result.tools
@@ -158,6 +161,8 @@ class MCPToolDiscovery:
     
     def _extract_cursor(self, result: Any) -> Optional[str]:
         """Extract nextCursor from MCP tools/list result."""
+        if isinstance(result, BaseModel):
+            result = result.model_dump(by_alias=True)
         if hasattr(result, 'nextCursor'):
             return result.nextCursor
         

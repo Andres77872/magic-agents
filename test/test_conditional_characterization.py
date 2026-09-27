@@ -381,15 +381,14 @@ class TestNodeConditionalProcessErrorPaths:
         async for item in cond(chat_log):
             results.append(item)
 
-        # Should yield debug_error and return (no BYPASS_ALL for init error)
+        # Configuration failures must also release downstream waiters.
         error_events = [r for r in results if r.get("type") == SYSTEM_EVENT_DEBUG]
         bypass_events = [r for r in results if r.get("type") == ConditionalSignalTypes.BYPASS_ALL]
 
         assert len(error_events) == 1
         assert error_events[0]["content"]["error_type"] == "ConfigurationError"
         assert "non-empty" in error_events[0]["content"]["error_message"]
-        # Init error does NOT yield BYPASS_ALL
-        assert len(bypass_events) == 0
+        assert len(bypass_events) == 1
 
     @pytest.mark.asyncio
     async def test_process_no_inputs_yields_error_and_bypass_all(self):

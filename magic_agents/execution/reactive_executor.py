@@ -246,6 +246,8 @@ def reset_iteration_nodes(nodes: Dict[str, Any], iteration_nodes: Set[str]) -> N
         if node:
             node._response = None
             node.outputs.clear()
+            if hasattr(node, 'selected_handle'):
+                node.selected_handle = None
             # Clear input from previous iteration loop feedback
             if hasattr(node, 'inputs'):
                 # Preserve non-loop inputs but allow them to be overwritten
@@ -620,7 +622,8 @@ async def execute_graph_reactive(
                     await output_queue.put({
                         "type": SYSTEM_EVENT_STREAMING,
                         "content": item["content"]["content"],
-                        "source_node": node_id
+                        "source_node": node_id,
+                        "source_node_path": item.get("source_node_path", [node_id]),
                     })
                 elif item_type == SYSTEM_EVENT_DEBUG:
                     # Queue debug info (legacy path — Node may still yield debug events
@@ -640,7 +643,9 @@ async def execute_graph_reactive(
                             conditional_selected_handle = item_type
             
             # Mark completed
-            dispatcher.set_state(node_id, NodeState.COMPLETED)
+            dispatcher.set_state(node_id, NodeState.ERROR if bypass_all_signaled else NodeState.COMPLETED)
+            if bypass_all_signaled:
+                _graph_has_errors = True
             logger.debug("Node %s completed", node_id)
             
             # Propagate outputs to downstream nodes
@@ -770,31 +775,39 @@ async def execute_graph_reactive(
     # Start task waiter
     waiter = asyncio.create_task(wait_for_tasks())
     
-    # Yield results as they arrive
-    while True:
-        try:
-            item = await asyncio.wait_for(output_queue.get(), timeout=1.0)
-            if item is None:
-                break
-            yield item
-        except asyncio.TimeoutError:
-            # Check if all done
-            if all_done.is_set():
-                # Drain remaining queue items
-                while not output_queue.empty():
-                    item = output_queue.get_nowait()
-                    if item is not None:
-                        yield item
-                break
-    
-    # Wait for waiter task
-    await waiter
-    
+    # Cancellation/closing the consumer must stop every owned node task.
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(output_queue.get(), timeout=1.0)
+                if item is None:
+                    break
+                yield item
+            except asyncio.TimeoutError:
+                # Check if all done
+                if all_done.is_set():
+                    # Drain remaining queue items
+                    while not output_queue.empty():
+                        item = output_queue.get_nowait()
+                        if item is not None:
+                            yield item
+                    break
+
+        # Wait for waiter task
+        await waiter
+
+    finally:
+        for task in [waiter, *tasks.values()]:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(waiter, *tasks.values(), return_exceptions=True)
+
     # === HOOK: on_graph_end / on_graph_error (AFTER all tasks complete, BEFORE return, Phase 4) ===
     # Spec requirement: on_graph_end fires for successful execution only.
     # on_graph_error fires when any node errored; on_graph_end is NOT invoked for failures.
     if _graph_hook_context is not None:
         _graph_hook_context.timestamp = datetime.now(UTC)
+        _graph_hook_context.duration_ms = (_graph_hook_context.timestamp - _exec_start_time).total_seconds() * 1000
         _summary = dispatcher.get_execution_summary()
         _graph_hook_context.metadata["execution_summary"] = _summary
         if _graph_has_errors:
@@ -1021,6 +1034,8 @@ async def execute_graph_loop_reactive(
     )
 
     failed_node_ids: Set[str] = set()
+    # Graph failure history is sticky; routing is based on this invocation only.
+    current_failed_node_ids: Set[str] = set()
 
     def mark_completed(node_id: str) -> None:
         """Record a unique graph node as successfully executed."""
@@ -1037,6 +1052,7 @@ async def execute_graph_loop_reactive(
 
     def mark_failed(node_id: str) -> None:
         failed_node_ids.add(node_id)
+        current_failed_node_ids.add(node_id)
         dispatcher.set_state(node_id, NodeState.ERROR)
 
     # ``NodeLoop`` is an executor-owned orchestration node: invoking its
@@ -1207,6 +1223,7 @@ async def execute_graph_loop_reactive(
             edges_to_process: List of edges to check for inputs. If None, uses all_edges.
         """
         node = nodes[node_id]
+        current_failed_node_ids.discard(node_id)
         
         # Use all edges for input resolution to handle cross-phase dependencies
         # (e.g., client nodes executed in static phase feeding LLM nodes executed post-loop)
@@ -1228,6 +1245,7 @@ async def execute_graph_loop_reactive(
             _node_obs = observer_registry.observer_for(node_id, node) if observer_registry.is_active else None
             if node_id not in failed_node_ids:
                 dispatcher.set_state(node_id, NodeState.EXECUTING)
+            bypass_all_signaled = False
             try:
                 async for item in node(chat_log, hooks=hooks, observer=_node_obs):
                     item_type = item.get("type", "")
@@ -1242,11 +1260,15 @@ async def execute_graph_loop_reactive(
                     if is_streaming:
                         yield {
                             "type": SYSTEM_EVENT_STREAMING,
-                            "content": item["content"]["content"]
+                            "content": item["content"]["content"],
+                            "source_node": node_id,
+                            "source_node_path": item.get("source_node_path", [node_id]),
                         }
                     elif item_type == SYSTEM_EVENT_DEBUG:
                         yield item
                     elif ConditionalSignalTypes.is_system_signal(item_type):
+                        if item_type == ConditionalSignalTypes.BYPASS_ALL:
+                            bypass_all_signaled = True
                         logger.debug("Loop node %s emitted system signal: %s", node_id, item_type)
                     else:
                         # All other outputs stored using their handle name
@@ -1265,6 +1287,19 @@ async def execute_graph_loop_reactive(
                     },
                 }
             else:
+                selected = getattr(node, 'selected_handle', None)
+                if selected and isinstance(node, ConditionalRouting) and not any(
+                    edge.source == node_id and edge.sourceHandle == selected for edge in all_edges
+                ):
+                    bypass_all_signaled = True
+                    yield node.yield_debug_error(
+                        error_type='GraphRoutingError',
+                        error_message=f"Conditional selected handle '{selected}', but no outgoing edge matches.",
+                    )
+                if bypass_all_signaled:
+                    node.outputs.clear()
+                    mark_failed(node_id)
+                    return
                 mark_completed(node_id)
 
                 async for hook_output in execute_traversed_edge_hooks(
@@ -1521,7 +1556,7 @@ async def execute_graph_loop_reactive(
         node_obj = nodes.get(node_id)
         if hasattr(node_obj, 'condition_template'):
             cond_node = node_obj
-            has_inputs = any(
+            has_inputs = cond_node.has_state_inputs() if hasattr(cond_node, 'has_state_inputs') else any(
                 cond_node.inputs.get(h) is not None
                 for h in cond_node.inputs.keys()
             )
@@ -1541,7 +1576,7 @@ async def execute_graph_loop_reactive(
         ):
             yield out
 
-        if dispatcher.get_state(node_id) == NodeState.ERROR:
+        if node_id in current_failed_node_ids:
             for edge in static_bypass_edges:
                 if edge.source == node_id:
                     _propagate_edge_bypass(
@@ -1818,7 +1853,7 @@ async def execute_graph_loop_reactive(
                 ):
                     yield out
 
-                if dispatcher.get_state(node_id) == NodeState.ERROR:
+                if node_id in current_failed_node_ids:
                     for edge in all_edges:
                         if edge.source == node_id:
                             _propagate_edge_bypass(
@@ -2052,7 +2087,7 @@ async def execute_graph_loop_reactive(
         ):
             yield out
 
-        if dispatcher.get_state(node_id) == NodeState.ERROR:
+        if node_id in current_failed_node_ids:
             for edge in all_edges:
                 if edge.source == node_id:
                     _propagate_edge_bypass(
@@ -2096,6 +2131,7 @@ async def execute_graph_loop_reactive(
     _summary = dispatcher.get_execution_summary()
     if _graph_hook_context is not None:
         _graph_hook_context.timestamp = datetime.now(UTC)
+        _graph_hook_context.duration_ms = (_graph_hook_context.timestamp - _exec_start_time).total_seconds() * 1000
         _graph_hook_context.metadata["execution_summary"] = _summary
         if _summary["errors"] > 0:
             _graph_hook_context.error_message = (

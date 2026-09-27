@@ -5,10 +5,67 @@ This model validates conditional node configuration at build time,
 including Jinja2 template syntax and output handle declarations.
 """
 
-from typing import Optional, Dict, List, Literal
+import json
+from typing import Annotated, Optional, Dict, List, Literal, Union
 
 import jinja2
-from pydantic import BaseModel, Field, field_validator, ConfigDict
+from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict, JsonValue
+
+
+Description = Union[str, Dict[str, JsonValue], List[JsonValue]]
+
+
+class QuestionBase(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    instructions: Description
+
+    @field_validator('instructions')
+    @classmethod
+    def validate_instructions(cls, value):
+        if not value or isinstance(value, str) and not value.strip():
+            raise ValueError('Question instructions cannot be empty')
+        json.dumps(value, allow_nan=False)
+        return value
+
+
+class ChoiceQuestion(QuestionBase):
+    type: Literal['choice']
+    criteria: Dict[str, Optional[Description]] = Field(min_length=2, max_length=255)
+
+    @field_validator('criteria')
+    @classmethod
+    def validate_criteria(cls, value):
+        if any(not label.strip() for label in value):
+            raise ValueError('Choice labels cannot be empty')
+        json.dumps(value, allow_nan=False)
+        return value
+
+
+class ScoreQuestion(QuestionBase):
+    type: Literal['score']
+    criteria: List[Description] = Field(min_length=2, max_length=10)
+
+    @field_validator('criteria')
+    @classmethod
+    def validate_criteria(cls, value):
+        json.dumps(value, allow_nan=False)
+        return value
+
+
+class NoulQuestion(QuestionBase):
+    type: Literal['noul']
+    criteria: Optional[Dict[Literal['true', 'false'], Description]] = None
+
+    @field_validator('criteria')
+    @classmethod
+    def validate_criteria(cls, value):
+        json.dumps(value, allow_nan=False)
+        return value
+
+
+ConditionalQuestion = Annotated[
+    Union[ChoiceQuestion, ScoreQuestion, NoulQuestion], Field(discriminator='type')
+]
 
 
 class ConditionalNodeModel(BaseModel):
@@ -34,6 +91,12 @@ class ConditionalNodeModel(BaseModel):
         }
     """
     model_config = ConfigDict(extra='forbid')  # Reject unknown fields - strict validation
+
+    evaluation_mode: Literal['jinja', 'llm'] = Field(
+        default='jinja', description='Exact deterministic routing, or typed LLM judgments followed by deterministic routing'
+    )
+    questions: Optional[Dict[str, ConditionalQuestion]] = Field(default=None, min_length=1)
+    evaluation_timeout: float = Field(default=30.0, gt=0, allow_inf_nan=False, strict=True)
     
     condition: str = Field(
         ...,
@@ -63,6 +126,26 @@ class ConditionalNodeModel(BaseModel):
                     "Must match one of the declared output_handles if specified."
     )
 
+    @field_validator('questions')
+    @classmethod
+    def validate_questions(cls, value):
+        if value is not None and any(not key.strip() for key in value):
+            raise ValueError('Question IDs cannot be empty')
+        return value
+
+    @model_validator(mode='after')
+    def validate_evaluation_configuration(self):
+        if self.questions is not None and 'evaluation_mode' not in self.model_fields_set:
+            raise ValueError('Specify evaluation_mode when configuring questions')
+        if self.evaluation_mode == 'llm':
+            if not self.questions:
+                raise ValueError('LLM evaluation requires at least one typed question')
+            if not self.output_handles:
+                raise ValueError('LLM evaluation requires declared output_handles')
+        if self.evaluation_mode == 'llm' and self.handles and self.handles.get('client_provider', self.handles.get('client', 'handle-client-provider')) == self.handles.get('input', self.handles.get('context', 'handle_input')):
+            raise ValueError('Client and state input handles must be different')
+        return self
+
     @field_validator('condition')
     @classmethod
     def validate_jinja2_syntax(cls, v: str) -> str:
@@ -78,9 +161,13 @@ class ConditionalNodeModel(BaseModel):
     def validate_output_handles(cls, v: Optional[List[str]]) -> Optional[List[str]]:
         """Ensure output handles are valid identifiers."""
         if v is not None:
+            if len(set(v)) != len(v):
+                raise ValueError('Output handle names must be unique')
             for handle in v:
-                if not handle:
+                if not handle or not handle.strip():
                     raise ValueError("Output handle name cannot be empty")
+                if handle in {'debug', 'debug_summary', 'content', 'end'}:
+                    raise ValueError(f"Output handle '{handle}' is reserved for runtime events")
                 if handle.startswith('__') and handle.endswith('__'):
                     raise ValueError(
                         f"Invalid output handle name: '{handle}'. "

@@ -2,11 +2,16 @@
 
 Defines how MCP nodes are declared in agent graph JSON.
 """
-import re
 from typing import Literal, Optional, Any
+from urllib.parse import urlparse
 from pydantic import BaseModel, Field, ConfigDict, model_validator, field_validator
 
 from magic_agents.models.factory.Nodes.BaseNodeModel import BaseNodeModel
+
+
+_STDIO_ONLY_FIELDS = ('command', 'args', 'env', 'cwd')
+_HTTP_ONLY_FIELDS = ('url', 'headers')
+_OPTIONAL_TEXT_FIELDS = ('url', 'cwd', 'prefix')
 
 
 class MCPServerConfig(BaseModel):
@@ -42,24 +47,39 @@ class MCPServerConfig(BaseModel):
     tool_allowlist: Optional[list[str]] = None  # Whitelist (None = all allowed)
     tool_denylist: Optional[list[str]] = None  # Blacklist
     
+    @model_validator(mode='before')
+    @classmethod
+    def drop_inactive_transport_fields(cls, data: Any) -> Any:
+        """Ignore settings that belong to the other transport, and blank strings.
+
+        Editors keep both transports' fields while authors switch between them;
+        a leftover ``url`` on a stdio server (or ``command`` on an HTTP one) must
+        not fail validation or change how the server is started.
+        """
+        if not isinstance(data, dict):
+            return data
+        cleaned = {key: value for key, value in data.items() if not (isinstance(value, str) and not value.strip() and key in _OPTIONAL_TEXT_FIELDS)}
+        transport = cleaned.get('transport', 'stdio')
+        inactive = _HTTP_ONLY_FIELDS if transport == 'stdio' else _STDIO_ONLY_FIELDS if transport == 'http' else ()
+        for key in inactive:
+            cleaned.pop(key, None)
+        return cleaned
+
     @field_validator('url')
     @classmethod
     def validate_url_format(cls, v: Optional[str]) -> Optional[str]:
-        """Validate that HTTP URLs are valid HTTP/HTTPS endpoints."""
+        """Accept any absolute http(s) URL with a host (service names, IPv6, long TLDs)."""
         if v is None:
             return v
-        # Must be http:// or https:// URL
-        url_pattern = re.compile(
-            r'^https?://'  # http:// or https://
-            r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,6}\.?|'  # domain
-            r'localhost|'  # localhost
-            r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # IP address
-            r'(?::\d+)?'  # optional port
-            r'(?:/?|[/?]\S+)$', re.IGNORECASE)
-        if not url_pattern.match(v):
+        parsed = urlparse(v.strip())
+        try:
+            parsed.port  # raises ValueError for an out-of-range or non-numeric port
+        except ValueError:
             raise ValueError(f"url must be a valid HTTP or HTTPS URL: '{v}'")
-        return v
-    
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname or any(ch.isspace() for ch in v.strip()):
+            raise ValueError(f"url must be a valid HTTP or HTTPS URL: '{v}'")
+        return v.strip()
+
     @model_validator(mode='after')
     def validate_transport_requirements(self):
         """Validate that required fields are present based on transport type."""

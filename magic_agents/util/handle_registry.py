@@ -157,6 +157,7 @@ CANONICAL_INPUT_HANDLES: Dict[str, Set[str]] = {
     },
     ModelAgentFlowTypesModel.CONDITIONAL: {
         'handle_input',  # Primary context input for evaluation
+        'handle-client-provider',  # LLM judgment client; never part of state
     },
     ModelAgentFlowTypesModel.INNER: {
         'handle_user_message',  # Primary input for inner graph
@@ -225,6 +226,7 @@ PORT_CARDINALITY: Dict[str, Dict[str, CardinalityInfo]] = {
     # Conditional: primary context input; additional custom merge handles are runtime-supported.
     ModelAgentFlowTypesModel.CONDITIONAL: {
         'handle_input': CardinalityInfo(cardinality="many", exclusive=False, multi_compatible=True, merge_policy="merge"),
+        'handle-client-provider': CardinalityInfo(cardinality="one", exclusive=True),
     },
     # Loop: list input plus many-compatible feedback aggregation input
     ModelAgentFlowTypesModel.LOOP: {
@@ -285,7 +287,7 @@ PORT_CARDINALITY: Dict[str, Dict[str, CardinalityInfo]] = {
 }
 
 
-def get_port_cardinality(node_type: str, handle: str) -> CardinalityInfo:
+def get_port_cardinality(node_type: str, handle: str, node_instance=None) -> CardinalityInfo:
     """
     Get cardinality metadata for a port.
     
@@ -299,6 +301,10 @@ def get_port_cardinality(node_type: str, handle: str) -> CardinalityInfo:
         CardinalityInfo for the port, or default ambiguous if not declared
     """
     node_cardinality = PORT_CARDINALITY.get(node_type, {})
+    if node_type == ModelAgentFlowTypesModel.LLM and node_instance is not None:
+        tool_prefix = getattr(node_instance, 'INPUT_TOOL_PREFIX', '')
+        if tool_prefix and handle.startswith(tool_prefix):
+            return node_cardinality['handle-tool-definition']
     if handle in node_cardinality:
         return node_cardinality[handle]
     # Check for dynamic pattern match (handle-tool-definition-0 matches handle-tool-definition)

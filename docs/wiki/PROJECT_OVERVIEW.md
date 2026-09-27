@@ -24,7 +24,7 @@ The runtime is **reactive**, not a simple linear runner:
 At build time the library:
 
 1. normalizes graph input
-2. resolves `{{env.NAME}}` placeholders
+2. resolves `{{env.NAME}}` placeholders in MCP connection settings (`client` and `fetch` resolve their own credential fields)
 3. validates basic graph shape
 4. auto-assigns tool handles for tool-capable nodes targeting LLM nodes
 5. sorts nodes/edges for stable processing

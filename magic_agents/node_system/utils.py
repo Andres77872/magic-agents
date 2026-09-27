@@ -301,7 +301,7 @@ def apply_windowing(
         max_messages = None
 
     # Work on a copy — never mutate the input (W9)
-    working = list(messages)
+    working = [dict(message) for message in messages]
 
     # --- Step 1: Extract & preserve system messages --------------------
     system_msgs = [m for m in working if m.get("role") == "system"]
@@ -361,5 +361,10 @@ def apply_windowing(
             total = estimate_tokens(system_msgs + truncatable + last_user)
 
     # --- Step 6: Re-assemble and return --------------------------------
-    preserved = list(system_msgs) + truncatable + list(last_user)
+    # Keeping the last user does not make it the newest message: a replay can
+    # legitimately end with its assistant/tool exchange. Preserve chronology.
+    retained = {id(message) for message in truncatable + last_user}
+    preserved = list(system_msgs) + [message for message in non_system if id(message) in retained]
+    for message in preserved:
+        message.pop("_chain_group_id", None)
     return preserved

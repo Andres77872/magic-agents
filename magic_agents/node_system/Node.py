@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import abc
+from contextlib import aclosing
 import logging
 from typing import Any, Dict, Optional, AsyncGenerator, TYPE_CHECKING
 from datetime import datetime, UTC
@@ -262,10 +263,13 @@ class Node(abc.ABC):
             self._start_debug_tracking()
 
         error_msg = None
+        completed = False
         try:
             # Execute subclass-specific logic.
-            async for result in self.process(chat_log):
-                yield result
+            async with aclosing(self.process(chat_log)) as source:
+                async for result in source:
+                    yield result
+            completed = True
         except Exception as e:
             error_msg = str(e)
             if self.debug:
@@ -309,7 +313,7 @@ class Node(abc.ABC):
             raise
         finally:
             # End legacy debug tracking if not already done (normal execution path)
-            if error_msg is None:
+            if completed and error_msg is None:
                 _node_end_time = datetime.now(UTC)
                 _duration_ms = (_node_end_time - _node_start_time).total_seconds() * 1000
 

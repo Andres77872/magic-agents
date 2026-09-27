@@ -581,7 +581,10 @@ class HookRelay(AgentHooks):
             error_message=f"Budget exceeded ({budget_type}): {details}",
             inputs={"budget_type": budget_type, "details": details},
         )
-        self._safe_invoke_sync("on_node_error", context, {"error": None})
+        error = RuntimeError(context.error_message)
+        context.error = error
+        context.error_type = type(error).__name__
+        self._safe_invoke_sync("on_node_error", context, {"error": error})
 
     # === Async Bridge: Pending Futures ===
 

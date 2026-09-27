@@ -38,6 +38,9 @@ class NodeInner(Node):
     def __init__(self, data: InnerNodeModel, load_chat: Callable, handles: Optional[dict] = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.magic_flow = data.magic_flow
+        self._tool_data = data
+        self.tool_mode = data.tool_mode
+        self._tool_graph_factory = None
         self._load_chat = load_chat
         self.parent_state_mapping = data.parent_state_mapping  # Static key-path mapping for selective parent state exposure
         self.inner_graph: 'AgentFlowModel' = None  # Will be set by build()
@@ -47,8 +50,13 @@ class NodeInner(Node):
         self.HANDLER_EXECUTION_CONTENT = handles.get('output_content', handles.get('content', self.DEFAULT_OUTPUT_CONTENT))
         self.HANDLER_EXECUTION_EXTRAS = handles.get('output_extras', handles.get('extras', self.DEFAULT_OUTPUT_EXTRAS))
         self.HANDLER_CLIENT_EXTRAS = handles.get('client_extras', self.DEFAULT_INPUT_CLIENT_EXTRAS)
+        self.OUTPUT_HANDLE_TOOL = handles.get('tool', 'handle-tool-definition')
 
     async def process(self, chat_log):
+        if self.tool_mode:
+            from magic_agents.node_system.authored_tools import GraphTool
+            yield self.yield_static(GraphTool(self, chat_log), content_type=self.OUTPUT_HANDLE_TOOL)
+            return
         input_message = self.inputs.get(self.INPUT_HANDLE)
         if input_message is None:
             yield self.yield_debug_error(
@@ -98,6 +106,21 @@ class NodeInner(Node):
         # Prepare child extras by merging client extras and parent state
         child_extras = self._prepare_child_extras(client_extras, parent_state)
         
+        # A child graph is a fresh invocation, even when this INNER node is
+        # reused by a parent loop. Preserve configured services/history, but
+        # discard cached outputs and routed inputs from the previous invocation.
+        # Descendant INNER nodes reset their own children when they execute.
+        for child_node in self.inner_graph.nodes.values():
+            child_node._response = None
+            child_node.inputs.clear()
+            child_node.outputs.clear()
+            if hasattr(child_node, 'generated'):
+                child_node.generated = ''
+            if hasattr(child_node, 'selected_handle'):
+                child_node.selected_handle = None
+            if child_node.debug:
+                child_node._init_debug_info()
+
         # Update input nodes in the inner graph with the current message
         from magic_agents.models.factory.Nodes import ModelAgentFlowTypesModel
         for node_id, node in self.inner_graph.nodes.items():
@@ -105,6 +128,7 @@ class NodeInner(Node):
             if node_type in [ModelAgentFlowTypesModel.USER_INPUT, ModelAgentFlowTypesModel.CHAT]:
                 if node_type == ModelAgentFlowTypesModel.USER_INPUT:
                     node._text = input_message  # Update the internal text directly
+                    node._extras = child_extras
                 elif node_type == ModelAgentFlowTypesModel.CHAT:
                     node.message = input_message
         
@@ -203,10 +227,14 @@ class NodeInner(Node):
             if hasattr(event, 'choices') and event.choices:
                 # It's a ChatCompletionModel
                 event_content = event
+                # Preserve the child origin through arbitrary nesting. Consumers
+                # can distinguish terminal output from internal child steps.
+                forwarded = self.yield_static(event_content, content_type=self.OUTPUT_HANDLE_CONTENT)
+                child_path = evt.get('source_node_path') or [evt.get('source_node')]
+                forwarded['source_node_path'] = [self.node_id, *child_path]
+                # Usage-only terminal chunks are part of the stream contract too.
+                yield forwarded
                 if event_content.choices[0].delta.content:
-                    # Forward streaming chunk to parent executor in real-time (follows NodeLLM pattern)
-                    yield self.yield_static(event_content, content_type=self.OUTPUT_HANDLE_CONTENT)
-                    # Still collect for final output
                     content += event_content.choices[0].delta.content
                 if hasattr(event_content, 'extras') and event_content.extras:
                     extras.append(event_content.extras)

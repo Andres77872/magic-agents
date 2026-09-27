@@ -44,7 +44,11 @@ flowchart TD
 
 ### 2. Environment placeholder resolution
 
-Only `{{env.VAR_NAME}}` is resolved at build time by `resolve_env_placeholders()`.
+`{{env.VAR_NAME}}` is resolved only in connection settings: `client` credentials
+(`api_info`, `extra_data`), `fetch` requests (URL, headers, params, body) and `mcp`
+server settings (`command`, `args`, `env`, `cwd`, `url`, `headers`). Anywhere else
+(text, prompts, templates, constants) it is kept as literal text, so a graph author
+cannot read the server's environment through a node's output.
 
 Other Jinja-like placeholders such as `{{ handle_user_message }}` are preserved for runtime templating.
 

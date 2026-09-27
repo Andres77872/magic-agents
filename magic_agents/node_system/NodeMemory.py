@@ -54,6 +54,10 @@ class NodeMemory(Node):
         self._vector_db = kwargs.pop('vector_db', None)
         self._embedding_client = kwargs.pop('embedding_client', None)
         self._client = kwargs.pop('client', None)
+        self._client_wrapper = kwargs.pop('client_wrapper', None)
+        # A graph-local node ID may repeat inside sibling INNER graphs.
+        # Keep graph routing IDs unchanged while isolating persistent memory.
+        self._scope_node_id = kwargs.pop('scope_node_id', node_id)
         if self._vector_db is None:
             from magic_agents.vector_storage import InMemoryVectorDB
 
@@ -124,6 +128,9 @@ class NodeMemory(Node):
                 self.node_id, exc,
             )
 
+        if client is not None and callable(self._client_wrapper):
+            client = self._client_wrapper(client)
+
         # =====================================================================
         # FIRE-AND-FORGET: Background extraction + upsert (Phases 2-3)
         # =====================================================================
@@ -164,7 +171,7 @@ class NodeMemory(Node):
                             top_k=self._top_k,
                             filter_scope={
                                 "session_id": str(chat_log.id_chat) if chat_log.id_chat is not None else "",
-                                "node_id": self.node_id or "",
+                                "node_id": self._scope_node_id or "",
                             },
                         )
                     else:
@@ -296,7 +303,7 @@ class NodeMemory(Node):
                                 "trigger": entry.trigger,
                                 "created_at": entry.created_at.isoformat(),
                                 "session_id": str(chat_log.id_chat) if chat_log.id_chat is not None else "",
-                                "node_id": self.node_id or "",
+                                "node_id": self._scope_node_id or "",
                             },
                         )
                 except Exception as exc:

@@ -83,7 +83,7 @@ class NodeUserInput(Node):
             logger.debug("NodeUserInput:%s setting thread_id=%s", self.node_id, chat_log.id_thread)
         
         logger.info("NodeUserInput:%s processing user input (text_len=%d, files=%d, images=%d, session=%s)", 
-                   self.node_id, len(self._text) if self._text else 0, 
+                   self.node_id, len(str(self._text)) if self._text is not None else 0,
                    len(self.files) if self.files else 0, 
                    len(self.images) if self.images else 0,
                    chat_log.id_chat)

@@ -184,6 +184,79 @@ class TestBuildNestedContentNormalization:
         assert text_node._text == "Hello {{ handle_parser_input }}"
 
 
+    def test_build_never_resolves_env_placeholders_outside_connection_settings(self, monkeypatch):
+        """Text, prompts and constants must not expose the server environment."""
+        monkeypatch.setenv("SECRET_FOR_TEST", "server-secret")
+
+        agt = {
+            "type": "graph",
+            "nodes": [
+                {"id": "ui", "type": ModelAgentFlowTypesModel.USER_INPUT},
+                {"id": "txt", "type": ModelAgentFlowTypesModel.TEXT, "data": {"text": "{{env.SECRET_FOR_TEST}}"}},
+                {
+                    "id": "const",
+                    "type": ModelAgentFlowTypesModel.CONSTANT,
+                    "data": {"value": "{{env.SECRET_FOR_TEST}}", "value_type": "str"},
+                },
+                {"id": "end", "type": ModelAgentFlowTypesModel.END},
+            ],
+            "edges": [
+                {"id": "e1", "source": "ui", "target": "txt"},
+                {"id": "e2", "source": "txt", "target": "end"},
+            ],
+        }
+
+        result = build(agt, message="hello", load_chat=None)
+
+        assert result.nodes["txt"]._text == "{{env.SECRET_FOR_TEST}}"
+        assert "server-secret" not in repr(vars(result.nodes["const"]))
+
+    def test_build_resolves_env_placeholders_in_mcp_connection_settings(self, monkeypatch):
+        """MCP server URLs and headers may reference platform secrets."""
+        monkeypatch.setenv("MCP_TOKEN_FOR_TEST", "mcp-token")
+        agt = {
+            "type": "graph",
+            "nodes": [
+                {"id": "ui", "type": ModelAgentFlowTypesModel.USER_INPUT},
+                {
+                    "id": "mcp",
+                    "type": ModelAgentFlowTypesModel.MCP,
+                    "data": {"servers": [{
+                        "transport": "http",
+                        "url": "https://mcp.example.com/mcp",
+                        "headers": {"Authorization": "Bearer {{env.MCP_TOKEN_FOR_TEST}}"},
+                    }]},
+                },
+                {"id": "end", "type": ModelAgentFlowTypesModel.END},
+            ],
+            "edges": [{"id": "e1", "source": "ui", "target": "end"}],
+        }
+
+        result = build(agt, message="hello", load_chat=None)
+
+        server = result.nodes["mcp"]._config.servers[0]
+        assert server.headers == {"Authorization": "Bearer mcp-token"}
+        # The caller's graph definition is left untouched.
+        assert agt["nodes"][1]["data"]["servers"][0]["headers"]["Authorization"] == "Bearer {{env.MCP_TOKEN_FOR_TEST}}"
+
+
+    def test_build_wires_a_renamed_end_output_to_the_sink(self):
+        """END emits on its configured output; the automatic sink edge must use it."""
+        agt = {
+            "type": "graph",
+            "nodes": [
+                {"id": "ui", "type": ModelAgentFlowTypesModel.USER_INPUT},
+                {"id": "end", "type": ModelAgentFlowTypesModel.END, "data": {"handles": {"output": "done"}}},
+            ],
+            "edges": [{"id": "e1", "source": "ui", "target": "end"}],
+        }
+
+        result = build(agt, message="hello", load_chat=None)
+
+        sink_edges = [edge for edge in result.edges if edge.source == "end"]
+        assert [edge.sourceHandle for edge in sink_edges] == ["done"]
+
+
 class TestBuildMessageInjection:
     """Test build() injects message into appropriate nodes."""
 

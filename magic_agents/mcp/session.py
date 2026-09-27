@@ -5,13 +5,14 @@ Encapsulates mcp SDK to prevent dependency leakage.
 """
 import asyncio
 import logging
+import inspect
+from pydantic import BaseModel
 from typing import Optional, Any
 from contextlib import asynccontextmanager
 
 # MCP SDK imports isolated here
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
-from mcp.client.streamable_http import streamablehttp_client
 
 from magic_agents.models.factory.Nodes.McpNodeModel import MCPServerConfig
 from magic_agents.mcp.errors import MCPProtocolError, MCPTransportError
@@ -20,6 +21,28 @@ logger = logging.getLogger(__name__)
 
 # MCP protocol version we support
 MCP_PROTOCOL_VERSION = "2025-03-26"
+
+
+@asynccontextmanager
+async def streamablehttp_client(url: str, headers: Optional[dict[str, str]] = None):
+    """Adapt MCP SDK HTTP naming/header changes without affecting stdio imports.
+
+    The SDK's current API takes an HTTP client rather than a headers keyword.
+    Its factory supplies the matching HTTP implementation and timeout defaults.
+    Older SDKs expose only the legacy streamablehttp_client helper.
+    """
+    from mcp.client import streamable_http
+
+    modern_client = getattr(streamable_http, 'streamable_http_client', None)
+    if modern_client is None:
+        async with streamable_http.streamablehttp_client(url, headers=headers) as streams:
+            yield streams
+        return
+
+    from mcp.shared._httpx_utils import create_mcp_http_client
+    async with create_mcp_http_client(headers=headers) as http_client:
+        async with modern_client(url, http_client=http_client) as streams:
+            yield streams
 
 
 class MCPSessionManager:
@@ -225,10 +248,19 @@ class MCPSessionManager:
         )
         
         # Extract server info, capabilities, and instructions
-        self._server_info = init_result.serverInfo if hasattr(init_result, 'serverInfo') else {}
-        self._capabilities = init_result.capabilities if hasattr(init_result, 'capabilities') else {}
-        self._protocol_version = init_result.protocolVersion if hasattr(init_result, 'protocolVersion') else MCP_PROTOCOL_VERSION
-        self._server_instructions = getattr(init_result, 'instructions', None)
+        # SDK 1.x/2.x Pydantic models expose different Python attribute names;
+        # protocol aliases remain stable on the wire.
+        if isinstance(init_result, BaseModel):
+            init_data = init_result.model_dump(by_alias=True)
+        elif isinstance(init_result, dict):
+            init_data = init_result
+        else:
+            init_data = {key: getattr(init_result, key, None) for key in
+                         ('serverInfo', 'capabilities', 'protocolVersion', 'instructions')}
+        self._server_info = init_data.get('serverInfo') or {}
+        self._capabilities = init_data.get('capabilities') or {}
+        self._protocol_version = init_data.get('protocolVersion') or MCP_PROTOCOL_VERSION
+        self._server_instructions = init_data.get('instructions')
         if self._server_instructions:
             logger.debug(
                 "MCPSessionManager:%s server provides instructions (%d chars)",
@@ -341,9 +373,16 @@ class MCPSessionManager:
             )
         
         try:
-            # SDK handles pagination internally if we pass cursor
+            # SDK 2.x replaced cursor= with PaginatedRequestParams. Detect the
+            # signature before calling so TypeError from a request is not retried.
+            parameters = inspect.signature(self._session.list_tools).parameters
+            if 'params' in parameters and 'cursor' not in parameters:
+                from mcp.types import PaginatedRequestParams
+                request = self._session.list_tools(params=PaginatedRequestParams(cursor=cursor) if cursor else None)
+            else:
+                request = self._session.list_tools(cursor=cursor)
             result = await asyncio.wait_for(
-                self._session.list_tools(cursor=cursor),
+                request,
                 timeout=self._config.discovery_timeout
             )
             return result

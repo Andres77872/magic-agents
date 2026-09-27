@@ -1,10 +1,12 @@
 import asyncio
+from contextlib import aclosing
 import json
 import re
 import uuid
 import logging
 from typing import Any, Optional, TYPE_CHECKING
 
+from magic_agents.util.llm_usage import usage_detail_outputs
 from magic_llm import MagicLLM
 from magic_llm.model import ModelChat
 from magic_llm.model.ModelChatStream import ChatCompletionModel, ChoiceModel, DeltaModel
@@ -84,6 +86,7 @@ class NodeLLM(Node):
         self._default_top_p = data.top_p
         self._default_max_tokens = data.max_tokens
         self._base_extra_data = dict(data.extra_data or {})
+        self._agent_config = data.agent_config
         # Backend-injected history_messages for no-CHAT graph path
         # (playground inline graphs without CHAT nodes)
         self._history_messages = data.history_messages or []
@@ -129,6 +132,74 @@ class NodeLLM(Node):
 
         return extra_data
 
+    def _agent_loop_options(self, chat: Optional[ModelChat] = None) -> dict:
+        """Build execution objects from JSON without leaking limits to providers."""
+        options = dict(self.extra_data)
+        if chat is not None and chat.messages and chat.messages[-1].get('role') == 'tool':
+            # Continue the existing assistant/tool exchange without moving the
+            # earlier user turn after its result. The system prompt (including
+            # manifest) is supplied separately by the caller.
+            from copy import deepcopy
+            initial_chat = ModelChat()
+            initial_chat.messages = deepcopy([m for m in chat.messages if m.get('role') != 'system'])
+            options['initial_chat'] = initial_chat
+        if self._agent_config is not None:
+            from magic_llm.agent.types import AgentBudget
+
+            config = self._agent_config
+            options.update(
+                budget=AgentBudget(
+                    max_iterations=config.max_iterations,
+                    wall_clock_timeout=config.wall_clock_timeout,
+                ),
+                deduplicate=config.deduplicate,
+                tool_executor_options={
+                    'per_tool_timeout': config.per_tool_timeout,
+                    'max_parallel_tools': config.max_parallel_tools,
+                    'max_content_size': config.max_output_chars,
+                    'enable_dedup': config.deduplicate,
+                },
+            )
+            # These legacy extra_data keys must not override the explicit
+            # configuration or accidentally become provider request parameters.
+            for key in ('max_iterations', 'wall_clock_timeout', 'per_tool_timeout',
+                        'max_parallel_tools', 'max_output_chars'):
+                options.pop(key, None)
+        return options
+
+    def _drain_tool_call_events(self, relay):
+        """Persist already-started/completed calls, including a failed loop."""
+        for event in relay.get_collected_tool_data_for_yield():
+            yield {
+                'type': 'debug',
+                'content': {
+                    'event_type': 'TOOL_CALL' if event['type'] == 'tool_call' else 'TOOL_RESULT',
+                    'node_id': self.node_id,
+                    'data': event['data'],
+                },
+            }
+
+    def _drain_tool_events(self, functions: dict):
+        """Forward accounting from buffered tools without publishing child text."""
+        seen = set()
+        for function in functions.values():
+            if id(function) in seen:
+                continue
+            seen.add(id(function))
+            drain = getattr(function, 'drain_events', None)
+            if not callable(drain):
+                continue
+            for event in drain() or []:
+                if isinstance(event, dict) and event.get('type') == 'tool_usage':
+                    yield {
+                        'type': 'debug',
+                        'content': {
+                            'event_type': 'TOOL_USAGE',
+                            'node_id': self.node_id,
+                            'data': event,
+                        },
+                    }
+
     async def _collect_tools(self) -> tuple[list, dict, dict[str, str]]:
         """Collect all tool definitions from tool-prefixed input handles.
 
@@ -155,114 +226,95 @@ class NodeLLM(Node):
         tools_schemas = []
         tool_functions = {}
         mcp_instructions: dict[str, str] = {}
-        seen_tool_names: dict[str, str] = {}
+        seen: dict[str, tuple[Any, str]] = {}
         schema_only_names: set[str] = set()
         callable_names: set[str] = set()
 
-        def schema_name(schema: Any) -> str | None:
-            if isinstance(schema, dict):
-                function = schema.get("function")
-                if isinstance(function, dict):
-                    name = function.get("name")
-                    if isinstance(name, str) and name:
-                        return name
-            return None
+        def register(name: str | None, identity: Any, source: str) -> bool:
+            if not isinstance(name, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", name):
+                raise ValueError(f"NodeLLM:{self.node_id} invalid tool name from {source}: {name!r}")
+            if name in seen:
+                previous_identity, previous_source = seen[name]
+                if previous_identity == identity:
+                    return False  # The same provider connected twice is one tool.
+                raise ToolNameCollisionError(tool_name=name, source_nodes=[previous_source, source])
+            seen[name] = (identity, source)
+            return True
 
-        def register_name(name: str | None, source: str) -> None:
-            if not name:
+        def tag(function: Any, attribute: str, source: str) -> None:
+            # Bound methods/builtins need not support arbitrary attributes.
+            if not hasattr(function, attribute):
+                try:
+                    setattr(function, attribute, source)
+                except (AttributeError, TypeError):
+                    pass
+
+        def add(value: Any, source: str) -> None:
+            if value is None:
                 return
-            existing = seen_tool_names.get(name)
-            if existing and existing != source:
-                raise ToolNameCollisionError(tool_name=name, source_nodes=[existing, source])
-            seen_tool_names[name] = source
+            if isinstance(value, (list, tuple)):
+                # collect-many edges deliver a list on one tool input handle.
+                for index, item in enumerate(value):
+                    add(item, f"{source}[{index}]")
+                return
+            if hasattr(value, 'tool_schemas') and hasattr(value, 'tool_functions'):
+                bundle_source = getattr(value, 'node_id', None) or source
+                for index, schema in enumerate(value.tool_schemas):
+                    name = NodeLLM._extract_tool_name(schema)
+                    function = value.tool_functions.get(name)
+                    if not callable(function):
+                        raise ValueError(f"NodeLLM:{self.node_id} bundle tool {name!r} has no callable")
+                    if register(name, (id(value), index), bundle_source):
+                        tools_schemas.append(schema)
+                        tool_functions[name] = function
+                        callable_names.add(name)
+                        tag(function, '_mcp_node_id', bundle_source)
+                if getattr(value, 'server_instructions', None):
+                    server_key = getattr(value, 'server_key', None) or bundle_source
+                    mcp_instructions[server_key] = value.server_instructions
+                return
+            if hasattr(value, 'tool_schema') and hasattr(value, 'tool_callable'):
+                schema, function = value.tool_schema, value.tool_callable
+                name = NodeLLM._extract_tool_name(schema)
+                if function is not None and not callable(function):
+                    raise ValueError(f"NodeLLM:{self.node_id} tool {name!r} executor is not callable")
+                origin = getattr(function, '_source_node_id', None) or source
+                if register(name, id(value), origin):
+                    tools_schemas.append(schema)
+                    if function is None:
+                        schema_only_names.add(name)
+                    else:
+                        # Public schema identity, not implementation __name__,
+                        # determines which callable the model actually invokes.
+                        tool_functions[name] = function
+                        callable_names.add(name)
+                        tag(function, '_source_node_id', source)
+                return
+            if callable(value) and not isinstance(value, dict):
+                name = getattr(value, '__name__', None)
+                if register(name, id(value), source):
+                    tools_schemas.append(value)
+                    tool_functions[name] = value
+                    callable_names.add(name)
+                    tag(value, '_source_node_id', self.node_id)
+                return
+            if isinstance(value, dict):
+                name = NodeLLM._extract_tool_name(value)
+                if register(name, id(value), source):
+                    tools_schemas.append(value)
+                    schema_only_names.add(name)
+                return
+            raise ValueError(f"NodeLLM:{self.node_id} unsupported tool input at {source}: {type(value).__name__}")
 
         for handle_name, value in sorted(self.inputs.items()):
-            if not handle_name.startswith(self.INPUT_TOOL_PREFIX):
-                continue
-            if value is None:
-                continue
-
-            # Bundle path: MCPToolBundle with multiple tools
-            if hasattr(value, 'tool_schemas') and hasattr(value, 'tool_functions'):
-                # MCPToolBundle (or similar multi-tool container)
-                bundle_node_id = getattr(value, 'node_id', 'unknown')
-                bundle_prefix = getattr(value, 'prefix', '')
-                bundle_count = len(value.tool_schemas)
-                
-                for schema in value.tool_schemas:
-                    name = schema_name(schema)
-                    register_name(name, bundle_node_id)
-                    if name:
-                        callable_names.add(name)
-                
-                # Extend schemas and merge functions
-                tools_schemas.extend(value.tool_schemas)
-                
-                # Tag functions with their source node_id for collision tracking
-                for tool_name, func in value.tool_functions.items():
-                    register_name(tool_name, bundle_node_id)
-                    callable_names.add(tool_name)
-                    if not hasattr(func, '_mcp_node_id'):
-                        func._mcp_node_id = bundle_node_id
-                    tool_functions[tool_name] = func
-                
-                # Collect MCP server.instructions for tool manifest
-                if hasattr(value, 'server_instructions') and value.server_instructions:
-                    server_key = getattr(value, 'server_key', '') or bundle_node_id
-                    mcp_instructions[server_key] = value.server_instructions
-                
-                logger.debug(
-                    "NodeLLM:%s flattened MCP bundle from node '%s': %d tools (prefix='%s')",
-                    self.node_id,
-                    bundle_node_id,
-                    bundle_count,
-                    bundle_prefix
-                )
-            
-            # Single-tool path: existing ToolProvider (FetchToolCallable, PythonExecutor)
-            elif hasattr(value, 'tool_schema') and hasattr(value, 'tool_callable'):
-                name = schema_name(value.tool_schema)
-                if value.tool_callable is not None:
-                    name = name or getattr(value.tool_callable, '__name__', None)
-                    source = getattr(value.tool_callable, '_source_node_id', None) or handle_name
-                    register_name(name, source)
-                    if name:
-                        callable_names.add(name)
-                tools_schemas.append(value.tool_schema)
-                if value.tool_callable is not None:
-                    name = getattr(value.tool_callable, '__name__', None)
-                    if name:
-                        if not hasattr(value.tool_callable, '_source_node_id'):
-                            value.tool_callable._source_node_id = handle_name
-                        tool_functions[name] = value.tool_callable
-            
-            # Plain callable: schema auto-extracted by magic-llm
-            elif callable(value) and not isinstance(value, dict):
-                tools_schemas.append(value)
-                name = getattr(value, '__name__', None)
-                if name:
-                    register_name(name, self.node_id or 'callable_tool')
-                    callable_names.add(name)
-                    value._source_node_id = self.node_id
-                    tool_functions[name] = value
-            
-            # Schema-only dict (no executor)
-            elif isinstance(value, dict):
-                name = schema_name(value)
-                register_name(name, f"schema_only:{handle_name}")
-                if name:
-                    schema_only_names.add(name)
-                tools_schemas.append(value)
+            if handle_name.startswith(self.INPUT_TOOL_PREFIX):
+                add(value, handle_name)
 
         if schema_only_names and callable_names:
             raise ValueError(
                 f"NodeLLM:{self.node_id} does not support mixed callable and schema-only tools in v1. "
                 "Move node_tool schemas to a separate LLM node or remove callable tools from this LLM."
             )
-
-        # NOTE: Task subagents are loaded via MagicLLM.load_subagents() 
-        # in process() where the client is available.
-        # magic-llm owns ALL subagent architecture — no local registry.
 
         return tools_schemas, tool_functions, mcp_instructions
 
@@ -276,7 +328,8 @@ class NodeLLM(Node):
                 return True
         return False
 
-    def _extract_tool_name(self, schema: Any) -> str | None:
+    @staticmethod
+    def _extract_tool_name(schema: Any) -> str | None:
         if not isinstance(schema, dict):
             return None
         function = schema.get("function")
@@ -622,95 +675,7 @@ class NodeLLM(Node):
             llm_config=llm_config,
         )
 
-    @staticmethod
-    def _first_not_none(*values: Any) -> Any:
-        for value in values:
-            if value is not None:
-                return value
-        return None
-
-    def _usage_to_plain_dict(self, usage: Any) -> dict[str, Any]:
-        if usage is None:
-            return {}
-        if isinstance(usage, dict):
-            return dict(usage)
-        if hasattr(usage, 'model_dump'):
-            dumped = usage.model_dump()
-            return dict(dumped or {}) if isinstance(dumped, dict) else {}
-        return {}
-
-    def _usage_detail_outputs(self, usage: Any, *, response_id: Any = None) -> dict[str, Any]:
-        data = self._usage_to_plain_dict(usage)
-
-        def attr(name: str) -> Any:
-            if isinstance(usage, dict):
-                return usage.get(name)
-            return getattr(usage, name, None) if usage is not None else None
-
-        def nested_detail(container_name: str, field_name: str) -> Any:
-            nested = data.get(container_name)
-            if nested is None and usage is not None and not isinstance(usage, dict):
-                nested = getattr(usage, container_name, None)
-            if isinstance(nested, dict):
-                return nested.get(field_name)
-            return getattr(nested, field_name, None) if nested is not None else None
-
-        audio_tokens = self._first_not_none(data.get('audio_tokens'), attr('audio_tokens'))
-        if audio_tokens is None:
-            audio_prompt = nested_detail('prompt_tokens_details', 'audio_tokens')
-            audio_completion = nested_detail('completion_tokens_details', 'audio_tokens')
-            if audio_prompt is not None or audio_completion is not None:
-                audio_tokens = (audio_prompt or 0) + (audio_completion or 0)
-
-        raw_usage_json = data.get('raw_usage_json')
-        if raw_usage_json is None:
-            raw_usage_json = attr('raw_usage_json')
-        if raw_usage_json is None and data and hasattr(usage, 'model_dump'):
-            raw_usage_json = dict(data)
-
-        return {
-            'provider_request_id': self._first_not_none(
-                data.get('provider_request_id'),
-                attr('provider_request_id'),
-                response_id,
-            ),
-            'prompt_tokens': self._first_not_none(data.get('prompt_tokens'), attr('prompt_tokens')),
-            'completion_tokens': self._first_not_none(data.get('completion_tokens'), attr('completion_tokens')),
-            'total_tokens': self._first_not_none(data.get('total_tokens'), attr('total_tokens')),
-            'cached_tokens_read': self._first_not_none(
-                data.get('cached_tokens_read'),
-                data.get('cached_read_tokens'),
-                attr('cached_tokens_read'),
-                attr('cached_read_tokens'),
-                nested_detail('prompt_tokens_details', 'cached_tokens'),
-            ),
-            'cached_tokens_write': self._first_not_none(
-                data.get('cached_tokens_write'),
-                data.get('cached_write_tokens'),
-                attr('cached_tokens_write'),
-                attr('cached_write_tokens'),
-            ),
-            'reasoning_tokens': self._first_not_none(
-                data.get('reasoning_tokens'),
-                attr('reasoning_tokens'),
-                nested_detail('completion_tokens_details', 'reasoning_tokens'),
-            ),
-            'audio_tokens': audio_tokens,
-            'accepted_prediction_tokens': self._first_not_none(
-                data.get('accepted_prediction_tokens'),
-                attr('accepted_prediction_tokens'),
-                nested_detail('completion_tokens_details', 'accepted_prediction_tokens'),
-            ),
-            'rejected_prediction_tokens': self._first_not_none(
-                data.get('rejected_prediction_tokens'),
-                attr('rejected_prediction_tokens'),
-                nested_detail('completion_tokens_details', 'rejected_prediction_tokens'),
-            ),
-            'provider_extra': self._first_not_none(data.get('provider_extra'), attr('provider_extra')),
-            'service_tier': self._first_not_none(data.get('service_tier'), attr('service_tier')),
-            'usage_source': self._first_not_none(data.get('usage_source'), attr('usage_source')),
-            'raw_usage_json': raw_usage_json,
-        }
+    _usage_detail_outputs = staticmethod(usage_detail_outputs)
 
     async def process(self, chat_log):
         # ``process`` may run repeatedly inside a loop. Generated content belongs
@@ -723,8 +688,9 @@ class NodeLLM(Node):
         params = self.inputs
         # Avoid logging full params to prevent leaking content; log keys only
         logger.debug("NodeLLM:%s inputs keys: %s", self.node_id, list(params.keys()))
+        tool_continuation = bool(self._history_messages and self._history_messages[-1].get('role') == 'tool')
         no_inputs = False
-        if not params.get(self.INPUT_HANDLER_SYSTEM_CONTEXT) and not params.get(self.INPUT_HANDLER_USER_MESSAGE):
+        if not params.get(self.INPUT_HANDLER_SYSTEM_CONTEXT) and not params.get(self.INPUT_HANDLER_USER_MESSAGE) and not tool_continuation:
             no_inputs = True
 
         def extract_message(msg):
@@ -817,7 +783,7 @@ class NodeLLM(Node):
                     inject_history_message(chat, msg)
             if k := params.get(self.INPUT_HANDLER_USER_MESSAGE):
                 chat.add_user_message(extract_message(k))
-            else:
+            elif not tool_continuation:
                 logger.error("NodeLLM:%s missing required input '%s'", self.node_id, self.INPUT_HANDLER_USER_MESSAGE)
                 yield self.yield_debug_error(
                     error_type="InputError",
@@ -937,10 +903,21 @@ class NodeLLM(Node):
                             tool_functions=tool_functions,
                             hooks=hook_relay,
                             extra_messages=extra_messages or None,
-                            **self.extra_data
+                            **self._agent_loop_options(chat)
                         )
+                    except Exception:
+                        for event in self._drain_tool_call_events(hook_relay):
+                            yield event
+                        # Account for child work even when a later provider call
+                        # or the parent execution budget fails. Do not yield on
+                        # GeneratorExit/CancelledError during stream closure.
+                        for event in self._drain_tool_events(tool_functions):
+                            yield event
+                        raise
                     finally:
                         await hook_relay.flush_pending_hooks()
+                    for event in self._drain_tool_events(tool_functions):
+                        yield event
                 else:
                     hook_relay = self._create_hook_relay(client=client)
                     try:
@@ -952,10 +929,21 @@ class NodeLLM(Node):
                             hooks=hook_relay,
                             task_executor=None,
                             extra_messages=extra_messages or None,
-                            **self.extra_data
+                            **self._agent_loop_options(chat)
                         )
+                    except Exception:
+                        for event in self._drain_tool_call_events(hook_relay):
+                            yield event
+                        # Account for child work even when a later provider call
+                        # or the parent execution budget fails. Do not yield on
+                        # GeneratorExit/CancelledError during stream closure.
+                        for event in self._drain_tool_events(tool_functions):
+                            yield event
+                        raise
                     finally:
                         await hook_relay.flush_pending_hooks()
+                    for event in self._drain_tool_events(tool_functions):
+                        yield event
                 self.generated = intention.content
                 # Use REAL collected tool calls, not intention.tool_calls (always empty for callable-tool path)
                 if hook_relay is not None and hook_relay.collected_tool_calls:
@@ -1127,10 +1115,12 @@ class NodeLLM(Node):
                             tool_functions=tool_functions,
                             hooks=hook_relay,
                             extra_messages=extra_messages or None,
-                            **self.extra_data
+                            **self._agent_loop_options(chat)
                         ):
                             self.generated += chunk.choices[0].delta.content or ''
                             last_chunk = chunk
+                            for event in self._drain_tool_events(tool_functions):
+                                yield event
                             yield self.yield_static(chunk, content_type=self.OUTPUT_HANDLE_CONTENT)
                         if last_chunk:
                             if hook_relay is not None and hook_relay.collected_tool_calls:
@@ -1148,24 +1138,38 @@ class NodeLLM(Node):
                                             'data': te['data'],
                                         }
                                     }
+                    except Exception:
+                        for event in self._drain_tool_call_events(hook_relay):
+                            yield event
+                        # Account for child work even when a later provider call
+                        # or the parent execution budget fails. Do not yield on
+                        # GeneratorExit/CancelledError during stream closure.
+                        for event in self._drain_tool_events(tool_functions):
+                            yield event
+                        raise
                     finally:
                         await hook_relay.flush_pending_hooks()
+                    for event in self._drain_tool_events(tool_functions):
+                        yield event
                 else:
                     hook_relay = self._create_hook_relay(client=client)
                     last_chunk = None
+                    stream = client.run_agent_stream_async(
+                        user_input=user_msg,
+                        system_prompt=sys_msg,
+                        tools=tools_schemas,
+                        tool_functions=tool_functions,
+                        hooks=hook_relay,
+                        task_executor=None,
+                        extra_messages=extra_messages or None,
+                        **self._agent_loop_options(chat)
+                    )
                     try:
-                        async for chunk in client.run_agent_stream_async(
-                            user_input=user_msg,
-                            system_prompt=sys_msg,
-                            tools=tools_schemas,
-                            tool_functions=tool_functions,
-                            hooks=hook_relay,
-                            task_executor=None,
-                            extra_messages=extra_messages or None,
-                            **self.extra_data
-                        ):
+                        async for chunk in stream:
                             self.generated += chunk.choices[0].delta.content or ''
                             last_chunk = chunk
+                            for event in self._drain_tool_events(tool_functions):
+                                yield event
                             yield self.yield_static(chunk, content_type=self.OUTPUT_HANDLE_CONTENT)
                         # Capture tool_calls from the last chunk
                         if last_chunk:
@@ -1184,8 +1188,22 @@ class NodeLLM(Node):
                                             'data': te['data'],
                                         }
                                     }
+                    except Exception:
+                        for event in self._drain_tool_call_events(hook_relay):
+                            yield event
+                        # Account for child work even when a later provider call
+                        # or the parent execution budget fails. Do not yield on
+                        # GeneratorExit/CancelledError during stream closure.
+                        for event in self._drain_tool_events(tool_functions):
+                            yield event
+                        raise
                     finally:
-                        await hook_relay.flush_pending_hooks()
+                        try:
+                            await stream.aclose()
+                        finally:
+                            await hook_relay.flush_pending_hooks()
+                    for event in self._drain_tool_events(tool_functions):
+                        yield event
             elif tools_schemas:
                 # Schema-only tools with streaming
                 # === HOOK: on_llm_start (schema-only tools streaming path, Phase 0 R0.2) ===
@@ -1413,5 +1431,6 @@ class NodeLLM(Node):
         # if configured to iterate inside a Loop, always re-run instead of using cached response
         if getattr(self, 'iterate', False):
             self._response = None
-        async for result in super().__call__(chat_log, **kwargs):
-            yield result
+        async with aclosing(super().__call__(chat_log, **kwargs)) as source:
+            async for result in source:
+                yield result

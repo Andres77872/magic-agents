@@ -4,6 +4,7 @@ Creates async callable wrappers for MCP tools and builds MCPToolBundle.
 """
 import json
 import logging
+from pydantic import BaseModel
 from typing import Any, Callable, Optional
 
 from magic_agents.mcp.session import MCPSessionManager
@@ -301,6 +302,9 @@ class MCPToolDispatcher:
         isError handling:
         - Log warning but return content for LLM to reason about
         """
+        if isinstance(result, BaseModel):
+            result = result.model_dump(by_alias=True)
+
         # Check isError flag
         is_error = False
         if hasattr(result, 'isError'):

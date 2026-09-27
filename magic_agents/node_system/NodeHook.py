@@ -146,12 +146,22 @@ class NodeHook(Node):
             )
             return
 
+        # Templates are compiled per invocation, so their namespace is isolated.
+        # Support both documented global emit.user(...) and context.emit.user(...).
+        hook_function.__globals__['emit'] = emit
+
+        # An edge override belongs to this invocation, not the shared node's
+        # configuration. Zero is an explicit immediate timeout, not a fallback.
+        timeout_seconds = hook_context.metadata.get('timeout_override')
+        if timeout_seconds is None:
+            timeout_seconds = self._timeout_seconds
+
         # Execute with timeout (Phase 1 safety)
         try:
             # The compiled hook function may be async or sync
             result = await asyncio.wait_for(
                 self._execute_function(hook_function, hook_context, chat_log),
-                timeout=self._timeout_seconds,
+                timeout=timeout_seconds,
             )
 
             # If the function returned a result dict, yield it
@@ -162,17 +172,17 @@ class NodeHook(Node):
             logger.warning(
                 "NodeHook:%s timed out after %ss (template truncated: %s...)",
                 self.node_id,
-                self._timeout_seconds,
+                timeout_seconds,
                 self._function_template[:80],
             )
             yield self.yield_debug_error(
                 error_type="HookTimeout",
                 error_message=(
-                    f"Hook exceeded {self._timeout_seconds}s timeout"
+                    f"Hook exceeded {timeout_seconds}s timeout"
                 ),
                 context={
                     "function_template": self._function_template[:200],
-                    "timeout": self._timeout_seconds,
+                    "timeout": timeout_seconds,
                 },
             )
 

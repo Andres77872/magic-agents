@@ -5,6 +5,7 @@ This module provides the core execution engine for agent flow graphs.
 Uses a reactive event-based execution model for automatic parallel execution.
 """
 
+import copy
 import logging
 import uuid
 from typing import Callable, Dict, Any, AsyncGenerator, Optional, Union
@@ -65,7 +66,7 @@ from magic_agents.execution import (
     execute_graph_loop_reactive,
 )
 from magic_agents.util.const import HANDLE_VOID
-from magic_agents.util.env_resolver import resolve_env_placeholders
+from magic_agents.util.env_resolver import resolve_connection_placeholders
 from magic_agents.hooks.runtime_config import RuntimeConfig
 from magic_agents.hooks.flow_hooks import FlowHooks
 from magic_agents.util.graph_validator import (
@@ -83,6 +84,7 @@ logger = logging.getLogger(__name__)
 
 # Node types that can provide tools to LLM nodes
 _TOOL_CAPABLE_TYPES = {
+    ModelAgentFlowTypesModel.INNER,
     ModelAgentFlowTypesModel.FETCH,
     ModelAgentFlowTypesModel.PYTHON_EXEC,
     ModelAgentFlowTypesModel.MCP,
@@ -215,7 +217,7 @@ def _assign_tool_handles(nodes: list[dict], edges: list[dict]) -> None:
         source_data = source_node.get('data', {})
 
         # For fetch nodes, only assign tool handles when tool_mode is true
-        if source_type == ModelAgentFlowTypesModel.FETCH:
+        if source_type in {ModelAgentFlowTypesModel.FETCH, ModelAgentFlowTypesModel.INNER}:
             if not source_data.get('tool_mode', False):
                 continue
 
@@ -223,7 +225,7 @@ def _assign_tool_handles(nodes: list[dict], edges: list[dict]) -> None:
         # handle assignment entirely. Node-mode python_exec edges route from
         # handle-python_exec-result to downstream graph nodes, NOT to LLM tools.
         if source_type == ModelAgentFlowTypesModel.PYTHON_EXEC:
-            if source_data.get('code'):
+            if source_data.get('tool_mode') is False or (source_data.get('code') and source_data.get('tool_mode') is not True):
                 # Node-mode python_exec: preserve original handles, don't assign tool handles
                 continue
 
@@ -233,6 +235,8 @@ def _assign_tool_handles(nodes: list[dict], edges: list[dict]) -> None:
         if source_type == ModelAgentFlowTypesModel.FETCH:
             # Fetch: output → response → default
             resolved_handle = handles.get('output', handles.get('response', 'handle_fetch_output'))
+        elif source_type == ModelAgentFlowTypesModel.INNER:
+            resolved_handle = handles.get('tool', 'handle-tool-definition')
         elif source_type == ModelAgentFlowTypesModel.MCP:
             # MCP: output → default (handle-tool-definition)
             resolved_handle = handles.get('output', 'handle-tool-definition')
@@ -247,7 +251,11 @@ def _assign_tool_handles(nodes: list[dict], edges: list[dict]) -> None:
         if not edge.get('targetHandle'):
             llm_id = edge['target']
             idx = tool_counters.get(llm_id, 0)
-            edge['targetHandle'] = f'handle-tool-definition-{idx}'
+            prefix = (target_node.get('data', {}).get('handles') or {}).get('tool_prefix', 'handle-tool-')
+            occupied = {e.get('targetHandle') for e in edges if e.get('target') == llm_id}
+            while f'{prefix}definition-{idx}' in occupied:
+                idx += 1
+            edge['targetHandle'] = f'{prefix}definition-{idx}'
             tool_counters[llm_id] = idx + 1
 
 
@@ -653,7 +661,7 @@ def validate_graph(nodes: list[dict], edges: list[dict]) -> dict:
     }
 
 
-def build(agt_data, message: str, images: list[str] = None, load_chat=None, extras: Optional[dict[str, Any]] = None, history_messages: Optional[list[dict[str, Any]]] = None, deps: Optional[dict[str, Any]] = None) -> AgentFlowModel:
+def build(agt_data, message: str, images: list[str] = None, load_chat=None, extras: Optional[dict[str, Any]] = None, history_messages: Optional[list[dict[str, Any]]] = None, deps: Optional[dict[str, Any]] = None, _node_path: tuple[str, ...] = ()) -> AgentFlowModel:
     """
     Prepare and build the agent flow graph from input data and message.
     
@@ -698,7 +706,12 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
                 graph_data[key] = agt_data[key]
         agt_data = graph_data
     
-    agt_data = resolve_env_placeholders(agt_data)
+    # Work on a private copy: build() rewrites nodes and edges in place, and callers
+    # reuse definitions (for example once per inner tool invocation).
+    agt_data = copy.deepcopy(agt_data)
+    # {{env.*}} is resolved only in connection settings; see resolve_connection_placeholders.
+    if 'nodes' in agt_data:
+        agt_data['nodes'] = resolve_connection_placeholders(agt_data['nodes'])
 
     # Task 3.10 (F22): Diagnostic warning for dict "hooks" in JSON agent definitions.
     # Graph-level hooks cannot be set from JSON — they must be FlowHooks instances.
@@ -781,16 +794,31 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
                 node['data'] = node.get('data', {})
                 node['data']['history_messages'] = history_messages
         elif node['type'] == ModelAgentFlowTypesModel.END:
-            # END edges also get unique ID
+            # END edges also get unique ID. Honor a renamed output (data.handles),
+            # which NodeEND emits on; a mismatch would hold END until the timeout.
+            end_handles = (node.get('data') or {}).get('handles') or {}
             agt_data['edges'].append({
                 "id": uuid.uuid4().hex,
                 "source": node['id'],
                 "target": void_id,
-                "sourceHandle": "handle_end_output"  # Match NodeEND.DEFAULT_OUTPUT_HANDLE
+                "sourceHandle": end_handles.get('output', end_handles.get('end', NodeEND.DEFAULT_OUTPUT_HANDLE)),
             })
     
+    # Tuple dependency keys identify scoped nodes without assuming globally
+    # unique IDs. Legacy string keys remain supported for direct callers.
+    local_deps = dict(deps or {})
+    for node in agt_data['nodes']:
+        if node['type'] == ModelAgentFlowTypesModel.MEMORY:
+            path = (*_node_path, node['id'])
+            node_deps = dict(local_deps.get(path, local_deps.get(node['id'], {})))
+            if _node_path:
+                # JSON Pointer escaping distinguishes IDs containing '/' or '~'.
+                scope = '/' + '/'.join(part.replace('~', '~0').replace('/', '~1') for part in path)
+                node_deps.setdefault('scope_node_id', scope)
+            local_deps[node['id']] = node_deps
+
     nodes: Dict[str, Any] = {
-        node['id']: create_node(node, load_chat, agt_data.get('debug', False), deps=deps) for node in agt_data['nodes']
+        node['id']: create_node(node, load_chat, agt_data.get('debug', False), deps=local_deps) for node in agt_data['nodes']
     }
     
     # Build inner graphs for NodeInner nodes
@@ -815,7 +843,10 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
                 continue
             
             required_keys = {'nodes', 'edges'}
-            missing_keys = required_keys - set(node_instance.magic_flow.keys())
+            child_definition = node_instance.magic_flow
+            if isinstance(child_definition.get('content'), dict):
+                child_definition = child_definition['content']
+            missing_keys = required_keys - set(child_definition.keys())
             if missing_keys:
                 logger.warning(
                     "NodeInner '%s' magic_flow is malformed — missing required keys: %s. "
@@ -831,10 +862,30 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
                 message="",  # Will be overridden by the input at runtime
                 images=None,
                 load_chat=load_chat,
-                extras=None  # Child flow starts with isolated extras (will be set at runtime)
+                extras=None,  # Child flow starts with isolated extras (will be set at runtime)
+                history_messages=history_messages,
+                deps=deps,
+                _node_path=(*_node_path, node_id),
             )
             # Set the built graph on the NodeInner instance
             node_instance.inner_graph = inner_graph
+            if node_instance.tool_mode:
+                # Capture the build context, not mutable execution state. Each
+                # tool invocation gets fresh nodes, including nested graphs.
+                definition = copy.deepcopy(node_instance.magic_flow)
+                path = (*_node_path, node_id)
+                def build_tool_graph(arguments, tool_extras, *, _definition=definition, _path=path):
+                    child = build(
+                        copy.deepcopy(_definition), message="", images=None, load_chat=load_chat,
+                        extras=tool_extras, history_messages=history_messages,
+                        deps=deps, _node_path=_path,
+                    )
+                    for child_node in child.nodes.values():
+                        if getattr(child_node, 'node_type', None) == ModelAgentFlowTypesModel.USER_INPUT:
+                            child_node._text = copy.deepcopy(arguments)
+                            child_node._extras = copy.deepcopy(tool_extras)
+                    return child
+                node_instance._tool_graph_factory = build_tool_graph
     
     # Convert edges to EdgeNodeModel for validation
     edge_models = [EdgeNodeModel(**e) for e in agt_data['edges']]

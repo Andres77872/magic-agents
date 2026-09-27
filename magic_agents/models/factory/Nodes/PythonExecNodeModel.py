@@ -1,6 +1,6 @@
 from typing import Optional
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from magic_agents.models.factory.Nodes.BaseNodeModel import BaseNodeModel
 
@@ -29,6 +29,20 @@ class PythonExecNodeModel(BaseNodeModel):
         default=None,
         description="Custom tool name for tool mode. Defaults to 'execute_python' when None."
     )
+    # None retains legacy inference: configured code is a graph node, otherwise
+    # expose the general Python executor. True with code creates a fixed tool.
+    tool_mode: Optional[bool] = None
+    tool_description: str = "Run the configured Python function with structured arguments."
+    tool_parameters: Optional[dict] = None
+
+    @model_validator(mode='after')
+    def validate_execution_mode(self):
+        if self.tool_mode is False and not (self.code and self.code.strip()):
+            raise ValueError("Python node mode requires code defining run(handler)")
+        if self.tool_mode is True and self.code and self.code.strip():
+            from magic_agents.models.tool_schema import function_tool_schema
+            function_tool_schema(self.tool_name or "execute_python", self.tool_description, self.tool_parameters)
+        return self
 
     # NEW: Handle name overrides (standard pattern, see ChatNodeModel)
     handles: Optional[dict[str, str]] = Field(

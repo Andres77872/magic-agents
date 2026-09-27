@@ -1,8 +1,21 @@
 from typing import Any, Literal, Optional
 
-from pydantic import Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from magic_agents.models.factory.Nodes.BaseNodeModel import BaseNodeModel
+
+
+class AgentExecutionConfig(BaseModel):
+    """Serializable limits for the agent loop, separate from provider kwargs."""
+
+    model_config = ConfigDict(extra='forbid', strict=True, allow_inf_nan=False)
+
+    max_iterations: int = Field(default=150, ge=1)
+    wall_clock_timeout: Optional[float] = Field(default=None, gt=0)
+    per_tool_timeout: float = Field(default=30.0, gt=0)
+    max_parallel_tools: int = Field(default=8, ge=1)
+    max_output_chars: int = Field(default=50000, ge=1)
+    deduplicate: bool = False
 
 
 class LlmNodeModel(BaseNodeModel):
@@ -19,6 +32,7 @@ class LlmNodeModel(BaseNodeModel):
     max_output_tokens: Optional[int] = None  # alias for max_tokens
     iterate: Optional[bool] = False  # if true, rerun this LLM node on each Loop iteration
     history_messages: Optional[list[dict[str, Any]]] = None  # Backend-injected history for no-CHAT graph path
+    agent_config: Optional[AgentExecutionConfig] = None
 
     # STM windowing fields (no-CHAT fallback path parity)
     max_messages: Optional[int] = Field(

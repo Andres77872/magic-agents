@@ -138,7 +138,12 @@ class PythonExecToolWrapper:
             effective_code = self._node_code or "def run(handler): return handler"
             return await self._execute_with_handler(effective_code, handler_dict)
 
-        # Case 3: Only code provided — legacy path
+        # Prefer the cancellable API while retaining compatible custom executors.
+        execute_async = getattr(self._executor, "execute_async", None)
+        if inspect.iscoroutinefunction(getattr(type(self._executor), "execute_async", None)):
+            return await execute_async(code=code or "")
+
+        # Case 3: Only code provided — legacy custom executor path
         result = await asyncio.to_thread(self._executor, code=code or "")
         if inspect.isawaitable(result):
             result = await result
@@ -150,6 +155,8 @@ class PythonExecToolWrapper:
             self._code_runner = CodeRunner()
 
         result = await self._code_runner.execute(code, handler)
+        if "error" in result:
+            raise RuntimeError(result["error"])
 
         import json
         return json.dumps(result)
@@ -183,7 +190,7 @@ class NodePythonExec(Node):
         # Node-mode inputs become keys in the user-defined ``handler`` dict, so
         # their edge handles are intentionally open-ended. Tool mode continues
         # to accept only its declared runtime-configuration handles.
-        self.accepts_dynamic_input_handles = self._has_code()
+        self.accepts_dynamic_input_handles = self._has_code() and data.tool_mode is not True
         self._data = data
         self._tool_name = data.tool_name or "execute_python"
         self._default_safety_mode = getattr(data, 'safety_mode', 'subprocess')
@@ -223,7 +230,7 @@ class NodePythonExec(Node):
             True if data.code is a non-empty string (node mode).
             False if data.code is None or empty (tool mode).
         """
-        return bool(self._code)
+        return bool(self._code and self._code.strip())
 
     def _build_handler_dict(self) -> dict:
         """Build handler dict from self.inputs, excluding config handles.
@@ -305,6 +312,16 @@ class NodePythonExec(Node):
         Existing behavior unchanged — resolve runtime config, refresh executor,
         yield wrapped executor via self.OUTPUT_HANDLE.
         """
+        if self._has_code() and self._data.tool_mode is True:
+            from magic_agents.node_system.authored_tools import FixedPythonTool
+            safety_mode, timeout, max_output_chars = self._resolve_runtime_config()
+            yield self.yield_static(FixedPythonTool(
+                code=self._code, name=self._tool_name,
+                description=self._data.tool_description, parameters=self._data.tool_parameters,
+                node_id=self.node_id, safety_mode=safety_mode, timeout=timeout,
+                max_output_chars=max_output_chars,
+            ), content_type=self.OUTPUT_HANDLE)
+            return
         # ─── Node Mode ───────────────────────────────────────────────
         if self._has_code():
             runtime_safety_mode, runtime_timeout, runtime_max_output_chars = self._resolve_runtime_config()

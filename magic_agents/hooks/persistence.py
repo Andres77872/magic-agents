@@ -515,7 +515,7 @@ class GraphPersistenceHook:
             )
             await self._sink.complete_execution(
                 id_execution=execution_id,
-                status="completed",
+                status="failed" if context.error is not None else "completed",
             )
 
     async def on_llm_loop_end(self, context: HookContext) -> None:

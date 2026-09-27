@@ -32,7 +32,7 @@ class NodeChat(Node):
     # Output handle
     DEFAULT_OUTPUT_HANDLE = 'handle_chat_output'
 
-    def __init__(self, data: ChatNodeModel, **kwargs) -> None:
+    def __init__(self, data: ChatNodeModel, handles: Optional[dict] = None, **kwargs) -> None:
         """
         Initialize Chat node with validated ChatNodeModel.
         
@@ -89,7 +89,7 @@ class NodeChat(Node):
         self._total_tokens_estimated = None
 
         # Handle name overrides from validated model
-        handles = data.handles or {}
+        handles = handles if handles is not None else (data.handles or {})
         self.INPUT_HANDLER_SYSTEM_CONTEXT = handles.get('system_context', handles.get('system', self.DEFAULT_INPUT_SYSTEM_CONTEXT))
         self.INPUT_HANDLER_USER_MESSAGE = handles.get('user_message', handles.get('message', self.DEFAULT_INPUT_USER_MESSAGE))
         self.INPUT_HANDLER_MESSAGES = handles.get('messages', self.DEFAULT_INPUT_MESSAGES)

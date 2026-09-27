@@ -1,4 +1,5 @@
 import functools
+from contextlib import aclosing
 import inspect
 import time
 import logging
@@ -58,8 +59,9 @@ def magic_telemetry(func):
             }
         }
 
-        async for i in func(self, chat_log, *args, **kwargs):
-            yield i
+        async with aclosing(func(self, chat_log, *args, **kwargs)) as source:
+            async for i in source:
+                yield i
         end_time = time.monotonic()
         execution_time = end_time - start_time
         logger.info(f"{qualname}:{self.node_id} execution time: {execution_time:.4f} seconds")

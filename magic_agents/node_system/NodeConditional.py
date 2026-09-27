@@ -1,23 +1,28 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+import time
+import uuid
 from typing import Any, Dict, AsyncGenerator, Optional, List
 
 import jinja2
 from jinja2 import UndefinedError, TemplateSyntaxError, TemplateError
 
 from magic_agents.node_system.Node import Node
-from magic_agents.models.factory.Nodes.ConditionalNodeModel import ConditionalSignalTypes
+from magic_agents.models.factory.Nodes.ConditionalNodeModel import ConditionalNodeModel, ConditionalSignalTypes
 from magic_agents.execution.condition_evaluator import ConditionEvaluator
-from magic_agents.execution.condition_evaluator_jinja2 import Jinja2Evaluator
+from magic_agents.execution.condition_evaluator_jinja2 import Jinja2Evaluator, Jinja2StrictEvaluator
+from magic_agents.execution.condition_evaluator_llm import build_judgment_chat, parse_judgments, validate_provider_answer
+from magic_agents.util.llm_usage import usage_detail_outputs
 
 logger = logging.getLogger(__name__)
 
 
 class NodeConditional(Node):
-    """Branching node that routes execution based on a Jinja2-evaluated condition.
+    """Route state deterministically, optionally after typed LLM judgments.
     
     Handle names are configurable via JSON data.handles.
     JSON is the source of truth for all handle names.
@@ -49,9 +54,18 @@ class NodeConditional(Node):
         Declared output handle names for build-time validation.
     default_handle : str (optional)
         Fallback handle if condition evaluates to empty/invalid string.
+    evaluation_mode : str (optional, default='jinja')
+        'llm' evaluates typed questions against state before routing. The
+        condition can read `answers` and `state`; branch payloads retain the
+        original merged state. 'jinja' preserves existing exact-rule behavior.
+    questions : dict (required in llm mode)
+        Independent named choice, score, or noul questions in Jev's grammar.
+    evaluation_timeout : float (optional, default=30)
+        Maximum seconds waiting for one LLM judgment call.
     """
     # Default handle name - can be overridden by JSON data.handles
     DEFAULT_INPUT_HANDLE_CTX = "handle_input"
+    DEFAULT_INPUT_HANDLE_CLIENT = "handle-client-provider"
 
     def __init__(
         self,
@@ -62,6 +76,9 @@ class NodeConditional(Node):
         output_handles: Optional[List[str]] = None,
         default_handle: Optional[str] = None,
         evaluator: Optional[ConditionEvaluator] = None,
+        evaluation_mode: str = "jinja",
+        questions: Optional[Dict[str, Any]] = None,
+        evaluation_timeout: float = 30.0,
         **kwargs
     ):
         self.condition_template = condition
@@ -69,9 +86,17 @@ class NodeConditional(Node):
         self.output_handles = output_handles
         self.default_handle = default_handle
         self.init_error = None
+        self.evaluation_mode = evaluation_mode
+        self.questions = questions
+        self.evaluation_timeout = evaluation_timeout
+        self.answers: Dict[str, Any] = {}
+        self.judgment_diagnostics: Dict[str, Any] = {}
+        self._evaluation_sequence = 0
         
         # Set up the condition evaluator (default: Jinja2Evaluator)
-        self._evaluator: ConditionEvaluator = evaluator or Jinja2Evaluator()
+        self._evaluator: ConditionEvaluator = evaluator or (
+            Jinja2StrictEvaluator() if evaluation_mode == 'llm' else Jinja2Evaluator()
+        )
         
         # Track key sources for collision detection
         self._key_sources: Dict[str, str] = {}
@@ -80,11 +105,20 @@ class NodeConditional(Node):
         # Allow JSON to override handle names
         handles = handles or {}
         self.INPUT_HANDLE_CTX = handles.get('input', handles.get('context', self.DEFAULT_INPUT_HANDLE_CTX))
+        self.INPUT_HANDLE_CLIENT = handles.get('client_provider', handles.get('client', self.DEFAULT_INPUT_HANDLE_CLIENT))
         
         if not condition:
             self.init_error = "NodeConditional requires a non-empty 'condition' template"
         elif merge_strategy not in ("flat", "namespaced"):
             self.init_error = f"Invalid merge_strategy '{merge_strategy}'. Must be 'flat' or 'namespaced'"
+        elif evaluation_mode != 'jinja' or questions is not None:
+            validated = ConditionalNodeModel(
+                condition=condition, merge_strategy=merge_strategy, handles=handles,
+                output_handles=output_handles, default_handle=default_handle,
+                evaluation_mode=evaluation_mode, questions=questions,
+                evaluation_timeout=evaluation_timeout,
+            )
+            self.questions = {key: value.model_dump(exclude_none=True) for key, value in (validated.questions or {}).items()}
         
         super().__init__(**kwargs)
 
@@ -105,6 +139,74 @@ class NodeConditional(Node):
                 # Treat as plain string value
                 return raw_data
         return raw_data
+
+    def _is_client_input(self, handle: str) -> bool:
+        # Before LLM mode existed, exact-rule graphs could name their primary
+        # state port anything, including the new client's default name.
+        return handle == self.INPUT_HANDLE_CLIENT and (
+            self.evaluation_mode == 'llm' or handle != self.INPUT_HANDLE_CTX
+        )
+
+    def has_state_inputs(self) -> bool:
+        """Client readiness alone never makes a conditional ready for loop state."""
+        return any(value is not None for handle, value in self.inputs.items() if not self._is_client_input(handle))
+
+    async def _generate_judgments(self, render_ctx):
+        client = self.get_input(self.INPUT_HANDLE_CLIENT, required=True)
+        chat = build_judgment_chat(render_ctx, self.questions)
+        hooks = self._hooks
+        self._evaluation_sequence += 1
+        ctx = None
+        model = getattr(client.llm, 'model', 'unknown')
+        provider = getattr(client.llm, 'engine_name', '') or getattr(client, 'engine', 'unknown')
+        if hooks is not None and not hooks.is_empty():
+            from magic_agents.hooks.context_factory import HookContextFactory
+            ctx = HookContextFactory.build_llm_context(
+                execution_id=getattr(hooks, 'execution_id', ''),
+                run_id=getattr(hooks, 'run_id', ''), node_id=self.node_id,
+                node_type=self.node_type or 'conditional', node_class=type(self).__name__,
+                model=model, provider=provider, streaming=False,
+                sequence_number=self._evaluation_sequence,
+                evaluation_mode='llm', question_ids=list(self.questions),
+            )
+            await hooks.invoke('on_llm_start', ctx)
+        started = time.monotonic()
+        try:
+            response = await asyncio.wait_for(
+                client.llm.async_generate(chat, json_output=True),
+                timeout=self.evaluation_timeout,
+            )
+        except BaseException as exc:
+            if ctx is not None:
+                ctx.error = exc
+                ctx.outputs = {'model': model, 'provider': provider, 'finish_reason': 'error', 'error': str(exc)}
+                await hooks.invoke('on_llm_end', ctx)
+            raise
+        usage = usage_detail_outputs(getattr(response, 'usage', None), response_id=getattr(response, 'id', None))
+        duration_ms = (time.monotonic() - started) * 1000
+        output = {
+            'model': getattr(response, 'model', None) or model,
+            'provider': provider, 'content': getattr(response, 'content', None),
+            'duration_ms': duration_ms, **usage,
+        }
+        choices = getattr(response, 'choices', None)
+        if choices:
+            output['finish_reason'] = getattr(choices[0], 'finish_reason', None)
+        if ctx is not None:
+            ctx.outputs = output
+            await hooks.invoke('on_llm_end', ctx)
+            ctx.outputs = {**output, 'total_iterations': 1}
+            await hooks.invoke('on_llm_loop_end', ctx)
+        return response, {'type': 'debug', 'content': {
+            'event_type': 'LLM_GENERATION', 'node_id': self.node_id,
+            'node_type': 'conditional',
+            # Internal judgment calls have no user-facing content chunk. Give
+            # usage consumers a stable per-call identity, including adapters
+            # that omit their provider request ID.
+            'id': usage.get('provider_request_id') or getattr(response, 'id', None) or f'conditional-{uuid.uuid4().hex}',
+            'model': output['model'], 'provider': provider,
+            'duration_ms': duration_ms, **usage,
+        }}
 
     def _merge_inputs(self) -> Dict[str, Any]:
         """
@@ -130,7 +232,7 @@ class NodeConditional(Node):
         available_inputs = [
             (handle_name, self.inputs.get(handle_name))
             for handle_name in self.inputs.keys()
-            if self.inputs.get(handle_name) is not None
+            if self.inputs.get(handle_name) is not None and not self._is_client_input(handle_name)
         ]
         
         if not available_inputs:
@@ -215,6 +317,11 @@ class NodeConditional(Node):
 
     async def process(self, chat_log) -> AsyncGenerator[Dict[str, Any], None]:  # noqa: D401
         """Evaluate condition, emit chosen handle, update bypass metadata."""
+        self.selected_handle = None
+        self._response = None
+        self.answers = {}
+        self.judgment_diagnostics = {}
+        self.outputs.clear()
         
         # Check for initialization errors
         if self.init_error:
@@ -226,6 +333,7 @@ class NodeConditional(Node):
                     "merge_strategy": self.merge_strategy
                 }
             )
+            yield {"type": ConditionalSignalTypes.BYPASS_ALL, "content": None}
             return
         
         # Merge all available inputs into a dict context
@@ -246,9 +354,28 @@ class NodeConditional(Node):
             yield {"type": ConditionalSignalTypes.BYPASS_ALL, "content": None}
             return
 
+        # The LLM judges state; deterministic application code selects a route.
+        route_ctx = render_ctx
+        if self.evaluation_mode == 'llm':
+            try:
+                response, generation_event = await self._generate_judgments(render_ctx)
+                # Usage is emitted even if the provider returned malformed JSON.
+                yield generation_event
+                validate_provider_answer(response)
+                self.answers = parse_judgments(response.content, self.questions, diagnostics=self.judgment_diagnostics)
+                route_ctx = {**render_ctx, 'state': render_ctx, 'answers': self.answers}
+            except Exception as exc:
+                yield self.yield_debug_error(
+                    error_type='EvaluationTimeout' if isinstance(exc, asyncio.TimeoutError) else 'JudgmentError',
+                    error_message=str(exc) or 'Conditional LLM evaluation timed out',
+                    context={'evaluation_mode': 'llm', 'question_ids': list(self.questions), 'evaluation_timeout': self.evaluation_timeout},
+                )
+                yield {'type': ConditionalSignalTypes.BYPASS_ALL, 'content': None}
+                return
+
         # Evaluate the condition template using the configured evaluator
         try:
-            selected_handle = self._evaluator.evaluate(self.condition_template, render_ctx)
+            selected_handle = self._evaluator.evaluate(self.condition_template, route_ctx)
         except UndefinedError as e:
             logger.error(
                 "NodeConditional (%s): Undefined variable in template: %s",
@@ -352,6 +479,15 @@ class NodeConditional(Node):
                 yield {"type": ConditionalSignalTypes.BYPASS_ALL, "content": None}
                 return
 
+        if self.evaluation_mode == 'llm' and selected_handle not in self.output_handles:
+            yield self.yield_debug_error(
+                error_type='GraphRoutingError',
+                error_message=f"Condition selected undeclared output handle '{selected_handle}'",
+                context={'output_handles': self.output_handles},
+            )
+            yield {'type': ConditionalSignalTypes.BYPASS_ALL, 'content': None}
+            return
+
         # Persist selection for executors that need deterministic bypass routing
         self.selected_handle = selected_handle
 
@@ -369,10 +505,16 @@ class NodeConditional(Node):
         yield self.yield_static({
             "selected": selected_handle,
             "merge_strategy": self.merge_strategy,
-            "input_count": len([k for k in self.inputs.keys() if self.inputs.get(k) is not None]),
+            "input_count": sum(value is not None for handle, value in self.inputs.items() if not self._is_client_input(handle)),
             "merge_collisions": self._merge_collisions if self._merge_collisions else None,
             "output_handles": self.output_handles,
-            "default_handle": self.default_handle
+            "default_handle": self.default_handle,
+            "evaluation_mode": self.evaluation_mode,
+            **({
+                'answers': self.answers,
+                'confidence_source': 'llm_estimated_not_calibrated',
+                'judgment_diagnostics': self.judgment_diagnostics,
+            } if self.evaluation_mode == 'llm' else {}),
         })
 
     def _capture_internal_state(self):
@@ -384,6 +526,12 @@ class NodeConditional(Node):
         state['merge_strategy'] = self.merge_strategy
         state['output_handles'] = self.output_handles
         state['default_handle'] = self.default_handle
+        state['evaluation_mode'] = self.evaluation_mode
+        if self.evaluation_mode == 'llm':
+            state['answers'] = self.answers
+            state['questions'] = self.questions
+            state['judgment_diagnostics'] = self.judgment_diagnostics
+            state['confidence_source'] = 'llm_estimated_not_calibrated'
         
         # Capture the selected handle if available
         if hasattr(self, 'selected_handle'):
