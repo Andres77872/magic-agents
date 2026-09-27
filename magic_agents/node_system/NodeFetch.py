@@ -572,7 +572,12 @@ class NodeFetch(Node):
             if self.debug:
                 logger.debug("NodeFetch:%s response status=%s", self.node_id, response.status)
             response.raise_for_status()
-            return await response.json()
+            try:
+                return await response.json()
+            except aiohttp.ContentTypeError:
+                # Documentation endpoints such as llms.txt return text/plain.
+                # Keep declared JSON decoding errors visible to the caller.
+                return await response.text()
 
     def _render_request_value(self, value):
         resolved_value = resolve_env_placeholders(value)

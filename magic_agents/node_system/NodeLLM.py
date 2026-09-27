@@ -12,6 +12,7 @@ from magic_llm.model import ModelChat
 from magic_llm.model.ModelChatStream import ChatCompletionModel, ChoiceModel, DeltaModel
 
 from magic_agents.models.factory.Nodes import LlmNodeModel
+from magic_agents.models.factory.Nodes.LlmNodeModel import normalize_reasoning_effort
 from magic_agents.node_system.Node import Node
 from magic_agents.node_system.utils import apply_windowing
 from magic_agents.util.primitive_coercion import coerce_primitive_by_type, input_has_value
@@ -37,6 +38,7 @@ class NodeLLM(Node):
     DEFAULT_INPUT_TEMPERATURE = 'handle-llm-temperature'
     DEFAULT_INPUT_TOP_P = 'handle-llm-top_p'
     DEFAULT_INPUT_MAX_TOKENS = 'handle-llm-max_tokens'
+    DEFAULT_INPUT_REASONING_EFFORT = 'handle-llm-reasoning_effort'
     DEFAULT_INPUT_STREAM = 'handle-llm-stream'
     DEFAULT_INPUT_ITERATE = 'handle-llm-iterate'
     DEFAULT_INPUT_JSON_OUTPUT = 'handle-llm-json_output'
@@ -70,6 +72,7 @@ class NodeLLM(Node):
         self.INPUT_HANDLER_TEMPERATURE = handles.get('temperature', self.DEFAULT_INPUT_TEMPERATURE)
         self.INPUT_HANDLER_TOP_P = handles.get('top_p', self.DEFAULT_INPUT_TOP_P)
         self.INPUT_HANDLER_MAX_TOKENS = handles.get('max_tokens', self.DEFAULT_INPUT_MAX_TOKENS)
+        self.INPUT_HANDLER_REASONING_EFFORT = handles.get('reasoning_effort', self.DEFAULT_INPUT_REASONING_EFFORT)
         self.INPUT_HANDLER_STREAM = handles.get('stream', self.DEFAULT_INPUT_STREAM)
         self.INPUT_HANDLER_ITERATE = handles.get('iterate', self.DEFAULT_INPUT_ITERATE)
         self.INPUT_HANDLER_JSON_OUTPUT = handles.get('json_output', handles.get('json_mode', self.DEFAULT_INPUT_JSON_OUTPUT))
@@ -85,6 +88,7 @@ class NodeLLM(Node):
         self._default_temperature = data.temperature
         self._default_top_p = data.top_p
         self._default_max_tokens = data.max_tokens
+        self._default_reasoning_effort = data.reasoning_effort
         self._base_extra_data = dict(data.extra_data or {})
         self._agent_config = data.agent_config
         # Backend-injected history_messages for no-CHAT graph path
@@ -129,6 +133,35 @@ class NodeLLM(Node):
             extra_data['max_tokens'] = runtime_max_tokens
         elif 'max_tokens' not in extra_data and runtime_max_tokens is not None:
             extra_data['max_tokens'] = runtime_max_tokens
+
+        # A connected input overrides the explicit node field, which overrides
+        # legacy extra_data. Rebuild each invocation so loops cannot leak values.
+        if input_has_value(self.inputs, self.INPUT_HANDLER_REASONING_EFFORT):
+            effort = normalize_reasoning_effort(self.inputs[self.INPUT_HANDLER_REASONING_EFFORT])
+            if effort is None:
+                extra_data.pop('reasoning_effort', None)
+            else:
+                extra_data['reasoning_effort'] = effort
+        elif self._default_reasoning_effort is not None:
+            extra_data['reasoning_effort'] = self._default_reasoning_effort
+        elif 'reasoning_effort' in extra_data:
+            effort = normalize_reasoning_effort(extra_data['reasoning_effort'])
+            if effort is None:
+                extra_data.pop('reasoning_effort')
+            else:
+                extra_data['reasoning_effort'] = effort
+
+        if (input_has_value(self.inputs, self.INPUT_HANDLER_REASONING_EFFORT)
+                or self._default_reasoning_effort is not None):
+            # The explicit graph setting also overrides a legacy nested effort.
+            # Keep summary and other provider options, without mutating the graph.
+            if isinstance(extra_data.get('reasoning'), dict):
+                reasoning = dict(extra_data['reasoning'])
+                reasoning.pop('effort', None)
+                if reasoning:
+                    extra_data['reasoning'] = reasoning
+                else:
+                    extra_data.pop('reasoning')
 
         return extra_data
 
@@ -1062,8 +1095,8 @@ class NodeLLM(Node):
                 yield self._emit_llm_generation(intention)
 
             yield self.yield_static(ChatCompletionModel(
-                id=uuid.uuid4().hex,
-                model=client.llm.model,
+                id=getattr(intention, "id", None) or uuid.uuid4().hex,
+                model=getattr(intention, "model", None) or client.llm.model,
                 choices=[ChoiceModel(
                     delta=DeltaModel(content=intention.content or '')
                 )],

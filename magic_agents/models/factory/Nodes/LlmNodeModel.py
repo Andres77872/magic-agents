@@ -1,8 +1,17 @@
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from magic_agents.models.factory.Nodes.BaseNodeModel import BaseNodeModel
+
+
+def normalize_reasoning_effort(value: Any) -> Optional[str]:
+    """Effort names belong to providers; only validate type and trim whitespace."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("reasoning_effort must be a string or null")
+    return value.strip() or None
 
 
 class AgentExecutionConfig(BaseModel):
@@ -28,6 +37,14 @@ class LlmNodeModel(BaseNodeModel):
     json_output: Optional[bool] = False
     json_mode: Optional[bool] = None  # alias for json_output
     temperature: Optional[float] = None
+    reasoning_effort: Optional[str] = Field(
+        default=None,
+        description="Provider-defined reasoning effort. Empty/null inherits defaults; "
+                    "OpenAI suggestions are none, minimal, low, medium, high, xhigh, max."
+    )
+
+    _normalize_reasoning_effort = field_validator('reasoning_effort', mode='before')(normalize_reasoning_effort)
+
     max_tokens: Optional[int] = None
     max_output_tokens: Optional[int] = None  # alias for max_tokens
     iterate: Optional[bool] = False  # if true, rerun this LLM node on each Loop iteration

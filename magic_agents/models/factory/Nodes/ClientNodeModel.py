@@ -45,6 +45,7 @@ class ClientNodeModel(BaseNodeModel):
     credentials: Optional[dict | str] = None  # alias for api_info
     model: Optional[str] = None
     model_name: Optional[str] = None  # alias for model
+    endpoint: Optional[Literal['chat_completions', 'responses']] = None
 
     @model_validator(mode='after')
     def resolve_aliases(self):

@@ -146,6 +146,7 @@ CANONICAL_INPUT_HANDLES: Dict[str, Set[str]] = {
         'handle-tool-definition',     # Tool definition inputs (variadic)
         'handle-chat',                # Chat history input
         'handle-system-context',      # System context input
+        'handle-llm-reasoning_effort', # Runtime reasoning effort override
     },
     ModelAgentFlowTypesModel.CHAT: set(),  # Source node variant
     ModelAgentFlowTypesModel.SEND_MESSAGE: {
@@ -205,6 +206,7 @@ PORT_CARDINALITY: Dict[str, Dict[str, CardinalityInfo]] = {
         ),
         'handle-chat': CardinalityInfo(cardinality="one", exclusive=True),
         'handle-system-context': CardinalityInfo(cardinality="one", exclusive=True),
+        'handle-llm-reasoning_effort': CardinalityInfo(cardinality="one", exclusive=True),
     },
     # Text node: single input
     ModelAgentFlowTypesModel.TEXT: {

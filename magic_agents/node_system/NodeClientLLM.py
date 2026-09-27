@@ -44,6 +44,7 @@ class NodeClientLLM(Node):
         self._default_engine = getattr(data, 'engine', None)
         self._default_model = getattr(data, 'model', None)
         self._default_api_info = getattr(data, 'api_info', None)
+        self._endpoint = data.endpoint
         self._base_extra_data = dict(getattr(data, 'extra_data', {}) or {})
         self._client_args_preview = {
             "engine": self._default_engine,
@@ -75,6 +76,14 @@ class NodeClientLLM(Node):
 
         if 'api_key' in args and 'private_key' not in args:
             args['private_key'] = args['api_key']
+
+        # A visible node selection overrides endpoint options in API config.
+        if self._endpoint is not None:
+            args['endpoint'] = self._endpoint
+        if args.get('engine') != 'openai':
+            endpoint = args.pop('endpoint', None)
+            if endpoint == 'responses':
+                raise ValueError("Responses requires engine='openai'")
 
         return args
 
