@@ -361,6 +361,8 @@ class TestBuildVoidSentinelNode:
         end_edges = [e for e in result.edges if e.source in ("end1", "end2")]
         void_edges = [e for e in end_edges if e.target == void_id]
         assert len(void_edges) == 2
+        # Like every other void edge; a None handle becomes void.inputs[None].
+        assert all(e.targetHandle == HANDLE_VOID for e in void_edges)
 
     def test_build_edges_without_target_handle_route_to_void(self):
         """Edges without targetHandle get routed to void."""

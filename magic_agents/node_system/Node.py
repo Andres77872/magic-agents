@@ -260,7 +260,7 @@ class Node(abc.ABC):
         # fail Pydantic validation on unusual inputs (loop sub-nodes, etc.)
         # and is no longer needed for the observer path.
         if observer is None:
-            self._start_debug_tracking()
+            self._run_legacy_debug_tracking(self._start_debug_tracking)
 
         error_msg = None
         completed = False
@@ -308,7 +308,7 @@ class Node(abc.ABC):
 
             # Legacy debug tracking — only when observer is inactive
             if observer is None:
-                self._end_debug_tracking(error=error_msg)
+                self._run_legacy_debug_tracking(self._end_debug_tracking, error=error_msg)
 
             # Re-raise so executor can mark node ERROR and propagate
             # error cascade bypass to downstream nodes (Phase 4).
@@ -333,7 +333,7 @@ class Node(abc.ABC):
 
                 # Legacy debug tracking — only when observer is inactive
                 if observer is None:
-                    self._end_debug_tracking(error=None)
+                    self._run_legacy_debug_tracking(self._end_debug_tracking, error=None)
                 # === HOOK: on_node_end (AFTER debug tracking in success path, Phase 4) ===
                 if _hook_ctx is not None:
                     _hook_end = datetime.now(UTC)
@@ -388,6 +388,16 @@ class Node(abc.ABC):
             node_class=self.__class__.__name__
         )
     
+    def _run_legacy_debug_tracking(self, track, **kwargs) -> None:
+        """Run a legacy debug tracking step; bookkeeping must never fail the node."""
+        try:
+            track(**kwargs)
+        except Exception:
+            logger.warning(
+                "Node (%s): legacy debug tracking failed; continuing execution",
+                self.node_id, exc_info=True,
+            )
+
     def _start_debug_tracking(self) -> Optional[NodeDebugInfo]:
         """
         Start tracking debug information for this node execution.

@@ -796,12 +796,15 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
         elif node['type'] == ModelAgentFlowTypesModel.END:
             # END edges also get unique ID. Honor a renamed output (data.handles),
             # which NodeEND emits on; a mismatch would hold END until the timeout.
+            # These edges are added after the HANDLE_VOID defaulting above, so
+            # set it here too; without it the void node receives inputs[None].
             end_handles = (node.get('data') or {}).get('handles') or {}
             agt_data['edges'].append({
                 "id": uuid.uuid4().hex,
                 "source": node['id'],
                 "target": void_id,
                 "sourceHandle": end_handles.get('output', end_handles.get('end', NodeEND.DEFAULT_OUTPUT_HANDLE)),
+                "targetHandle": HANDLE_VOID,
             })
     
     # Tuple dependency keys identify scoped nodes without assuming globally

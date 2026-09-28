@@ -17,6 +17,7 @@ from typing import Dict, List, Set, Optional, Literal
 from dataclasses import dataclass
 
 from magic_agents.models.factory.Nodes import ModelAgentFlowTypesModel
+from magic_agents.util.const import HANDLE_VOID
 
 
 @dataclass
@@ -253,8 +254,11 @@ PORT_CARDINALITY: Dict[str, Dict[str, CardinalityInfo]] = {
         'handle-fetch-headers': CardinalityInfo(cardinality="one", exclusive=True),
         'handle_fetch_input': CardinalityInfo(cardinality="one", exclusive=True),
     },
-    # VOID: sink node, no cardinality restrictions
-    ModelAgentFlowTypesModel.VOID: {},
+    # VOID: sink node, no cardinality restrictions; every END node and every
+    # edge without a targetHandle converges on its single port.
+    ModelAgentFlowTypesModel.VOID: {
+        HANDLE_VOID: CardinalityInfo(cardinality="many", exclusive=False, multi_compatible=True),
+    },
     # Source nodes (user_input, constant, chat): no inputs
     ModelAgentFlowTypesModel.USER_INPUT: {},
     ModelAgentFlowTypesModel.CLIENT: {
