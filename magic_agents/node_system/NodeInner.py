@@ -137,7 +137,7 @@ class NodeInner(Node):
         # can pass our HookRegistry natively — execute_graph's `hooks` param expects
         # a RuntimeConfig, which doesn't match self._hooks (a HookRegistry).
         from magic_agents.execution.reactive_executor import execute_graph_reactive
-        from magic_agents.util.const import SYSTEM_EVENT_DEBUG
+        from magic_agents.util.const import SYSTEM_EVENT_DEBUG, SYSTEM_EVENT_DEBUG_SUMMARY
         content = ''
         extras = []
         inner_had_error = False
@@ -214,10 +214,17 @@ class NodeInner(Node):
                 parent_run_id=parent_run_id,   # Phase 0
                 hooks=_child_hooks,
         ):
-            # Propagate debug/error events from inner graph to outer graph
-            if evt.get('type') == SYSTEM_EVENT_DEBUG:
-                yield evt
-                evt_content = evt.get('content', {})
+            # Legacy diagnostics and progress travel through the generator,
+            # while FlowHooks use their shared sink directly. Prefix only these
+            # child-relative events; never mutate a child's original envelope.
+            if evt.get('type') in (SYSTEM_EVENT_DEBUG, SYSTEM_EVENT_DEBUG_SUMMARY, 'loop_progress'):
+                evt_content = evt.get('content') or {}
+                child_path = evt.get('source_node_path')
+                if child_path is None:
+                    child_id = (evt.get('source_node') or evt_content.get('node_id')
+                                or evt_content.get('loop_node_id') or evt_content.get('loop_id'))
+                    child_path = [child_id] if child_id else []
+                yield {**evt, 'source_node_path': [self.node_id, *child_path]}
                 if evt_content.get('error_type'):
                     inner_had_error = True
                 continue

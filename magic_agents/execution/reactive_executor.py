@@ -221,6 +221,8 @@ def emit_loop_progress(
     
     return {
         "type": "loop_progress",
+        "source_node": loop_id,
+        "source_node_path": [loop_id],
         "content": {
             "loop_id": loop_id,
             "current": current_index,
@@ -625,7 +627,7 @@ async def execute_graph_reactive(
                         "source_node": node_id,
                         "source_node_path": item.get("source_node_path", [node_id]),
                     })
-                elif item_type == SYSTEM_EVENT_DEBUG:
+                elif item_type in (SYSTEM_EVENT_DEBUG, SYSTEM_EVENT_DEBUG_SUMMARY, "loop_progress"):
                     # Queue debug info (legacy path — Node may still yield debug events
                     # for backward compatibility; these are forwarded through the queue)
                     await output_queue.put(item)
@@ -1264,7 +1266,7 @@ async def execute_graph_loop_reactive(
                             "source_node": node_id,
                             "source_node_path": item.get("source_node_path", [node_id]),
                         }
-                    elif item_type == SYSTEM_EVENT_DEBUG:
+                    elif item_type in (SYSTEM_EVENT_DEBUG, SYSTEM_EVENT_DEBUG_SUMMARY, "loop_progress"):
                         yield item
                     elif ConditionalSignalTypes.is_system_signal(item_type):
                         if item_type == ConditionalSignalTypes.BYPASS_ALL:

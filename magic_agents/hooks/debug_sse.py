@@ -22,13 +22,38 @@ class DebugEventSink(Protocol):
 class DebugSSEHook:
     """FlowHooks implementation that emits debug SSE-compatible envelopes."""
 
-    def __init__(self, *, sink: DebugEventSink | asyncio.Queue, id_chat: str) -> None:
+    def __init__(
+        self,
+        *,
+        sink: DebugEventSink | asyncio.Queue,
+        id_chat: str,
+        parent_path: tuple[str, ...] = (),
+    ) -> None:
         self._sink = sink
         self._id_chat = id_chat
+        self._parent_path = tuple(parent_path)
+
+    def fork_for_child(
+        self,
+        *,
+        child_run_id: str,
+        parent_node_id: str,
+    ) -> "DebugSSEHook":
+        'Share the sink while isolating ancestry for concurrent child graphs.'
+        return DebugSSEHook(
+            sink=self._sink,
+            id_chat=self._id_chat,
+            parent_path=(*self._parent_path, parent_node_id),
+        )
 
     def _emit(self, event_type: str, content: dict[str, Any], *, summary: bool = False) -> None:
+        node_id = content.get("node_id")
+        source_path = [*self._parent_path]
+        if isinstance(node_id, str) and node_id:
+            source_path.append(node_id)
         event = {
             "type": "debug_summary" if summary else "debug",
+            "source_node_path": source_path,
             "event_type": event_type,
             "id_chat": self._id_chat,
             "content": content,
