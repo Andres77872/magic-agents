@@ -15,9 +15,11 @@ Contracts:
 - Errors are isolated (logged, not propagated) per spec requirement
 """
 import asyncio
+import copy
 import inspect
 import json
 import logging
+import time
 import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
@@ -114,6 +116,10 @@ class HookRelay(AgentHooks):
         self._collected_tool_calls: List[Dict[str, Any]] = []
         self._collected_tool_results: List[Dict[str, Any]] = []
 
+        # Usage of the current streamed LLM call, taken from its chunks. The
+        # agent loop's synthetic stream response carries no usage of its own.
+        self._stream_usage: Any = None
+
     @staticmethod
     def _iteration_from_state(state: AgentState, fallback: int = 0) -> int:
         """Return canonical loop iteration metadata from AgentState.
@@ -177,6 +183,8 @@ class HookRelay(AgentHooks):
         if error_message:
             ctx.error_message = error_message
         ctx.emit = self._emit
+        # Hooks run later as scheduled tasks; record when the event happened.
+        ctx.monotonic_time = time.perf_counter()
 
         # Inject nested correlation metadata for ALL events.
         # Uses runtime DEPTH ContextVar when available (more accurate
@@ -247,6 +255,7 @@ class HookRelay(AgentHooks):
         )
         ctx.sequence_number = self._next_sequence()
         ctx.emit = self._emit
+        ctx.monotonic_time = time.perf_counter()
 
         # Inject nested correlation metadata for ALL tool events.
         try:
@@ -352,6 +361,39 @@ class HookRelay(AgentHooks):
             "raw_usage_json": raw_usage_json,
         }
 
+    _USAGE_COUNT_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens")
+
+    @classmethod
+    def _usage_counts(cls, usage: Any) -> Dict[str, int]:
+        """Positive token counts in ``usage`` (dict or model); empty when none."""
+        counts: Dict[str, int] = {}
+        for name in cls._USAGE_COUNT_FIELDS:
+            value = usage.get(name) if isinstance(usage, dict) else getattr(usage, name, None)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                counts[name] = value
+        return counts
+
+    def observe_stream_chunk(self, chunk: Any) -> None:
+        """Record the usage a chunk of the current streamed LLM call reports.
+
+        magic-llm builds the per-iteration response of a streamed loop without
+        usage, so the consumer of the stream feeds chunks here. Providers may
+        report cumulative usage on several chunks; keep the highest counts.
+        """
+        usage = getattr(chunk, 'usage', None)
+        counts = self._usage_counts(usage)
+        if not counts:
+            return
+        previous = self._usage_counts(self._stream_usage)
+        usage = copy.deepcopy(usage)
+        for name in counts.keys() | previous.keys():
+            value = max(counts.get(name, 0), previous.get(name, 0))
+            if isinstance(usage, dict):
+                usage[name] = value
+            else:
+                setattr(usage, name, value)
+        self._stream_usage = usage
+
     # === AgentHooks Protocol Implementation ===
 
     def on_iteration_start(self, iteration: int, state: AgentState) -> None:
@@ -373,6 +415,7 @@ class HookRelay(AgentHooks):
             state: The current agent state (read-only).
         """
         state_iteration = self._iteration_from_state(state, iteration)
+        self._stream_usage = None
         context = self._build_context(
             inputs={
                 "iteration": iteration,
@@ -404,21 +447,37 @@ class HookRelay(AgentHooks):
         correlation), token usage from response.usage, and iteration metadata
         from state.
 
+        Streamed calls take their usage from the chunks passed to
+        observe_stream_chunk(). ``usage_reported`` is False when neither
+        source reported counts; the counts are then None, never zeros.
+
         Args:
             response: The raw LLM response.
             state: The current agent state (read-only).
         """
         usage = getattr(response, 'usage', None) or {}
         usage_outputs = self._usage_detail_outputs(usage, response_id=getattr(response, 'id', None))
-        self._current_provider_request_id = usage_outputs.get("provider_request_id")
+        request_id = usage_outputs.get("provider_request_id")
+        streamed = self._stream_usage is not None
+        if not self._usage_counts(usage) and streamed:
+            usage = self._stream_usage
+            usage_outputs = {**self._usage_detail_outputs(usage), "provider_request_id": request_id}
+        self._stream_usage = None
+        usage_reported = bool(self._usage_counts(usage))
+        if not usage_reported:
+            usage_outputs = {**self._usage_detail_outputs(None), "provider_request_id": request_id}
+        self._current_provider_request_id = request_id
 
         context = self._build_context(
+            # Consumers that count non-streamed usage separately key off this.
+            inputs={"streaming": bool(self._llm_config.get("streaming")) or streamed},
             outputs={
                 "model": getattr(response, 'model', 'unknown'),
                 "content": getattr(response, 'content', ''),
                 "finish_reason": getattr(response, 'finish_reason', None),
                 "iteration": self._iteration_from_state(state),
                 **usage_outputs,
+                "usage_reported": usage_reported,
             }
         )
         self._safe_invoke_sync("on_llm_end", context)
@@ -501,6 +560,8 @@ class HookRelay(AgentHooks):
             provider_request_id=provider_request_id,
             iteration=iteration,
         )
+        if not success:
+            context.error_type = getattr(result, 'error_type', None)
         # Merge additional outputs not covered by build_tool_context
         context.outputs["result"] = getattr(result, 'content', '')
         context.outputs["provider_request_id"] = provider_request_id

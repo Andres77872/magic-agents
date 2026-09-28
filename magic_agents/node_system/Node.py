@@ -303,6 +303,8 @@ class Node(abc.ABC):
                 _hook_ctx.error_type = type(e).__name__
                 _hook_ctx.error_message = error_msg
                 await hooks.invoke("on_node_error", _hook_ctx, error=e)
+                # Lets the executor mark its failure frame as a duplicate.
+                self._hook_reported_error = e
 
             # Legacy debug tracking — only when observer is inactive
             if observer is None:

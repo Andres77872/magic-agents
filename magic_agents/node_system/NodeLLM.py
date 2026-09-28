@@ -1152,6 +1152,7 @@ class NodeLLM(Node):
                         ):
                             self.generated += chunk.choices[0].delta.content or ''
                             last_chunk = chunk
+                            hook_relay.observe_stream_chunk(chunk)
                             for event in self._drain_tool_events(tool_functions):
                                 yield event
                             yield self.yield_static(chunk, content_type=self.OUTPUT_HANDLE_CONTENT)
@@ -1201,6 +1202,7 @@ class NodeLLM(Node):
                         async for chunk in stream:
                             self.generated += chunk.choices[0].delta.content or ''
                             last_chunk = chunk
+                            hook_relay.observe_stream_chunk(chunk)
                             for event in self._drain_tool_events(tool_functions):
                                 yield event
                             yield self.yield_static(chunk, content_type=self.OUTPUT_HANDLE_CONTENT)

@@ -216,6 +216,11 @@ class HookContext:
     # Forward reference to avoid circular import
     emit: Optional[Any] = None  # EmitInterface injected at runtime
     
+    # time.perf_counter() reading taken when the event happened. Only set by
+    # producers that dispatch hooks after the fact (HookRelay schedules tasks);
+    # None means the hook runs at event time, so observers read the clock then.
+    monotonic_time: Optional[float] = None
+    
     def to_dict(self) -> Dict[str, Any]:
         """Serialize context for logging/transmission.
         

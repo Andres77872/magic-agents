@@ -37,6 +37,15 @@ from magic_agents.debug.observer import DebugObserver
 logger = logging.getLogger(__name__)
 
 
+def _hook_reported(node: Any, error: BaseException) -> Dict[str, Any]:
+    """Mark a failure frame whose error ``on_node_error`` hooks already reported.
+
+    These frames echo the node's lifecycle failure for legacy consumers; hook
+    consumers (e.g. debug SSE) use the flag to avoid reporting it twice.
+    """
+    return {"lifecycle_reported": True} if getattr(node, "_hook_reported_error", None) is error else {}
+
+
 def find_iteration_subgraph(
     loop_id: str,
     nodes: Dict[str, Any],
@@ -697,7 +706,7 @@ async def execute_graph_reactive(
                         await dispatcher.propagate_conditional_bypass(node_id, selected_handle)
                         await _notify_conditional_bypasses(previously_bypassed)
         
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as e:
             dispatcher.set_state(node_id, NodeState.ERROR)
             _graph_has_errors = True
             logger.error("Node %s timed out", node_id)
@@ -707,7 +716,8 @@ async def execute_graph_reactive(
                     "node_id": node_id,
                     "error_type": "TimeoutError",
                     "error_message": f"Node timed out waiting for inputs after {dispatcher.timeout}s",
-                    "timestamp": datetime.now(UTC).isoformat()
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    **_hook_reported(node, e),
                 }
             })
             await _propagate_error_bypass(node_id)
@@ -722,7 +732,8 @@ async def execute_graph_reactive(
                     "node_id": node_id,
                     "error_type": type(e).__name__,
                     "error_message": str(e),
-                    "timestamp": datetime.now(UTC).isoformat()
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    **_hook_reported(node, e),
                 }
             })
             await _propagate_error_bypass(node_id)
@@ -1286,6 +1297,7 @@ async def execute_graph_loop_reactive(
                         "error_type": type(exc).__name__,
                         "error_message": str(exc),
                         "timestamp": datetime.now(UTC).isoformat(),
+                        **_hook_reported(node, exc),
                     },
                 }
             else:
@@ -1654,7 +1666,9 @@ async def execute_graph_loop_reactive(
                     "node_type": "LOOP",
                     "error_type": "InputError",
                     "error_message": error_msg,
-                    "timestamp": datetime.now(UTC).isoformat()
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    # error_loop_lifecycle() reports this failure to hooks next.
+                    **({"lifecycle_reported": True} if _loop_hook_context is not None else {}),
                 }
             }
             mark_failed(loop_id)
@@ -1681,7 +1695,9 @@ async def execute_graph_loop_reactive(
                 "node_type": "LOOP",
                 "error_type": "ValidationError",
                 "error_message": error_msg,
-                "timestamp": datetime.now(UTC).isoformat()
+                "timestamp": datetime.now(UTC).isoformat(),
+                # error_loop_lifecycle() reports this failure to hooks next.
+                **({"lifecycle_reported": True} if _loop_hook_context is not None else {}),
             }
         }
         mark_failed(loop_id)
