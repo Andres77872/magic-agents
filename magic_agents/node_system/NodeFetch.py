@@ -431,6 +431,12 @@ class FetchToolCallable:
                             response.status, response.reason,
                             redacted_preview,
                         )
+                        if getattr(self, '_strict_errors', False):
+                            from magic_agents.hooks.invocation_control import OperationFailure
+                            raise OperationFailure("HTTP_ERROR", f"HTTP {response.status}: {response.reason}",
+                                retryable=response.status == 429 or response.status >= 500,
+                                details={"http_status": response.status, "status_code": response.status,
+                                         "response_body": body_text})
                         # Return the FULL unredacted body to the agent.
                         # The redacted preview is ONLY for the log.
                         return (
@@ -440,23 +446,35 @@ class FetchToolCallable:
                     body = await response.text()
                     # Try to parse as JSON for cleaner output
                     try:
-                        return json.dumps(json.loads(body))
+                        parsed = json.loads(body)
+                        return parsed if getattr(self, '_strict_errors', False) else json.dumps(parsed)
                     except (json.JSONDecodeError, ValueError):
                         return body
 
         except aiohttp.ClientResponseError as e:
+            if getattr(self, '_strict_errors', False):
+                from magic_agents.hooks.invocation_control import OperationFailure
+                raise OperationFailure("HTTP_ERROR", f"HTTP {e.status}: {e.message}",
+                    retryable=e.status == 429 or e.status >= 500,
+                    details={"http_status": e.status, "status_code": e.status}) from e
             logger.warning(
                 "Tool '%s' caught aiohttp.ClientResponseError: HTTP %d %s",
                 self._tool_name, e.status, e.message,
             )
             return f"HTTP {e.status}: {e.message}"
         except aiohttp.ClientError as e:
+            if getattr(self, '_strict_errors', False):
+                from magic_agents.hooks.invocation_control import OperationFailure
+                raise OperationFailure("NETWORK_ERROR", str(e), retryable=True,
+                    details={"exception_type": type(e).__name__}) from e
             logger.warning(
                 "Tool '%s' caught %s: %s",
                 self._tool_name, type(e).__name__, str(e),
             )
             return json.dumps({"error": f"Network error: {str(e)}"})
         except Exception as e:
+            if getattr(self, '_strict_errors', False):
+                raise
             logger.warning(
                 "Tool '%s' caught %s: %s",
                 self._tool_name, type(e).__name__, str(e),
@@ -602,6 +620,7 @@ class NodeFetch(Node):
                 tool_parameters=tool_parameters,
                 debug=self.debug,
             )
+            callable_tool._source_node_id = self.node_id
             yield self.yield_static(callable_tool, content_type=self.OUTPUT_HANDLE)
             return
 

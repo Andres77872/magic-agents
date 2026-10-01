@@ -7,7 +7,7 @@ emit messages via emit.user/debug/feedback through dedicated output handles.
 
 Phase 6.1: Pydantic model with function_template, timeout_override, hook_type.
 """
-from typing import Optional
+from typing import Optional, Literal
 
 from pydantic import Field
 
@@ -49,3 +49,7 @@ class HookNodeModel(BaseNodeModel):
         default="custom",
         description="Hook lifecycle type: pre, post, error, custom"
     )
+
+    lifecycle_event: Optional[Literal["onStart", "onError", "onFinish", "onCancel", "onDeliver"]] = None
+    target_node_id: Optional[str] = None
+    failure_policy: Literal["preserve", "fail"] = "preserve"

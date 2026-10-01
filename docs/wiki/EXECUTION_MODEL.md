@@ -46,9 +46,10 @@ Nodes emit events with `yield_static(content, content_type=...)`.
 The executor then:
 
 1. matches `edge.sourceHandle`
-2. sends the payload into the target node under `edge.targetHandle`
+2. invokes an enabled edge Hook, when configured, and waits for its callback to finish
+3. sends the original payload into the target node under `edge.targetHandle`
 
-If an edge has `hooks` configured and enabled, the dispatcher can also invoke the referenced `hook` node as part of edge traversal.
+The referenced `hook` node always runs before the payload reaches that target. Its returned events are emitted separately and do not replace the payload. Hook errors and timeouts are isolated; the original payload is still forwarded.
 
 See [HANDLES_AND_ROUTING.md](HANDLES_AND_ROUTING.md).
 

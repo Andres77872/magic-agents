@@ -1,8 +1,10 @@
 # EdgeHookConfig — Edge-Level Hook Dispatch
 
+> For lifecycle decisions and connected recovery, see [NodeHook](../nodes/hook.md#lifecycle-controls). This page describes the existing observer behavior when `lifecycle_event` is unset.
+
 ## Purpose
 
-`EdgeHookConfig` attaches a `NodeHook` node to an edge. When output propagates through that edge, the dispatcher builds an edge `HookContext` and delivers it to the configured hook node.
+`EdgeHookConfig` attaches a `NodeHook` node to an edge. When output propagates through that edge, the dispatcher builds an edge `HookContext` and delivers it to the configured hook node first. The executor waits for the Hook callback before forwarding the original payload to the target.
 
 **Files**:
 - Model: `magic_agents/models/factory/EdgeNodeModel.py:24-52`
@@ -35,7 +37,7 @@ class EdgeHookConfig(BaseModel):
 
 ## Dispatch Flow
 
-At `event_dispatcher.py:251-275`:
+The dispatcher and executor perform these steps for each traversal:
 
 1. Check: `edge.hooks and edge.hooks.enabled and edge.hooks.hook_node_id`
 2. Look up the hook node by `hook_node_id` in `self.nodes`
@@ -45,7 +47,8 @@ At `event_dispatcher.py:251-275`:
    - `source_handle`, `target_handle`
    - `content` (the payload traversing the edge)
 5. Set `hook_node.inputs[INPUT_HANDLE_HOOK_CONTEXT] = _hook_ctx`
-6. Call `self.dispatch_input(hook_node_id, handle, ctx)` to trigger `NodeHook.process()`
+6. Invoke `NodeHook.process()` and wait for its callback to finish, emitting its returned events separately.
+7. Forward the original payload to the edge's target under `edge.targetHandle`. Hook return values do not replace this payload. Hook errors and timeouts are isolated, so forwarding still occurs.
 
 ## Binding Rule and Loop Traversals
 

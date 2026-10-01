@@ -223,7 +223,10 @@ class NodeLLM(Node):
             if not callable(drain):
                 continue
             for event in drain() or []:
-                if isinstance(event, dict) and event.get('type') == 'tool_usage':
+                if isinstance(event, dict) and event.get('type') == 'hook_result':
+                    yield {'type': 'debug', 'content': {'event_type': 'HOOK_RESULT',
+                           'node_id': self.node_id, 'data': event}}
+                elif isinstance(event, dict) and event.get('type') == 'tool_usage':
                     yield {
                         'type': 'debug',
                         'content': {
@@ -299,7 +302,8 @@ class NodeLLM(Node):
                         raise ValueError(f"NodeLLM:{self.node_id} bundle tool {name!r} has no callable")
                     if register(name, (id(value), index), bundle_source):
                         tools_schemas.append(schema)
-                        tool_functions[name] = function
+                        control = getattr(self, '_invocation_control', None)
+                        tool_functions[name] = control.wrap_tool(function, self, source.split('[')[0], getattr(self, '_invocation_chat_log', None)) if control else function
                         callable_names.add(name)
                         tag(function, '_mcp_node_id', bundle_source)
                 if getattr(value, 'server_instructions', None):
@@ -319,7 +323,8 @@ class NodeLLM(Node):
                     else:
                         # Public schema identity, not implementation __name__,
                         # determines which callable the model actually invokes.
-                        tool_functions[name] = function
+                        control = getattr(self, '_invocation_control', None)
+                        tool_functions[name] = control.wrap_tool(function, self, source.split('[')[0], getattr(self, '_invocation_chat_log', None)) if control else function
                         callable_names.add(name)
                         tag(function, '_source_node_id', source)
                 return
@@ -327,7 +332,8 @@ class NodeLLM(Node):
                 name = getattr(value, '__name__', None)
                 if register(name, id(value), source):
                     tools_schemas.append(value)
-                    tool_functions[name] = value
+                    control = getattr(self, '_invocation_control', None)
+                    tool_functions[name] = control.wrap_tool(value, self, source.split('[')[0], getattr(self, '_invocation_chat_log', None)) if control else value
                     callable_names.add(name)
                     tag(value, '_source_node_id', self.node_id)
                 return

@@ -216,7 +216,11 @@ class Node(abc.ABC):
         - Invokes on_node_error hook in exception path
         - HookContext constructed only when hooks are registered (lazy)
         """
-        if self._response is not None:
+        self._invocation_chat_log = chat_log
+        control = getattr(self, '_invocation_control', None)
+        definition = control.exports_tool_definitions(self) if control is not None else getattr(self, 'tool_mode', False)
+        controlled = control is not None and not getattr(self, '_control_active', False) and not definition and control.controlled(self.node_id)
+        if self._response is not None and not controlled:
             # Response is precomputed; yield immediately.
             yield {"type": "end", "content": self.prep(self._response)}
             return
@@ -266,7 +270,8 @@ class Node(abc.ABC):
         completed = False
         try:
             # Execute subclass-specific logic.
-            async with aclosing(self.process(chat_log)) as source:
+            processor = control.process_node(self, chat_log) if controlled else self.process(chat_log)
+            async with aclosing(processor) as source:
                 async for result in source:
                     yield result
             completed = True

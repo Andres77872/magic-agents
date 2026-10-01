@@ -14,7 +14,7 @@ constrained namespace, no sandboxing yet).
 import asyncio
 import inspect
 import logging
-import re
+import ast
 from datetime import datetime, UTC
 from typing import Optional, AsyncGenerator, Dict, Any, Callable
 
@@ -83,6 +83,10 @@ class NodeHook(Node):
             data.timeout_override if data.timeout_override is not None
             else self.DEFAULT_TIMEOUT_SECONDS
         )
+        self.lifecycle_event = data.lifecycle_event
+        self.target_node_id = data.target_node_id
+        self.failure_policy = data.failure_policy
+        self.OUTPUT_HANDLE_CALL = handles.get('child_call', 'handle-child-call')
         self._hook_type = data.hook_type  # 'pre', 'post', 'error', 'custom'
 
         # Resolve handle names from JSON override (handles dict)
@@ -201,6 +205,14 @@ class NodeHook(Node):
                 },
             )
 
+    async def invoke_control(self, context, chat_log):
+        """Run this real Hook template without shared graph-node input state."""
+        function = self._compile_hook_function(self._function_template)
+        if function is None:
+            raise ValueError("Hook function template could not be compiled")
+        function.__globals__['emit'] = context.emit
+        return await self._execute_function(function, context, chat_log)
+
     async def _execute_function(
         self,
         func: Callable,
@@ -290,18 +302,20 @@ class NodeHook(Node):
         Returns:
             Function name string, or None if not found.
         """
-        match = re.search(
-            r'(?:async\s+def|def)\s+(\w+)\s*\(',
-            template,
-        )
-        if match:
-            return match.group(1)
+        try:
+            statements = ast.parse(template).body
+        except SyntaxError:
+            return None
+        for statement in statements:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return statement.name
 
-        # Fallback: look for lambda assignment
-        match = re.search(r'(\w+)\s*=\s*lambda\s+', template)
-        if match:
-            return match.group(1)
-
+        # Keep the existing lambda fallback, limited to real top-level syntax.
+        for statement in statements:
+            if isinstance(statement, ast.Assign) and isinstance(statement.value, ast.Lambda):
+                for target in statement.targets:
+                    if isinstance(target, ast.Name):
+                        return target.id
         return None
 
     def _capture_internal_state(self):

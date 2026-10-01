@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Set, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Set, Optional
 from enum import Enum
 from dataclasses import dataclass, field
 
@@ -65,6 +65,7 @@ class GraphEventDispatcher:
         timeout: float = 60.0,
         execution_id: str = "",
         run_id: str = "",
+        edge_hook_runner: Optional[Callable[[str], Awaitable[None]]] = None,
     ):
         """
         Initialize the event dispatcher.
@@ -76,6 +77,8 @@ class GraphEventDispatcher:
             timeout: Timeout for waiting on inputs (seconds)
             execution_id: Graph execution ID for hook traceability.
             run_id: Run ID for hook traceability.
+            edge_hook_runner: Executor callback that finishes an attached Hook
+                before its edge's original input is delivered.
         """
         self.nodes = nodes
         self.edges = edges
@@ -84,6 +87,11 @@ class GraphEventDispatcher:
         self._execution_id = execution_id
         self._run_id = run_id
         self._sequence_counter: int = 0
+        self._delivery_events = []
+        self.edge_hook_runner = edge_hook_runner
+        from magic_agents.hooks.invocation_control import InvocationControl
+        self.invocation_control = InvocationControl(nodes, edges, timeout=timeout,
+            execution_id=execution_id, run_id=run_id)
         
         # Build dependency maps
         self._incoming: Dict[str, List[EdgeNodeModel]] = {}
@@ -114,6 +122,8 @@ class GraphEventDispatcher:
     def _build_edge_maps(self):
         """Build incoming and outgoing edge maps for quick lookup."""
         for edge in self.edges:
+            if edge.id in self.invocation_control.connections:
+                continue
             # Incoming edges (edges where this node is the target)
             self._incoming.setdefault(edge.target, []).append(edge)
             # Outgoing edges (edges where this node is the source)
@@ -181,6 +191,33 @@ class GraphEventDispatcher:
         """Return the tracker key for one declarative edge-hook trigger."""
 
         return f"__edge_hook__:{edge_id}:{hook_node_id}"
+
+    def get_bound_hook_ids(self) -> Set[str]:
+        """Hooks scheduled by an enabled edge instead of as ordinary nodes."""
+        return self.invocation_control.hook_ids | self.invocation_control.on_demand | {
+            edge.hooks.hook_node_id
+            for edge in self.edges
+            if edge.hooks
+            and edge.hooks.enabled
+            and edge.hooks.hook_node_id in self.nodes
+            and hasattr(self.nodes[edge.hooks.hook_node_id], "INPUT_HANDLE_HOOK_CONTEXT")
+        }
+
+    def get_hook_dependency_edges(self) -> List[EdgeNodeModel]:
+        """Virtual source-to-Hook edges for scheduling, never payload routing."""
+        bound_hook_ids = self.get_bound_hook_ids()
+        return [
+            EdgeNodeModel(
+                id=self._hook_trigger_edge_id(edge.id, edge.hooks.hook_node_id),
+                source=edge.source,
+                sourceHandle=edge.sourceHandle,
+                target=edge.hooks.hook_node_id,
+                targetHandle=self.nodes[edge.hooks.hook_node_id].INPUT_HANDLE_HOOK_CONTEXT,
+            )
+            for edge in self.edges
+            if edge.hooks and edge.hooks.enabled
+            and edge.hooks.hook_node_id in bound_hook_ids
+        ]
 
     async def _bypass_edge_hook_trigger(
         self,
@@ -265,6 +302,11 @@ class GraphEventDispatcher:
         # directly by handle would silently replace another tool on that slot.
         await tracker.receive_input(handle, content, edge_id=edge_id)
         if node:
+            edge = next((value for value in self.edges if value.id == edge_id), None)
+            if edge is not None:
+                callers = getattr(node, "_control_callers", {})
+                callers[edge.id] = {"node_id": edge.source, "edge_id": edge.id}
+                node._control_callers = callers
             tool_prefix = getattr(node, 'INPUT_TOOL_PREFIX', '')
             if getattr(node, 'node_type', None) == 'llm' and tool_prefix and handle.startswith(tool_prefix):
                 received = tracker.get_all_inputs_by_edge()
@@ -310,6 +352,8 @@ class GraphEventDispatcher:
             return None
 
         hook_node_id = edge.hooks.hook_node_id
+        if hook_node_id in self.invocation_control.hook_ids:
+            return None
         hook_node = self.nodes.get(hook_node_id)
         if not hook_node or not hasattr(hook_node, "INPUT_HANDLE_HOOK_CONTEXT"):
             return None
@@ -353,10 +397,9 @@ class GraphEventDispatcher:
         """
         Propagate a node's outputs to all downstream nodes.
         
-        Phase 8.2: When an edge has hooks configured with a hook_node_id, the
-        edge traversal context is passed to the NodeHook node as input on its
-        INPUT_HANDLE_HOOK_CONTEXT handle. The NodeHook executes as part of
-        normal graph processing when the executor reaches it.
+        An attached Hook receives the traversal context first. The executor
+        finishes its callback before the original input reaches the target.
+        Hook return values are separate outputs and do not replace this input.
         
         Args:
             source_node_id: ID of the node that produced outputs
@@ -373,16 +416,23 @@ class GraphEventDispatcher:
                 else:
                     content = output
                 
+                hook_node_id = await self.dispatch_edge_hook(edge, source_node_id, content)
+                if hook_node_id is not None and self.edge_hook_runner is not None:
+                    await self.edge_hook_runner(hook_node_id)
+
+                assign, content, record = await self.invocation_control.prepare_delivery(edge, content)
+                if record is not None:
+                    self._delivery_events.append({"type": "debug", "content": {"event_type": "HOOK_RESULT",
+                        "node_id": edge.target, "data": {"execution": record}}})
+                if not assign:
+                    await self._trackers[edge.target].receive_bypass(edge_id=edge.id)
+                    continue
                 await self.dispatch_input(
                     edge.target,
                     edge.targetHandle,
                     content,
                     edge_id=edge.id,
                 )
-                
-                # Deliver edge traversal context and notify the virtual hook
-                # dependency used by the normal reactive executor.
-                await self.dispatch_edge_hook(edge, source_node_id, content)
                 
                 logger.debug(
                     "Propagated %s.%s -> %s.%s",

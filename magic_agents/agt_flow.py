@@ -67,6 +67,7 @@ from magic_agents.execution import (
 )
 from magic_agents.util.const import HANDLE_VOID
 from magic_agents.util.env_resolver import resolve_connection_placeholders
+from magic_agents.util.lifecycle_hook_validation import validate_lifecycle_hooks
 from magic_agents.hooks.runtime_config import RuntimeConfig
 from magic_agents.hooks.flow_hooks import FlowHooks
 from magic_agents.util.graph_validator import (
@@ -280,7 +281,8 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False, deps: Opti
     """
     extra = {'debug': debug, 'node_id': node['id'], 'node_type': node['type']}
     node_type = node['type']
-    node_data = node.get('data', {})
+    # Keep authored handle aliases intact for fresh invocation factories.
+    node_data = dict(node.get('data', {}))
     
     # Extract handles from JSON data - this allows JSON to override default handle names
     handles = node_data.pop('handles', None)
@@ -483,7 +485,8 @@ def validate_graph(nodes: list[dict], edges: list[dict]) -> dict:
     Returns:
         dict: Validation result with 'valid' (bool) and 'errors' (list) keys.
     """
-    errors = []
+    from magic_agents.util.fetch_template_validation import validate_fetch_templates
+    errors = validate_fetch_templates(nodes)
     
     # Validation 1: Only ONE NodeUserInput (start node) is allowed
     user_input_nodes = [node for node in nodes if node['type'] == ModelAgentFlowTypesModel.USER_INPUT]
@@ -655,6 +658,8 @@ def validate_graph(nodes: list[dict], edges: list[dict]) -> dict:
             }
         })
     
+    errors.extend(validate_lifecycle_hooks(nodes, edges))
+
     return {
         "valid": len(errors) == 0,
         "errors": errors
@@ -824,6 +829,18 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
         node['id']: create_node(node, load_chat, agt_data.get('debug', False), deps=local_deps) for node in agt_data['nodes']
     }
     
+    # Real invocation controls instantiate fresh configured processors per call.
+    for definition in agt_data['nodes']:
+        prototype = nodes[definition['id']]
+        private_definition = copy.deepcopy(definition)
+        def invocation_factory(_definition=private_definition):
+            fresh = create_node(copy.deepcopy(_definition), load_chat, agt_data.get('debug', False), deps=local_deps)
+            if isinstance(fresh, NodeInner) and fresh.magic_flow:
+                fresh.inner_graph = build(copy.deepcopy(fresh.magic_flow), message="", load_chat=load_chat,
+                    extras=None, history_messages=history_messages, deps=deps, _node_path=(*_node_path, fresh.node_id))
+            return fresh
+        prototype._invocation_factory = invocation_factory
+
     # Build inner graphs for NodeInner nodes
     for node_id, node_instance in nodes.items():
         if isinstance(node_instance, NodeInner):
