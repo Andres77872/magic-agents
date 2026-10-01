@@ -11,6 +11,8 @@ Phase 5 additions:
 - parent state exposure (default and selective mapping)
 - child completion and output propagation
 """
+import time
+
 import pytest
 
 from magic_agents import run_agent
@@ -501,8 +503,9 @@ class TestInnerGraphErrorPropagation:
                 content_output.append(text)
 
         content_str = "".join(content_output)
-        # The outer graph completes (doesn't hang). Since NodeInner emits BYPASS_ALL
-        # when inner graph errors, downstream nodes like 'send' are bypassed.
+        # The outer graph completes (doesn't hang). A failed child node makes
+        # NodeInner raise INNER_FLOW_FAILED, so downstream nodes like 'send'
+        # are bypassed (see test_inner_flow_failure.py).
         # We verify completion by checking debug_summary and debug events.
 
         # There should be debug events about the inner graph error
@@ -645,7 +648,7 @@ class TestInnerNodeFlowIntegration:
 
     @pytest.mark.asyncio
     async def test_userinput_no_extras_backward_compat(self):
-        """5.3: UserInput doesn't yield extras handle when extras=None (backward compat)."""
+        """5.3: A graph that does not read Extras runs the same without request extras."""
         agt = {
             "type": "graph",
             "debug": True,
@@ -680,6 +683,36 @@ class TestInnerNodeFlowIntegration:
         
         content_str = "".join(content_output)
         assert "BACKWARD_COMPAT" in content_str
+
+    @pytest.mark.asyncio
+    async def test_userinput_extras_output_without_extras_fires_empty_object(self):
+        """A wired Extras output with no request extras and no default gives {} at once (no input timeout)."""
+        agt = {
+            "type": "graph",
+            "debug": True,
+            "timeout": 5,
+            "nodes": [
+                {"id": "input", "type": "user_input"},
+                {"id": "parser", "type": "parser", "data": {"text": "TIER=[{{ handle_extras.get('tier', 'none') }}]"}},
+                {"id": "end", "type": "end"},
+            ],
+            "edges": [
+                {"id": "e1", "source": "input", "target": "parser",
+                 "sourceHandle": "handle_client_extras", "targetHandle": "handle_extras"},
+                {"id": "e2", "source": "parser", "target": "end",
+                 "sourceHandle": "handle_parser_output", "targetHandle": "handle_flow_input"},
+            ],
+        }
+
+        graph = build(agt, message="no extras here")
+        assert graph.nodes.get("input")._extras is None
+
+        started = time.monotonic()
+        async for _ in run_agent(graph):
+            pass
+
+        assert time.monotonic() - started < 2
+        assert graph.nodes.get("parser").outputs["handle_parser_output"]["content"] == "TIER=[none]"
 
     # ========== Tests 5.4-5.7: Streaming and Flow State Isolation ==========
 

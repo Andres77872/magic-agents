@@ -221,7 +221,8 @@ class TestFetchMockedHTTP:
 
     @pytest.mark.asyncio
     async def test_fetch_mocked_http_error(self):
-        """Fetch with HTTP error yields debug error event."""
+        """Fetch with an HTTP error raises a typed HTTPError (no silent debug frame)."""
+        from magic_agents.node_system.fetch_request import HTTPError
         import aiohttp
 
         mock_response = MagicMock()
@@ -258,17 +259,19 @@ class TestFetchMockedHTTP:
         results = []
 
         with patch("aiohttp.ClientSession", return_value=mock_session):
-            async for item in fetch_node(chat_log):
-                results.append(item)
+            with pytest.raises(HTTPError) as raised:
+                async for item in fetch_node(chat_log):
+                    results.append(item)
 
         assert mock_session.request.called
         call_kwargs = mock_session.request.call_args
         assert call_kwargs.kwargs["method"] == "GET"
-        debug_events = [r for r in results if r.get("type") == "debug"]
-        assert len(debug_events) == 1
-        assert debug_events[0]["content"]["error_type"] == "HTTPError"
-        assert debug_events[0]["content"]["context"]["status_code"] == 500
-        assert debug_events[0]["content"]["context"]["headers"] == {}
+        assert [r for r in results if r.get("type") == "debug"] == []
+        assert type(raised.value).__name__ == "HTTPError"
+        assert str(raised.value).startswith("HTTP request failed with status 500")
+        # Sanitized context only: never the response headers.
+        assert raised.value.context == {
+            "method": "GET", "url": "https://api.example.com/error", "status_code": 500}
 
     @pytest.mark.asyncio
     async def test_fetch_no_inputs_returns_empty(self):

@@ -21,19 +21,15 @@ flowchart LR
   E --> F[LLM agent loop]
 ```
 
-## Repo examples
+## Application-owned definitions
 
-Current bundled example manifest:
-
-- `subagents/research.web.agent.yaml`
-- `subagents/research.web.md`
-- `subagents/research_web.py`
+Applications can provide their own `subagents/` directory with manifests and callable implementations. This repository does not bundle task subagent definitions. The directory is optional while the feature is disabled.
 
 ## Registration model
 
 1. YAML manifest defines identity and schema
 2. Python callable is decorated with MagicLLM's `@subagent(..., registry=...)`
-3. `NodeLLM` loads manifests from the `subagents/` directory when the feature is enabled
+3. `NodeLLM` loads manifests from the application's `subagents/` directory, relative to the process working directory, when the feature is enabled
 
 ## Current feature toggle API
 
@@ -45,6 +41,3 @@ from magic_agents.agt_flow import enable_task_subagents, disable_task_subagents
 
 - the feature is off by default
 - docs that import from `magic_agents.subagents` are stale for the current codebase
-- Magic Agents currently documents only one sample subagent: `research.web`
-
-If you need historical drift details, see [../issues/task-subagent-docs-drift.md](../issues/task-subagent-docs-drift.md).

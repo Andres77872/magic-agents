@@ -46,6 +46,69 @@ def _hook_reported(node: Any, error: BaseException) -> Dict[str, Any]:
     return {"lifecycle_reported": True} if getattr(node, "_hook_reported_error", None) is error else {}
 
 
+def _error_context(error: BaseException) -> Dict[str, Any]:
+    """Sanitized diagnostic context carried by typed node failures (Fetch).
+
+    Also for a Hook-controlled Fetch, whose failure is an ``OperationFailure``
+    with the context in its outcome details.
+    """
+    from magic_agents.node_system.fetch_request import error_context
+    context = error_context(error)
+    return {"context": context} if context else {}
+
+
+def _error_code(error: BaseException) -> Dict[str, Any]:
+    """Typed outcome code of an ``OperationFailure`` (e.g. INNER_FLOW_FAILED)."""
+    from magic_agents.hooks.invocation_control import error_code
+    code = error_code(error)
+    return {"error_code": code} if code else {}
+
+
+def _failure_record(error: BaseException) -> Dict[str, Any]:
+    """What a result sink keeps about one failed node (no message, no context).
+
+    ``retryable`` is taken from a typed outcome when the failure has one (a
+    Hook-controlled node, a sub-flow, a step-mode Fetch); otherwise it is None.
+    A failed Inner Flow also reports which of its steps caused the failure
+    (``cause_path``), so an enclosing Inner Flow names the same step.
+    """
+    from magic_agents.hooks.invocation_control import error_code, error_retryable
+    record = {
+        "error_type": type(error).__name__,
+        "error_code": error_code(error),
+        "retryable": error_retryable(error),
+    }
+    outcome = getattr(error, "outcome", None)
+    error_info = outcome.get("error") if isinstance(outcome, dict) else None
+    details = error_info.get("details") if isinstance(error_info, dict) else None
+    if (record["error_code"] == "INNER_FLOW_FAILED" and isinstance(details, dict)
+            and isinstance(details.get("cause_path"), list)):
+        record["cause_path"] = [str(part) for part in details["cause_path"]]
+    return record
+
+
+def _fill_result(
+    result: Optional[Dict[str, Any]],
+    *,
+    has_errors: bool,
+    summary: Optional[Dict[str, Any]],
+    node_errors: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> None:
+    """Report a finished execution to an optional caller-owned result sink.
+
+    Sub-flow callers (Inner Flow step and tool mode) decide failure from this
+    node state instead of from diagnostic frames, which may be non-fatal.
+    """
+    if result is None:
+        return
+    result.update({
+        "has_errors": bool(has_errors),
+        "failed_nodes": list((summary or {}).get("states", {}).get("error", [])),
+        "summary": summary,
+        "node_errors": dict(node_errors or {}),
+    })
+
+
 def find_iteration_subgraph(
     loop_id: str,
     nodes: Dict[str, Any],
@@ -330,13 +393,18 @@ async def execute_graph_reactive(
     hooks: Optional[HookRegistry] = None,  # Phase 4: hook registry for graph/node hooks
     runtime_config: Optional[RuntimeConfig] = None,  # Phase 4: runtime config for persistence/SSE auto-wiring
     debug_callback = None,  # Phase 1: optional async callback for debug events
+    result: Optional[Dict[str, Any]] = None,  # Optional sink: has_errors, failed_nodes, summary
 ) -> AsyncGenerator[ChatCompletionModel, None]:
     """
     Execute graph using reactive event-based model.
-    
+
     Nodes execute automatically when all their inputs are ready.
     Parallel execution happens naturally based on the graph topology.
-    
+
+    When ``result`` is a dict, it is filled once the run finishes with
+    ``has_errors`` (any node ended in ERROR, or blocking validation aborted
+    the run), ``failed_nodes``, ``summary`` and ``node_errors``.
+
     Args:
         graph: The agent flow graph to execute
         id_chat: Optional chat ID
@@ -373,6 +441,7 @@ async def execute_graph_reactive(
             }
         if blocking_errors:
             logger.error("Aborting execution: %d blocking validation error(s)", len(blocking_errors))
+            _fill_result(result, has_errors=True, summary=None)
             return
 
     # Phase 4: Wire persistence and debug hooks into existing HookRegistry.
@@ -398,6 +467,7 @@ async def execute_graph_reactive(
             extras=extras, flow_state=flow_state,
             run_id=run_id, parent_run_id=parent_run_id,
             hooks=hooks, debug_callback=debug_callback,
+            result=result,
         ):
             yield msg
         return
@@ -456,6 +526,7 @@ async def execute_graph_reactive(
     # === HOOK: on_graph_start (AFTER validation, BEFORE task creation, Phase 4) ===
     _graph_hook_context = None
     _graph_has_errors = False  # Track whether any node errored (for on_graph_error)
+    _node_failures: Dict[str, Dict[str, Any]] = {}  # node_id -> _failure_record (result sink)
     if hooks is not None and not hooks.is_empty():
         from magic_agents.hooks.context_factory import HookContextFactory
         _graph_hook_context = HookContextFactory.build_graph_context(
@@ -720,8 +791,12 @@ async def execute_graph_reactive(
             dispatcher.set_state(node_id, NodeState.ERROR if bypass_all_signaled else NodeState.COMPLETED)
             if bypass_all_signaled:
                 _graph_has_errors = True
+                _node_failures.setdefault(node_id, {"error_type": "BypassAll", "error_code": None, "retryable": None})
+                # A failed node delivers nothing: an output yielded next to
+                # BYPASS_ALL is never a result (same as the loop executor).
+                node.outputs.clear()
             logger.debug("Node %s completed", node_id)
-            
+
             # Propagate outputs to downstream nodes
             await dispatcher.propagate_outputs(node_id, node.outputs)
             for delivery_event in dispatcher._delivery_events:
@@ -764,6 +839,12 @@ async def execute_graph_reactive(
                                 "suggestion": "Ensure the condition template evaluates to a handle name that has a corresponding outgoing edge."
                             }
                         ))
+                        # A routing error is a node error, as in the loop
+                        # executor: the graph (or the sub-flow) has failed.
+                        dispatcher.set_state(node_id, NodeState.ERROR)
+                        _graph_has_errors = True
+                        _node_failures.setdefault(
+                            node_id, {"error_type": "GraphRoutingError", "error_code": None, "retryable": None})
                         previously_bypassed = _bypassed_node_ids()
                         await dispatcher.handle_bypass_all_signal(node_id)
                         await _notify_conditional_bypasses(previously_bypassed)
@@ -775,6 +856,7 @@ async def execute_graph_reactive(
         except asyncio.TimeoutError as e:
             dispatcher.set_state(node_id, NodeState.ERROR)
             _graph_has_errors = True
+            _node_failures[node_id] = {"error_type": "TimeoutError", "error_code": None, "retryable": None}
             logger.error("Node %s timed out", node_id)
             await output_queue.put({
                 "type": SYSTEM_EVENT_DEBUG,
@@ -791,6 +873,7 @@ async def execute_graph_reactive(
         except Exception as e:
             dispatcher.set_state(node_id, NodeState.ERROR)
             _graph_has_errors = True
+            _node_failures[node_id] = _failure_record(e)
             logger.error("Node %s failed: %s", node_id, str(e))
             await output_queue.put({
                 "type": SYSTEM_EVENT_DEBUG,
@@ -799,6 +882,8 @@ async def execute_graph_reactive(
                     "error_type": type(e).__name__,
                     "error_message": str(e),
                     "timestamp": datetime.now(UTC).isoformat(),
+                    **_error_code(e),
+                    **_error_context(e),
                     **_hook_reported(node, e),
                 }
             })
@@ -956,7 +1041,9 @@ async def execute_graph_reactive(
             }
         }
         CallbackEmitter.emit(_graph_end_event, chat_log)
-    
+
+    _fill_result(result, has_errors=_graph_has_errors, summary=_summary, node_errors=_node_failures)
+
     logger.info(
         "Execution complete: %d completed, %d bypassed, %d errors",
         _summary.get("completed", 0),
@@ -979,6 +1066,7 @@ async def execute_graph_loop_reactive(
     hooks: Optional[HookRegistry] = None,  # Phase 4: hook registry for graph/node hooks
     runtime_config: Optional[RuntimeConfig] = None,  # Direct-loop persistence/SSE auto-wiring
     debug_callback=None,                   # Phase 1: optional async callback for debug events
+    result: Optional[Dict[str, Any]] = None,  # Optional sink, see execute_graph_reactive
 ) -> AsyncGenerator[ChatCompletionModel, None]:
     """
     Execute an agent flow graph containing a Loop node using reactive model.
@@ -1022,6 +1110,7 @@ async def execute_graph_loop_reactive(
             }
         if blocking_errors:
             logger.error("Aborting loop execution: %d blocking validation error(s)", len(blocking_errors))
+            _fill_result(result, has_errors=True, summary=None)
             return
     
     nodes = graph.nodes
@@ -1155,6 +1244,7 @@ async def execute_graph_loop_reactive(
     failed_node_ids: Set[str] = set()
     # Graph failure history is sticky; routing is based on this invocation only.
     current_failed_node_ids: Set[str] = set()
+    node_failures: Dict[str, Dict[str, Any]] = {}  # node_id -> _failure_record (result sink)
 
     def mark_completed(node_id: str) -> None:
         """Record a unique graph node as successfully executed."""
@@ -1448,6 +1538,9 @@ async def execute_graph_loop_reactive(
                         node.outputs[item_type] = item["content"]
             except Exception as exc:
                 mark_failed(node_id)
+                node_failures[node_id] = _failure_record(exc)
+                # Whatever the node yielded before raising is not a result.
+                node.outputs.clear()
                 logger.error("Loop node %s failed: %s", node_id, exc)
                 yield {
                     "type": SYSTEM_EVENT_DEBUG,
@@ -1457,6 +1550,8 @@ async def execute_graph_loop_reactive(
                         "error_type": type(exc).__name__,
                         "error_message": str(exc),
                         "timestamp": datetime.now(UTC).isoformat(),
+                        **_error_code(exc),
+                        **_error_context(exc),
                         **_hook_reported(node, exc),
                     },
                 }
@@ -1473,6 +1568,7 @@ async def execute_graph_loop_reactive(
                 if bypass_all_signaled:
                     node.outputs.clear()
                     mark_failed(node_id)
+                    node_failures.setdefault(node_id, {"error_type": "BypassAll", "error_code": None, "retryable": None})
                     return
                 mark_completed(node_id)
 
@@ -1649,6 +1745,64 @@ async def execute_graph_loop_reactive(
                 )
 
         _pending_static_bypasses.clear()
+
+    # Bypasses caused by a failed node, reported like the reactive executor
+    # (reason "upstream_error"), never as conditional bypasses.
+    _pending_error_bypasses: List[Tuple[str, str, str, str, str]] = []
+
+    def propagate_failure_bypass(
+        failed_node_id: str,
+        *,
+        phase_edges: List,
+        phase_bypassed_edges: Set[str],
+        phase_bypassed_nodes: Set[str],
+        allowed_nodes: Optional[Set[str]] = None,
+    ) -> None:
+        """Bypass a failed node's outgoing edges (edge-scoped cascade)."""
+        for edge in phase_edges:
+            if edge.source == failed_node_id:
+                _propagate_edge_bypass(
+                    edge,
+                    phase_edges=phase_edges,
+                    phase_bypassed_edges=phase_bypassed_edges,
+                    phase_bypassed_nodes=phase_bypassed_nodes,
+                    pending=_pending_error_bypasses,
+                    allowed_nodes=allowed_nodes,
+                )
+
+    async def flush_error_bypass_notifications(
+        failed_node_id: str,
+        phase: str,
+        iteration: Optional[int] = None,
+    ) -> None:
+        """Deliver and clear the bypass notifications caused by one failed node."""
+        if not _pending_error_bypasses:
+            return
+        metadata: Dict[str, Any] = {"phase": phase, "upstream_error_node": failed_node_id}
+        if iteration is not None:
+            metadata["iteration"] = iteration
+        if hooks is not None and not hooks.is_empty():
+            from magic_agents.hooks.context_factory import HookContextFactory
+            for _nid, _ntype, _nclass, _eid, _rid in _pending_error_bypasses:
+                _bypass_ctx = HookContextFactory.build_bypass_context(
+                    execution_id=_eid,
+                    run_id=_rid,
+                    node_id=_nid,
+                    node_type=_ntype,
+                    node_class=_nclass,
+                    reason="upstream_error",
+                    metadata=dict(metadata),
+                )
+                await hooks.invoke("on_node_bypass", _bypass_ctx, reason="upstream_error")
+        if observer_registry.is_active:
+            for _nid, _ntype, _nclass, _eid, _rid in _pending_error_bypasses:
+                await observer_registry.graph_observer.on_node_bypass(
+                    node_id=_nid,
+                    node_type=_ntype,
+                    node_class=_nclass,
+                    reason="upstream_error",
+                )
+        _pending_error_bypasses.clear()
     
     # Build topological order for static nodes
     def topological_sort_static() -> List[str]:
@@ -1762,15 +1916,13 @@ async def execute_graph_loop_reactive(
             yield out
 
         if node_id in current_failed_node_ids:
-            for edge in static_bypass_edges:
-                if edge.source == node_id:
-                    _propagate_edge_bypass(
-                        edge,
-                        phase_edges=static_bypass_edges,
-                        phase_bypassed_edges=bypassed_edge_ids,
-                        phase_bypassed_nodes=bypassed_nodes,
-                        pending=_pending_static_bypasses,
-                    )
+            propagate_failure_bypass(
+                node_id,
+                phase_edges=static_bypass_edges,
+                phase_bypassed_edges=bypassed_edge_ids,
+                phase_bypassed_nodes=bypassed_nodes,
+            )
+            await flush_error_bypass_notifications(node_id, "static")
             continue
         
         # Handle conditional bypass propagation
@@ -1910,7 +2062,50 @@ async def execute_graph_loop_reactive(
         start_time = time.time()
         total_items = len(items)
         item_edges_traversed = False
-        
+
+        # Data edges whose value is produced during an iteration (by the loop
+        # item or by another iteration node). Their values never carry over to
+        # the next iteration; pre-loop (static) inputs are kept.
+        iteration_input_edges = [
+            edge for edge in all_edges
+            if edge.target in iteration_subgraph
+            and (edge.source in iteration_subgraph or edge.source == loop_id)
+            and edge.id not in dispatcher.invocation_control.connections
+        ]
+
+        def clear_iteration_inputs() -> None:
+            """Drop last iteration's values so a silent or failed producer is never replayed."""
+            for edge in iteration_input_edges:
+                target = nodes.get(edge.target)
+                if target is None:
+                    continue
+                target.inputs.pop(edge.targetHandle, None)
+                callers = getattr(target, "_control_callers", None)
+                if callers:
+                    callers.pop(edge.id, None)
+
+        def iteration_inputs_arrived(node_id: str, bypassed_edges: Set[str], bypassed: Set[str]) -> bool:
+            """Per-item readiness for one iteration node: did a value for THIS item arrive?
+
+            Only in-iteration edges count (from the loop item or from another
+            iteration node that ran and emitted in this iteration). Pre-loop
+            inputs (a Client, a fixed Text, tool definitions) are the same for
+            every item, so on their own they never make a node run: an LLM
+            whose message producer failed is skipped, not run without a
+            message. Failed, bypassed and silent producers deliver nothing.
+            A node with no in-iteration edge at all keeps running.
+            """
+            incoming = [edge for edge in iteration_input_edges if edge.target == node_id]
+            if not incoming:
+                return True
+            for edge in incoming:
+                if edge.id in bypassed_edges or edge.source in bypassed:
+                    continue
+                source = loop_node if edge.source == loop_id else nodes.get(edge.source)
+                if source is not None and source.outputs.get(edge.sourceHandle) is not None:
+                    return True
+            return False
+
         for idx, item in enumerate(items):
             # Check iteration limit
             if idx >= max_iterations:
@@ -1955,7 +2150,8 @@ async def execute_graph_loop_reactive(
             
             # Reset ALL nodes in the iteration subgraph (not just immediate downstream)
             reset_iteration_nodes(nodes, iteration_subgraph)
-            
+            clear_iteration_inputs()
+
             # Track bypassed nodes WITHIN this iteration (reset each iteration).
             # When a conditional selects one branch, all other branches and their
             # downstream nodes must be skipped.
@@ -1963,12 +2159,17 @@ async def execute_graph_loop_reactive(
                 node_id for node_id in bypassed_nodes if node_id in iteration_subgraph
             }
             iteration_bypassed_edges: Set[str] = set(bypassed_edge_ids)
+            # Nodes that failed in this iteration, or were skipped because of
+            # such a failure, mapped to the failed node (bypass reason).
+            iteration_failed_roots: Dict[str, str] = {}
             
             # Pending observer bypass notifications for this iteration.
             # Collected during sync propagate_bypass_iteration, flushed
             # asynchronously at the end of the iteration's node execution phase.
             _pending_iteration_bypasses: List[Tuple[str, str, str, str, str]] = []
-            
+            # Nodes skipped because no input arrived in this iteration.
+            _pending_iteration_input_bypasses: List[Tuple[str, str, str, str, str]] = []
+
             def bypass_non_selected_conditional_branches(cond_node_id: str, selected_handle: str):
                 """After a conditional executes, bypass all non-selected branches."""
                 for edge in all_edges:
@@ -2019,7 +2220,39 @@ async def execute_graph_loop_reactive(
                 if node_id in iteration_bypassed or node_id in bypassed_nodes:
                     logger.debug("Skipping bypassed iteration node %s", node_id)
                     continue
-                
+
+                # Like the reactive executor, a node runs with whatever arrived
+                # for this item, and is skipped when no in-iteration value did
+                # (its producers failed, were bypassed or stayed silent);
+                # pre-loop inputs alone never make it run.
+                if not iteration_inputs_arrived(node_id, iteration_bypassed_edges, iteration_bypassed):
+                    logger.debug("Iteration %d: no input arrived for %s, skipping it", idx, node_id)
+                    # Skipped because a producer failed in this item: reported as
+                    # upstream_error; a silent or bypassed producer: not_ready.
+                    failed_root = next((
+                        iteration_failed_roots[edge.source] for edge in iteration_input_edges
+                        if edge.target == node_id and edge.source in iteration_failed_roots
+                    ), None)
+                    pending = (_pending_error_bypasses if failed_root is not None
+                               else _pending_iteration_input_bypasses)
+                    if _record_phase_bypass(node_id, iteration_bypassed, pending):
+                        for edge in all_edges:
+                            if edge.source == node_id:
+                                _propagate_edge_bypass(
+                                    edge,
+                                    phase_edges=all_edges,
+                                    phase_bypassed_edges=iteration_bypassed_edges,
+                                    phase_bypassed_nodes=iteration_bypassed,
+                                    pending=pending,
+                                    allowed_nodes=iteration_subgraph,
+                                )
+                    if failed_root is not None:
+                        for bypassed_entry in _pending_error_bypasses:
+                            iteration_failed_roots.setdefault(bypassed_entry[0], failed_root)
+                        iteration_failed_roots.setdefault(node_id, failed_root)
+                        await flush_error_bypass_notifications(failed_root, "iteration", idx)
+                    continue
+
                 # Apply inputs from any edges where source has completed
                 # Use all_edges to capture conditional branch edges too
                 for edge in all_edges:
@@ -2045,16 +2278,17 @@ async def execute_graph_loop_reactive(
                     yield out
 
                 if node_id in current_failed_node_ids:
-                    for edge in all_edges:
-                        if edge.source == node_id:
-                            _propagate_edge_bypass(
-                                edge,
-                                phase_edges=all_edges,
-                                phase_bypassed_edges=iteration_bypassed_edges,
-                                phase_bypassed_nodes=iteration_bypassed,
-                                pending=_pending_iteration_bypasses,
-                                allowed_nodes=iteration_subgraph,
-                            )
+                    propagate_failure_bypass(
+                        node_id,
+                        phase_edges=all_edges,
+                        phase_bypassed_edges=iteration_bypassed_edges,
+                        phase_bypassed_nodes=iteration_bypassed,
+                        allowed_nodes=iteration_subgraph,
+                    )
+                    iteration_failed_roots[node_id] = node_id
+                    for bypassed_entry in _pending_error_bypasses:
+                        iteration_failed_roots.setdefault(bypassed_entry[0], node_id)
+                    await flush_error_bypass_notifications(node_id, "iteration", idx)
                     continue
                 
                 # After execution, handle conditional bypass propagation
@@ -2108,7 +2342,31 @@ async def execute_graph_loop_reactive(
                         reason="iteration_conditional_bypass",
                     )
                 _pending_iteration_bypasses.clear()
-            
+
+            # Nodes skipped for missing inputs (failed/silent producers).
+            if hooks is not None and not hooks.is_empty() and _pending_iteration_input_bypasses:
+                from magic_agents.hooks.context_factory import HookContextFactory
+                for _nid, _ntype, _nclass, _eid, _rid in _pending_iteration_input_bypasses:
+                    _bypass_ctx = HookContextFactory.build_bypass_context(
+                        execution_id=_eid,
+                        run_id=_rid,
+                        node_id=_nid,
+                        node_type=_ntype,
+                        node_class=_nclass,
+                        reason="not_ready",
+                        metadata={"phase": "iteration", "iteration": idx},
+                    )
+                    await hooks.invoke("on_node_bypass", _bypass_ctx, reason="not_ready")
+            if observer_registry.is_active and _pending_iteration_input_bypasses:
+                for _nid, _ntype, _nclass, _eid, _rid in _pending_iteration_input_bypasses:
+                    await observer_registry.graph_observer.on_node_bypass(
+                        node_id=_nid,
+                        node_type=_ntype,
+                        node_class=_nclass,
+                        reason="iteration_inputs_missing",
+                    )
+            _pending_iteration_input_bypasses.clear()
+
             # NOW collect the feedback AFTER all processing is complete (Issue #1 fix)
             # The feedback-producing node should have written to loop_node.inputs
             fb = loop_node.inputs.get(loop_node.INPUT_HANDLE_LOOP)
@@ -2281,16 +2539,14 @@ async def execute_graph_loop_reactive(
             yield out
 
         if node_id in current_failed_node_ids:
-            for edge in all_edges:
-                if edge.source == node_id:
-                    _propagate_edge_bypass(
-                        edge,
-                        phase_edges=all_edges,
-                        phase_bypassed_edges=bypassed_edge_ids,
-                        phase_bypassed_nodes=bypassed_nodes,
-                        pending=_pending_static_bypasses,
-                        allowed_nodes=post_loop_node_ids,
-                    )
+            propagate_failure_bypass(
+                node_id,
+                phase_edges=all_edges,
+                phase_bypassed_edges=bypassed_edge_ids,
+                phase_bypassed_nodes=bypassed_nodes,
+                allowed_nodes=post_loop_node_ids,
+            )
+            await flush_error_bypass_notifications(node_id, "post_loop")
             continue
 
         if isinstance(node, ConditionalRouting):
@@ -2349,5 +2605,7 @@ async def execute_graph_loop_reactive(
             bypassed_count=_summary.get("bypassed", 0),
             failed_count=_summary.get("errors", 0),
         )
-    
+
+    _fill_result(result, has_errors=_summary["errors"] > 0, summary=_summary, node_errors=node_failures)
+
     logger.info("Finished reactive loop execution")

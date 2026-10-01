@@ -560,19 +560,25 @@ class GraphEventDispatcher:
         self,
         source_node_id: str,
     ) -> List[str]:
-        """Propagate BYPASS to all downstream nodes after an upstream error.
+        """Propagate BYPASS along the failed node's edges after an upstream error.
         
-        When a node fails, all nodes downstream of it must be bypassed to
-        prevent indefinite hangs (they will never receive their inputs).
+        When a node fails, its outgoing edges will never deliver, so each of
+        them is marked bypassed (edge-scoped, like conditional and BYPASS_ALL
+        bypass) to prevent indefinite hangs. A downstream node is bypassed
+        only once ALL its incoming edges are bypassed; a fan-in node keeps
+        waiting for its other in-flight inputs and runs once with what
+        arrived, whatever the order in which its producers finish. Bypassed
+        nodes recurse the same way to their own targets.
         
         This differs from _recursive_bypass in that it's triggered by node
-        ERROR (not conditional routing) and returns the list of bypassed
-        node IDs for hook invocation by the executor.
+        ERROR (not conditional routing), also stops at nodes that already
+        failed, and returns the list of bypassed node IDs for hook
+        invocation (reason ``upstream_error``) by the executor.
         
         Args:
-            source_node_id: The node that encountered an error. All nodes
-                          reachable from this node's outgoing edges will
-                          be recursively bypassed.
+            source_node_id: The node that encountered an error. Each of its
+                          outgoing edges is bypassed; reachable nodes are
+                          bypassed once none of their inputs can arrive.
                           
         Returns:
             List of node IDs that were marked as BYPASSED.
@@ -593,11 +599,13 @@ class GraphEventDispatcher:
         bypassed: List[str],
         edge_id: Optional[str] = None,
     ) -> None:
-        """Recursively bypass downstream nodes and collect their IDs.
+        """Bypass one edge into ``node_id``; recurse when the node is fully bypassed.
         
         Args:
-            node_id: Node to bypass.
+            node_id: Target of the edge that can no longer deliver.
             bypassed: Accumulator list for bypassed node IDs.
+            edge_id: The edge to bypass. Other, still in-flight edges into the
+                same target are left alone so their values are not lost.
         """
         bypassed_hook_id = await self._bypass_edge_hook_trigger(edge_id)
         if bypassed_hook_id is not None and bypassed_hook_id not in bypassed:
@@ -616,8 +624,9 @@ class GraphEventDispatcher:
         if not tracker:
             return
         
-        # Mark all inputs as bypassed
-        await tracker.receive_bypass()
+        # Only the edge from the failed (or bypassed) source can no longer
+        # deliver; a fan-in sibling that is still running keeps its slot.
+        await tracker.receive_bypass(edge_id=edge_id)
         
         if tracker.is_bypassed:
             self.set_state(node_id, NodeState.BYPASSED)

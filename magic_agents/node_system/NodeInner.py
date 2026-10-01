@@ -14,6 +14,125 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+INNER_FLOW_FAILED = 'INNER_FLOW_FAILED'
+_MAX_CHILD_ERRORS = 20
+_MAX_ERROR_MESSAGE = 500
+
+
+class SubFlowOutcome:
+    """Decides whether one sub-flow run failed, and builds its typed failure.
+
+    Failure comes from child node STATE, reported by the executor's result
+    sink: a child node that raised, timed out waiting for inputs or signalled
+    BYPASS_ALL. A diagnostic frame alone (for example a JSONParseError that a
+    Hook recovered) is not a failure. The child's error frames only describe
+    the failure. The root cause is the first frame, after the child's
+    GRAPH_START, from a step that actually failed (never from a step that
+    recovered); input-wait timeouts are effects, so when they are the only
+    failures the first frame of the run (typically the silent producer's
+    diagnostic) is the cause.
+    """
+
+    def __init__(self):
+        self.result: dict = {}
+        self._started = False
+        self._errors: list = []  # (after_graph_start, node_path, error_type, error_message, error_code)
+
+    @property
+    def failed(self) -> bool:
+        return bool(self.result.get('has_errors'))
+
+    def observe(self, content: Any, node_path: list) -> None:
+        """Record one child debug frame (``node_path`` relative to the sub-flow)."""
+        if not isinstance(content, dict):
+            return
+        if content.get('event_type') == 'GRAPH_START':
+            # The child's own GRAPH_START always comes first; validation
+            # warnings are yielded before it and are never the root cause.
+            self._started = True
+            return
+        if not content.get('error_type'):
+            return
+        self._errors.append((
+            self._started,
+            [str(part) for part in node_path if part is not None],
+            str(content.get('error_type')),
+            str(content.get('error_message') or '')[:_MAX_ERROR_MESSAGE],
+            content.get('error_code') if isinstance(content.get('error_code'), str) else None,
+        ))
+
+    def _cause(self, ordered: list, failed_nodes: list, node_errors: dict):
+        """The frame naming the step that failed first, or None."""
+        def from_failed_step(entry) -> bool:
+            after_start, path, *_ = entry
+            if not after_start or not path or path[0] not in failed_nodes:
+                return False
+            if len(path) > 1:
+                # Forwarded from a failed nested Inner Flow: only the frame it
+                # named as its own cause (a recovered grandchild is not one).
+                cause_path = (node_errors.get(path[0]) or {}).get('cause_path')
+                return cause_path is None or path[1:] == list(cause_path)
+            return True
+
+        def input_timeout(node_id: str) -> bool:
+            record = node_errors.get(node_id) or {}
+            return record.get('error_type') == 'TimeoutError' and not record.get('error_code')
+
+        candidates = [entry for entry in ordered if from_failed_step(entry)]
+        primary = [entry for entry in candidates if not input_timeout(entry[1][0])]
+        if primary:
+            return primary[0]
+        if failed_nodes and all(input_timeout(node_id) for node_id in failed_nodes) and ordered:
+            # Only waits timed out: what happened first explains them.
+            return ordered[0]
+        if candidates:
+            return candidates[0]
+        if not failed_nodes and ordered:
+            # A run stopped before any step ran (blocking validation).
+            return ordered[0]
+        return None
+
+    def failure(self, *, partial_content: str, child_run_id: str, tool: bool = False):
+        """The typed ``OperationFailure('INNER_FLOW_FAILED')`` for a failed run."""
+        from magic_agents.hooks.invocation_control import OperationFailure
+        ordered = [e for e in self._errors if e[0]] + [e for e in self._errors if not e[0]]
+        failed_nodes = [str(node_id) for node_id in self.result.get('failed_nodes') or []]
+        node_errors = self.result.get('node_errors') or {}
+        cause = self._cause(ordered, failed_nodes, node_errors)
+        if cause is not None:
+            _, cause_path, error_type, error_message, code = cause
+            text = f"sub-flow step '{'/'.join(cause_path) or '?'}' failed: {code or error_type}: {error_message}"
+        else:
+            cause_path = None
+            text = f"sub-flow failed: {', '.join(failed_nodes) or 'a step'} ended in error"
+        message = f"Inner tool failed: {text}" if tool else text[0].upper() + text[1:]
+        # Retryable only when the failed step's own typed outcome says so (e.g.
+        # a Fetch HTTP 429/5xx, or a nested Inner Flow inheriting it).
+        retryable = False
+        for node_id in [cause_path[0]] if cause_path else failed_nodes:
+            value = (node_errors.get(node_id) or {}).get('retryable')
+            if value is not None:
+                retryable = value
+                break
+        return OperationFailure(
+            INNER_FLOW_FAILED,
+            message,
+            retryable=retryable,
+            details={
+                'failed_nodes': failed_nodes,
+                # Never the frames' context dicts (URLs, headers, previews).
+                'child_errors': [
+                    {'node_path': path, 'error_type': error_type, 'error_message': error_message,
+                     **({'error_code': code} if code else {})}
+                    for _, path, error_type, error_message, code in ordered[:_MAX_CHILD_ERRORS]
+                ],
+                # Path (relative to the sub-flow) of the step the message names.
+                'cause_path': cause_path,
+                'partial_content': partial_content,
+                'child_run_id': child_run_id,
+            },
+        )
+
 
 class NodeInner(Node):
     """
@@ -140,8 +259,8 @@ class NodeInner(Node):
         from magic_agents.util.const import SYSTEM_EVENT_DEBUG, SYSTEM_EVENT_DEBUG_SUMMARY
         content = ''
         extras = []
-        inner_had_error = False
-        
+        outcome = SubFlowOutcome()
+
         # Phase 0: generate child run_id for execution tree persistence
         child_run_id = f"run-{uuid.uuid4().hex}"
         # Execution and run identities are different correlation domains.  The
@@ -213,6 +332,7 @@ class NodeInner(Node):
                 run_id=child_run_id,           # Phase 0
                 parent_run_id=parent_run_id,   # Phase 0
                 hooks=_child_hooks,
+                result=outcome.result,
         ):
             # Legacy diagnostics and progress travel through the generator,
             # while FlowHooks use their shared sink directly. Prefix only these
@@ -225,8 +345,8 @@ class NodeInner(Node):
                                 or evt_content.get('loop_node_id') or evt_content.get('loop_id'))
                     child_path = [child_id] if child_id else []
                 yield {**evt, 'source_node_path': [self.node_id, *child_path]}
-                if evt_content.get('error_type'):
-                    inner_had_error = True
+                if evt.get('type') == SYSTEM_EVENT_DEBUG:
+                    outcome.observe(evt_content, child_path)
                 continue
 
             event = evt['content']
@@ -297,24 +417,19 @@ class NodeInner(Node):
                 "parent_execution_id": parent_execution_id,
                 "child_run_id": child_run_id,
                 "node_id": self.node_id,
-                "status": "error" if inner_had_error else "completed",
+                "status": "error" if outcome.failed else "completed",
                 "timestamp": datetime.now(UTC).isoformat(),
             }
         }
 
-        # If inner graph had errors, signal bypass so downstream nodes don't hang
-        if inner_had_error:
-            logger.warning(
-                "NodeInner:%s inner graph had errors — signaling BYPASS_ALL",
-                self.node_id
-            )
-            yield {"type": ConditionalSignalTypes.BYPASS_ALL, "content": None}
-            # Still yield whatever content was collected (may be partial)
-            if content:
-                yield self.yield_static(content, content_type=self.HANDLER_EXECUTION_CONTENT)
-            if extras:
-                yield self.yield_static(extras, content_type=self.HANDLER_EXECUTION_EXTRAS)
-            return
+        # A child node ended in ERROR: the Inner Flow node itself fails with a
+        # typed outcome (lifecycle Hooks see it; the executor bypasses
+        # downstream). The partial Result is never delivered; it is kept in
+        # the error details for a Hook that wants to adopt it.
+        if outcome.failed:
+            logger.warning("NodeInner:%s sub-flow failed (nodes in error: %s)",
+                           self.node_id, outcome.result.get('failed_nodes'))
+            raise outcome.failure(partial_content=content, child_run_id=child_run_id)
 
         yield self.yield_static(content, content_type=self.HANDLER_EXECUTION_CONTENT)
         if extras:

@@ -103,35 +103,40 @@ class GraphTool:
         from contextlib import aclosing
         from magic_agents.execution.reactive_executor import execute_graph_reactive
         from magic_agents.hooks.hook_registry import HookRegistry
+        from magic_agents.node_system.NodeInner import SubFlowOutcome
         graph = self._node._tool_graph_factory(copy.deepcopy(arguments), copy.deepcopy(self._extras))
         child_run_id = f'run-{uuid.uuid4().hex}'
         parent_hooks = self._node._hooks
         child_hooks = parent_hooks.fork_for_child(child_run_id=child_run_id, parent_node_id=self._source_node_id) if parent_hooks else HookRegistry()
         if graph.hooks is not None:
             child_hooks.register_graph(graph.hooks)
-        errors = []
+        # Same rule as step mode: the call fails when a child node ends in
+        # ERROR, not when a (possibly recovered) diagnostic was emitted.
+        outcome = SubFlowOutcome()
         execution = execute_graph_reactive(
             graph, id_chat=getattr(self._chat_log, 'id_chat', None),
             id_thread=getattr(self._chat_log, 'id_thread', None),
             id_user=getattr(self._chat_log, 'id_user', None), extras=copy.deepcopy(self._extras),
             flow_state=None, run_id=child_run_id,
             parent_run_id=getattr(parent_hooks, 'run_id', None) or getattr(self._chat_log, 'run_id', None),
-            hooks=child_hooks,
+            hooks=child_hooks, result=outcome.result,
         )
         async with aclosing(execution):
             async for event in execution:
                 self._capture_usage(event)
                 if event.get('type') == 'debug':
                     content = event.get('content', {})
-                    if content.get('error_type'):
-                        errors.append(content.get('error_message') or content.get('error_type'))
-        if errors:
-            raise RuntimeError('Inner tool failed: ' + '; '.join(str(error) for error in errors))
+                    path = event.get('source_node_path') or [content.get('node_id') or event.get('source_node')]
+                    outcome.observe(content, path)
         values = []
         for node_id in sorted(graph.nodes):
             node = graph.nodes[node_id]
             if getattr(node, 'node_type', None) == 'end':
                 values.extend(node.inputs.values())
+        if outcome.failed:
+            partial = '\n'.join(value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+                                for value in values if value is not None)
+            raise outcome.failure(partial_content=partial, child_run_id=child_run_id, tool=True)
         if not values:
             raise RuntimeError('Inner tool completed without a value reaching End')
         result = values[0] if len(values) == 1 else values

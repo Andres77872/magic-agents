@@ -12,6 +12,7 @@ import json
 import math
 import time
 import uuid
+from datetime import datetime, UTC
 from types import MappingProxyType
 
 from magic_agents.hooks.context_factory import HookContextFactory
@@ -47,6 +48,71 @@ class OperationFailure(Exception):
     def __init__(self, code, message, *, retryable=False, details=None):
         super().__init__(message)
         self.outcome = failure(code, message, retryable=retryable, details=details)
+
+
+def error_code(error):
+    """The typed outcome code of a node failure, or None for an untyped exception."""
+    outcome = getattr(error, "outcome", None)
+    if isinstance(outcome, dict) and isinstance(outcome.get("error"), dict):
+        code = outcome["error"].get("code")
+        return code if isinstance(code, str) else None
+    return None
+
+
+def error_retryable(error):
+    """``retryable`` of a typed node failure, or None when the failure is untyped.
+
+    A step-mode Fetch failure maps to the same typed outcome as under Hook
+    control (HTTP 429/5xx and network errors are retryable).
+    """
+    outcome = getattr(error, "outcome", None)
+    if isinstance(outcome, dict) and isinstance(outcome.get("error"), dict):
+        retryable = outcome["error"].get("retryable")
+        return retryable if type(retryable) is bool else None
+    from magic_agents.node_system.fetch_request import FetchError, operation_failure_for
+    if isinstance(error, FetchError):
+        mapped = operation_failure_for(error)
+        if mapped is not error:
+            return mapped.outcome["error"]["retryable"]
+    return None
+
+
+def _close_open_subgraphs(outputs, error):
+    """SUBGRAPH_END frames for sub-flows an interrupted operation left open.
+
+    An Inner Flow cancelled by its invocation budget (or interrupted by an
+    unexpected exception) never reaches its own SUBGRAPH_END; the kept trace
+    still pairs every SUBGRAPH_START with an end.
+    """
+    opened, closed = [], set()
+    for item in outputs:
+        content = item.get("content") if isinstance(item, dict) and item.get("type") == "debug" else None
+        if not isinstance(content, dict):
+            continue
+        if content.get("event_type") == "SUBGRAPH_START":
+            opened.append(item)
+        elif content.get("event_type") == "SUBGRAPH_END":
+            closed.add(content.get("child_run_id"))
+    reason = "cancelled" if isinstance(error, asyncio.CancelledError) else "interrupted"
+    frames = []
+    # Innermost first, as a sub-flow ends before the one that contains it.
+    for item in reversed(opened):
+        start = item["content"]
+        if start.get("child_run_id") in closed:
+            continue
+        frame = {"type": "debug", "content": {
+            "event_type": "SUBGRAPH_END",
+            "parent_execution_id": start.get("parent_execution_id"),
+            "child_run_id": start.get("child_run_id"),
+            "node_id": start.get("node_id"),
+            "status": "error",
+            "reason": reason,
+            "timestamp": datetime.now(UTC).isoformat(),
+        }}
+        if item.get("source_node_path") is not None:
+            frame["source_node_path"] = list(item["source_node_path"])
+        frames.append(frame)
+    return frames
 
 
 class _Emit:
@@ -210,16 +276,39 @@ class InvocationControl:
                 if handle not in node.inputs or value != node._safe_value(original_value):
                     node.inputs[handle] = snapshot(value)
         if getattr(node, "node_type", None) == "fetch":
-            from magic_agents.node_system.NodeFetch import FetchToolCallable
-            url, method, headers, data, json_data = node._resolve_runtime_request_config()
-            function = FetchToolCallable(url, method, headers, data, json_data,
-                params=node.params, tool_name=node.tool_name,
-                tool_description=node.tool_description, tool_parameters=node.tool_parameters)
+            if tool is None and not node.tool_mode:
+                # A controlled step Fetch runs the same request/response core
+                # as plain step mode. Its content is its input handle map (the
+                # template context), also for a child call or redirect, so
+                # another step Fetch's context.request["content"] replays as-is.
+                from magic_agents.node_system.fetch_request import FetchError, operation_failure_for
+                if not isinstance(content, dict):
+                    raise OperationFailure("INVALID_INPUT", "Fetch operation arguments must be an object")
+                if target_handle is not None:
+                    node.inputs = snapshot(content)
+                    # A child call or redirect is an explicit request: it is
+                    # sent even with empty content (no "no inputs" skip).
+                    node._explicit_invocation = True
+                result = {}
+                try:
+                    async for item in node.process(chat_log):
+                        if item.get("type") == node.OUTPUT_HANDLE:
+                            value = item.get("content")
+                            if isinstance(value, dict) and "node" in value and "content" in value:
+                                value = value["content"]
+                            result[node.OUTPUT_HANDLE] = node._safe_value(value)
+                except FetchError as exc:
+                    failure = operation_failure_for(exc)
+                    if failure is exc:
+                        raise  # TemplateError/UnexpectedError -> NODE_EXCEPTION
+                    raise failure from exc
+                return result
+            # Tool mode keeps the LLM tool contract, with typed HTTP failures.
+            function = node._build_tool_callable()
             function._strict_errors = True
             if not isinstance(content, dict):
                 raise OperationFailure("INVALID_INPUT", "Fetch operation arguments must be an object")
-            value = await function(**content)
-            return value if tool is not None or node.tool_mode else {node.OUTPUT_HANDLE: value}
+            return await function(**content)
         if tool is not None:
             if not isinstance(content, dict):
                 raise OperationFailure("INVALID_INPUT", "Tool arguments must be an object")
@@ -242,8 +331,16 @@ class InvocationControl:
         outputs = []
         node._hooks = getattr(original, "_hooks", None)
         node._tool_graph_factory = getattr(original, "_tool_graph_factory", None)
-        async for item in node.process(chat_log):
-            outputs.append(item)
+        try:
+            async for item in node.process(chat_log):
+                outputs.append(item)
+        except BaseException as exc:
+            # A failed (or timed-out) operation keeps the trace it produced,
+            # e.g. an Inner Flow's SUBGRAPH_START/END and child error frames.
+            if raw_events is not None:
+                raw_events.extend(outputs)
+                raw_events.extend(_close_open_subgraphs(outputs, exc))
+            raise
         is_tool = self.exports_tool_definitions(node)
         if is_tool and target_handle is not None:
             # Resolve the existing real authored tool, then call that operation;
@@ -264,6 +361,15 @@ class InvocationControl:
             return await asyncio.to_thread(function, **content)
         if raw_events is not None:
             raw_events.extend(outputs)
+        from magic_agents.models.factory.Nodes.ConditionalNodeModel import ConditionalSignalTypes
+        if any(item.get("type") == ConditionalSignalTypes.BYPASS_ALL for item in outputs):
+            # BYPASS_ALL is a node's failure signal (configuration/input errors),
+            # never a success handle.
+            errors = [item for item in outputs if item.get("type") == "debug"
+                      and isinstance(item.get("content"), dict) and item["content"].get("error_type")]
+            message = str(errors[-1]["content"].get("error_message") or "") if errors else ""
+            raise OperationFailure("NODE_ERROR", message or "Node signalled a failure without a result",
+                                   details=node._safe_value(errors[-1]) if errors else None)
         data = [item for item in outputs if item.get("type") not in ("debug", "debug_summary")]
         if not data:
             errors = [item for item in outputs if item.get("type") == "debug"]
@@ -362,8 +468,13 @@ class InvocationControl:
                     except asyncio.TimeoutError:
                         outcome = failure("NODE_TIMEOUT", "Node operation exceeded its invocation budget", retryable=True)
                     except Exception as exc:
+                        from magic_agents.node_system.fetch_request import error_context
+                        details = {"exception_type": type(exc).__name__}
+                        context = error_context(exc)  # sanitized Fetch diagnostics
+                        if context:
+                            details["context"] = context
                         outcome = failure("NODE_EXCEPTION", str(exc) or type(exc).__name__,
-                                          details={"exception_type": type(exc).__name__})
+                                          details=details)
             frame["original_outcome"] = snapshot(outcome)
             # Rejected work is a diagnostic record, not a lifecycle admission.
             # Keep its phase facts without redispatching callbacks that could
@@ -605,6 +716,11 @@ class InvocationControl:
                 if handle not in replayed:
                     yield node.yield_static(content, content_type=handle)
         elif outcome["status"] == "error":
+            # Keep the operation's own trace (child frames, SUBGRAPH_START/END)
+            # before the node fails, exactly as on the success path.
+            for item in raw_events:
+                if item.get("type") in ("debug", "debug_summary"):
+                    yield item
             error = outcome["error"]
             raise OperationFailure(error["code"], error["message"],
                                    retryable=error["retryable"], details=error["details"])

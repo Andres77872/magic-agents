@@ -8,7 +8,7 @@ This guide is about authoring graphs that match the current runtime.
 2. Treat handles as explicit API contracts between nodes.
 3. Use `output_handles` and `default_handle` on conditionals.
 4. Use `iterate: true` on `llm` nodes that must re-run inside a loop.
-5. Use `{{env.NAME}}` only in connection settings (Client credentials, Fetch requests, MCP servers); elsewhere it stays literal text.
+5. Use `{{env.NAME}}` only in connection settings (Client credentials, a Fetch node's own request fields, MCP servers); elsewhere it stays literal text. Values that reach a Fetch through its inputs, Hook content or tool arguments are data: never templated or env-resolved.
 6. Do not rely on `master`; the current runtime ignores it.
 
 ## Common flow shapes

@@ -73,7 +73,23 @@ Conditional execution is protocol-based.
 - the executor bypasses non-selected downstream branches recursively
 - `__bypass_all__` is used for error cases where no branch should continue
 
-If a conditional selects a handle with no matching outgoing edge, the executor emits a `GraphRoutingError` debug event and bypasses all downstream targets.
+If a conditional selects a handle with no matching outgoing edge, the executor emits a `GraphRoutingError` debug event, marks the conditional as a failed node (the run ends with `on_graph_error`, and a sub-flow that hits it fails its Inner Flow node) and bypasses all downstream targets. Both executors (static and loop) treat it the same way.
+
+## Node failures and the error cascade
+
+A node fails when it raises, times out waiting for its inputs, or emits `__bypass_all__`. The executor marks it `ERROR`, emits an error frame (`node_id`, `error_type`, `error_message`; `error_code` when the failure is a typed `OperationFailure`, and a sanitized `context` for Fetch), and the run ends with `on_graph_error` instead of `on_graph_end`. Nothing the failed node yielded is delivered downstream.
+
+The cascade is edge-scoped. Each outgoing edge of the failed node is marked bypassed; a downstream node is bypassed (reason `upstream_error`, recursively) only when **all** its incoming edges are bypassed. A fan-in node keeps waiting for its other in-flight inputs and runs once with what arrived, so the outcome does not depend on which producer finishes first. A node that receives nothing is skipped.
+
+An edge whose source completed without emitting that handle (a silent handle) is neither delivered nor bypassed, so a node that waits on it times out after the graph `timeout`, even when another of its inputs failed. Before the edge-scoped cascade, a sibling's failure bypassed such a node at once; now only its failed input is bypassed and the silent one is still awaited.
+
+### Result sink
+
+`execute_graph_reactive(..., result={})` (and `execute_graph_loop_reactive`) fill the dict when the run finishes: `has_errors` (any node ended in `ERROR`, or blocking validation aborted the run), `failed_nodes`, `summary` (`get_execution_summary()`) and `node_errors` (`{node_id: {error_type, error_code, retryable}}`; `retryable` is set only for typed failures, and a failed Inner Flow also has `cause_path`). Inner Flow step and tool mode use it to decide whether the sub-flow failed.
+
+### Inner Flow failures
+
+An Inner Flow fails when a node of its sub-flow ends in `ERROR` (child node state, not the presence of diagnostic frames: a `JSONParseError` diagnostic recovered by a Hook leaves the sub-flow successful). The Inner node then emits `SUBGRAPH_END` with `status: "error"` and raises `OperationFailure("INNER_FLOW_FAILED")`, so it is an ordinary failed node: downstream is bypassed, `on_node_error` fires, and `onError` / `onFinish` lifecycle Hooks on it see the typed outcome and can recover it. The partial result is not delivered; it is in `error.details.partial_content`. This holds for a failure the sub-flow tolerates too (a Loop item that fails, a fan-in that renders with the other inputs): an `onError` Hook can adopt `partial_content` to keep the degraded Result. See [../nodes/inner.md](../nodes/inner.md).
 
 ## Loop execution
 
@@ -97,10 +113,17 @@ flowchart LR
 
 For each item in the list:
 
-1. emit `handle_item`
-2. run the iteration subgraph in topological order
-3. collect feedback sent back into `handle_loop`
-4. append that feedback into the aggregation array
+1. clear the previous iteration's values: every input that an iteration node receives from the loop item or from another iteration node is removed (inputs from pre-loop nodes are kept)
+2. emit `handle_item`
+3. run the iteration subgraph in topological order
+4. collect feedback sent back into `handle_loop`
+5. append that feedback into the aggregation array (`null` when nothing was fed back)
+
+Within an iteration a node runs with whatever arrived **for this item** and is skipped when none of its in-iteration edges (from the loop item or from another iteration node) delivered a value, because the producers failed, were bypassed or stayed silent in this iteration. Pre-loop inputs (a Client, a fixed Text, tool definitions) are the same for every item, so on their own they never make a node run: an `llm` whose message producer failed is skipped, not called without a message. A node with at least one in-iteration value runs without the missing ones (for example a step fed by the item and by a failed step).
+
+- A skipped node reports `on_node_bypass` with reason `upstream_error` (metadata `phase: "iteration"`, `iteration`, `upstream_error_node`) when a producer failed in this item, and `not_ready` when its producers were silent or bypassed. Failure-caused bypasses in the static and post-loop phases also report `upstream_error`, like the reactive executor.
+- A node never runs with another item's value. The aggregated slot is `null` when the feedback node failed or was skipped; when the feedback node still ran with a partial input, the slot holds what it produced.
+- A node that fails in any iteration keeps the run's status failed (`on_graph_error`).
 
 `llm` nodes only re-run per iteration when `data.iterate: true`.
 

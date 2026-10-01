@@ -1,15 +1,24 @@
 import json
 import logging
 import re
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 import aiohttp
-from jinja2 import Template
-from urllib.parse import urlsplit
 
 from magic_agents.models.factory.Nodes import FetchNodeModel
 from magic_agents.node_system.Node import Node
-from magic_agents.util.env_resolver import resolve_env_placeholders
+from magic_agents.node_system.fetch_request import (
+    FetchRenderer,
+    FetchRequest,
+    FetchSecrets,
+    TemplateError as FetchTemplateError,
+    check_header_values,
+    check_method,
+    network_message,
+    parse_json_input,
+    parse_mapping,
+    send_step_request,
+)
 from magic_agents.util.primitive_coercion import coerce_primitive_by_type, input_has_value
 
 logger = logging.getLogger(__name__)
@@ -136,6 +145,29 @@ def _redact_body_preview(body_text: str, max_length: int = 500) -> str:
     return json.dumps(_redact_json_value(parsed))[:max_length]
 
 
+def _scrub_exception(error: BaseException, secrets: FetchSecrets) -> str:
+    """Exception text without any env value resolved for the request."""
+    return secrets.scrub(str(error))
+
+
+_TEMPLATE_VARIABLE = re.compile(r'\{\{(\w+)\}\}')
+
+
+def _template_variables(value: Any) -> list[str]:
+    """``{{name}}`` placeholders in a string or in any nested string leaf.
+
+    The renderer fills nested dict values and list items too, so the tool
+    schema must expose their variables as well.
+    """
+    if isinstance(value, str):
+        return _TEMPLATE_VARIABLE.findall(value)
+    if isinstance(value, dict):
+        return [name for item in value.values() for name in _template_variables(item)]
+    if isinstance(value, (list, tuple)):
+        return [name for item in value for name in _template_variables(item)]
+    return []
+
+
 def _json_parse_mapping(value: Any, field_name: str, tool_name: str, allow_none: bool = False) -> dict:
     """Safely normalize a mapping field that may be a dict, JSON string, None, or invalid."""
     if value is None:
@@ -166,6 +198,9 @@ class FetchToolCallable:
 
     Encapsulates NodeFetch's HTTP configuration. When invoked by the
     agentic loop, it executes the fetch and returns the response body.
+    The configuration is rendered with the shared sandboxed Fetch renderer;
+    tool arguments are inserted as data. ``literal_fields`` names request
+    fields that arrived on input handles: they are sent verbatim.
     """
 
     def __init__(
@@ -180,6 +215,7 @@ class FetchToolCallable:
         tool_description: Optional[str] = None,
         tool_parameters: Optional[dict] = None,
         debug: bool = False,
+        literal_fields: Optional[Iterable[str]] = None,
     ):
         self._url = url_template
         self._method = (method or "GET").upper().strip()
@@ -192,6 +228,7 @@ class FetchToolCallable:
         self._tool_parameters = tool_parameters  # Explicit schema params (optional)
         self._constants: dict = {}  # Literal values from tool_parameters (constant mode)
         self._debug = debug
+        self._literal_fields = frozenset(literal_fields or ())
 
     @property
     def __name__(self) -> str:
@@ -208,15 +245,14 @@ class FetchToolCallable:
         Parses all string values for {{variable}} patterns and returns
         a deduplicated sorted list of variable names.
         """
-        pattern = re.compile(r'\{\{(\w+)\}\}')
         variables: set[str] = set()
-        for value in [self._url, self._headers, self._data, self._json_data, self._params]:
-            if isinstance(value, str):
-                variables.update(pattern.findall(value))
-            elif isinstance(value, dict):
-                for v in value.values():
-                    if isinstance(v, str):
-                        variables.update(pattern.findall(v))
+        fields = {'url': self._url, 'headers': self._headers, 'data': self._data,
+                  'json_data': self._json_data, 'params': self._params}
+        # Fields from input handles are data, never rendered: no variables.
+        for name, value in fields.items():
+            if name in self._literal_fields:
+                continue
+            variables.update(_template_variables(value))
         return sorted(variables)
 
     @property
@@ -231,7 +267,6 @@ class FetchToolCallable:
             properties = {}
             required = []
             constants = {}
-            jinja2_pattern = re.compile(r'\{\{(\w+)\}\}')
 
             for param_name, param_def in self._tool_parameters.items():
                 if isinstance(param_def, dict) and "type" in param_def:
@@ -242,15 +277,15 @@ class FetchToolCallable:
                     }
                     if param_def.get("required", False):
                         required.append(param_name)
-                elif isinstance(param_def, str) and "{{" in param_def:
-                    # Mode 1: Jinja2 variable extraction
-                    vars_in_value = jinja2_pattern.findall(param_def)
-                    for var in vars_in_value:
+                elif (isinstance(param_def, str) and "{{" in param_def) or _template_variables(param_def):
+                    # Mode 1: Jinja2 variable extraction (nested leaves included)
+                    for var in _template_variables(param_def):
                         properties[var] = {
                             "type": "string",
                             "description": f"Template variable '{var}'",
                         }
-                        required.append(var)
+                        if var not in required:
+                            required.append(var)
                 else:
                     # Mode 2: Constant — store literal, do NOT expose as tool parameter
                     constants[param_name] = param_def
@@ -295,6 +330,69 @@ class FetchToolCallable:
     def tool_callable(self):
         return self
 
+    def _build_request(self, kwargs: dict, secrets: FetchSecrets) -> FetchRequest:
+        """Render the effective request once with the tool call arguments.
+
+        Static configuration (the node fields and every non-schema
+        ``tool_parameters`` entry) is the template; it is rendered exactly
+        once. Model arguments are inserted as data and are never templated or
+        env-resolved. Fields in ``_literal_fields`` came from input handles and
+        are sent verbatim.
+        """
+        renderer = FetchRenderer(kwargs, secrets)
+        literal = self._literal_fields
+        overrides: dict[str, Any] = {}
+        if self._tool_parameters:
+            # When tool_parameters is set, its non-schema entries (Jinja2
+            # strings and literal constants) override the request fields.
+            # Explicit-schema dicts ({"type": ...}) only describe arguments.
+            overrides = {key: value for key, value in self._tool_parameters.items()
+                         if not (isinstance(value, dict) and "type" in value)}
+
+        url = overrides.get('url', self._url)
+        if 'url' in overrides or 'url' not in literal:
+            url = renderer.text(url, 'url')
+        method = self._method
+        if 'method' in overrides:
+            method = str(renderer.text(overrides['method'], 'method')).upper().strip()
+        check_method(method)
+
+        headers = _json_parse_mapping(self._headers, "headers", self._tool_name)
+        if 'headers' not in literal:
+            headers = {key: renderer.text(value, 'headers') for key, value in headers.items()}
+        if 'headers' in overrides:
+            override = _json_parse_mapping(overrides['headers'], "headers", self._tool_name)
+            headers.update({key: renderer.text(value, 'headers') for key, value in override.items()})
+        check_header_values(headers)
+
+        params = overrides['params'] if 'params' in overrides else _json_parse_mapping(
+            self._params, "params", self._tool_name, allow_none=True)
+        params = renderer.body(params, 'params') if params is not None else None
+
+        data = overrides.get('data', self._data)
+        if data is not None and ('data' in overrides or 'data' not in literal):
+            data = renderer.body(data, 'data')
+
+        json_data = overrides.get('json_data', self._json_data)
+        if json_data is not None:
+            if 'json_data' in overrides or 'json_data' not in literal:
+                json_data = renderer.body(json_data, 'json_data')
+            else:
+                json_data = parse_json_input(json_data, 'json_data')
+
+        # Unknown entries are extra JSON body fields, rendered as body leaves.
+        known_keys = {'url', 'method', 'headers', 'data', 'json_data', 'params'}
+        extras = {key: renderer.tree(value, 'json_data') for key, value in overrides.items()
+                  if key not in known_keys}
+        if extras:
+            if json_data is None:
+                json_data = {}
+            if isinstance(json_data, dict):
+                json_data = {**json_data, **extras}
+
+        return FetchRequest(method, url, headers, params=params, json_body=json_data,
+                            data_body=data, secrets=secrets)
+
     async def __call__(self, **kwargs: str) -> str:
         """Execute HTTP fetch with provided parameters as template context.
 
@@ -305,181 +403,98 @@ class FetchToolCallable:
         are only used for tool schema generation and are NOT applied here.
 
         Args:
-            **kwargs: Template variables for URL, headers, body parameters.
+            **kwargs: Values inserted into the URL, headers and body templates.
+                They are data: never compiled as templates or env-resolved.
 
         Returns:
             Response body as JSON string, or error string on non‑2xx.
         """
+        strict = getattr(self, '_strict_errors', False)
+        secrets = FetchSecrets()
+        safe = "[unrendered url]"
+        request = None
         try:
-            # --- Phase 3: build effective request config from _tool_parameters ---
-            # When tool_parameters is set, it IS the request template.
-            # Render all non‑explicit‑schema entries, then use the result as
-            # overrides for the default request fields.
-            effective_url = self._url
-            effective_method = self._method
-            effective_headers = _json_parse_mapping(self._headers, "headers", self._tool_name)
-            effective_data = self._data
-            effective_json_data = self._json_data
-            effective_params = _json_parse_mapping(self._params, "params", self._tool_name, allow_none=True)
-
-            if self._tool_parameters:
-                rendered_config: dict[str, Any] = {}
-                jinja2_pattern = re.compile(r'\{\{(\w+)\}\}')
-                for key, value in self._tool_parameters.items():
-                    if isinstance(value, dict) and "type" in value:
-                        continue  # Mode 3: explicit schema only — skip for request execution
-                    if isinstance(value, str) and "{{" in value:
-                        # Mode 1: Jinja2 template — render with tool call args
-                        rendered_config[key] = Template(
-                            resolve_env_placeholders(value)
-                        ).render(kwargs)
-                    else:
-                        # Mode 2: literal constant — use as‑is
-                        rendered_config[key] = value
-
-                # Apply known request‑field overrides
-                if 'url' in rendered_config:
-                    effective_url = rendered_config['url']
-                if 'method' in rendered_config:
-                    effective_method = str(rendered_config['method']).upper().strip()
-                if 'headers' in rendered_config:
-                    hv = rendered_config['headers']
-                    if isinstance(hv, dict):
-                        effective_headers.update(hv)
-                if 'data' in rendered_config:
-                    effective_data = rendered_config['data']
-                if 'json_data' in rendered_config:
-                    effective_json_data = rendered_config['json_data']
-                if 'params' in rendered_config:
-                    effective_params = rendered_config['params']
-
-                # Unknown entries → merge into JSON body as extra fields
-                known_keys = {'url', 'method', 'headers', 'data', 'json_data', 'params'}
-                extras = {k: v for k, v in rendered_config.items() if k not in known_keys}
-                if extras:
-                    if effective_json_data is None:
-                        effective_json_data = {}
-                    if isinstance(effective_json_data, dict):
-                        effective_json_data.update(extras)
-
-            # --- Render effective config with Jinja2 ---
-            url_template = Template(resolve_env_placeholders(effective_url))
-            rendered_url = url_template.render(kwargs)
-
-            # Render headers
-            rendered_headers = {}
-            for k, v in effective_headers.items():
-                if isinstance(v, str):
-                    rendered_headers[k] = Template(resolve_env_placeholders(v)).render(kwargs)
-                else:
-                    rendered_headers[k] = v
-
-            # Render body/params
-            def _render_template_value(value):
-                if value is None:
-                    return None
-                resolved = resolve_env_placeholders(value)
-                if isinstance(resolved, str):
-                    tpl = Template(resolved)
-                    return tpl.render(kwargs)
-                if isinstance(resolved, dict):
-                    return {
-                        k: Template(resolve_env_placeholders(v)).render(kwargs) if isinstance(v, str) else v
-                        for k, v in resolved.items()
-                    }
-                return resolved
-
-            rendered_data = _render_template_value(effective_data)
-            rendered_json_data = _render_template_value(effective_json_data)
-            rendered_params = _render_template_value(effective_params)
+            request = self._build_request(kwargs, secrets)
+            safe = request.safe_url
+            if not request.has_body and request.method != 'GET':
+                return json.dumps({"error": f"No body provided for {request.method} request"})
 
             async with aiohttp.ClientSession() as session:
-                method_fn = session.request
-                fetch_kwargs: dict[str, Any] = {
-                    'method': effective_method,
-                    'url': rendered_url,
-                    'headers': rendered_headers if isinstance(rendered_headers, dict) else json.loads(rendered_headers),
-                }
-
-                if rendered_params is not None:
-                    fetch_kwargs['params'] = rendered_params if isinstance(rendered_params, dict) else json.loads(rendered_params)
-
-                if rendered_json_data is not None:
-                    fetch_kwargs['json'] = rendered_json_data if isinstance(rendered_json_data, dict) else json.loads(rendered_json_data)
-                elif rendered_data is not None:
-                    # ``data`` is the raw/form-body channel. Preserve strings
-                    # verbatim; only ``json_data`` requires JSON decoding.
-                    fetch_kwargs['data'] = rendered_data
-
-                if 'json' not in fetch_kwargs and 'data' not in fetch_kwargs:
-                    if effective_method != 'GET':
-                        return json.dumps({"error": f"No body provided for {effective_method} request"})
-
-                async with method_fn(**fetch_kwargs) as response:
+                async with session.request(**request.aiohttp_kwargs()) as response:
                     if response.status < 200 or response.status >= 300:
                         # Read the response body — it is available even on
                         # non‑2xx responses and must be passed to the agent.
-                        body_text = await response.text()
+                        # Env values used by this request are scrubbed.
+                        body_text = secrets.scrub(await response.text())
                         redacted_preview = _redact_body_preview(body_text)
-
-                        # Safe URL: scheme + netloc + path only (no query/fragment)
-                        parts = urlsplit(rendered_url)
-                        safe_url = f"{parts.scheme}://{parts.netloc}{parts.path}"
+                        reason = secrets.scrub(response.reason)
                         logger.warning(
                             "Tool '%s' %s %s returned HTTP %d %s. Response body: %s",
-                            self._tool_name, effective_method, safe_url,
-                            response.status, response.reason,
+                            self._tool_name, request.method, safe,
+                            response.status, reason,
                             redacted_preview,
                         )
-                        if getattr(self, '_strict_errors', False):
+                        if strict:
                             from magic_agents.hooks.invocation_control import OperationFailure
-                            raise OperationFailure("HTTP_ERROR", f"HTTP {response.status}: {response.reason}",
+                            raise OperationFailure("HTTP_ERROR", f"HTTP {response.status}: {reason}",
                                 retryable=response.status == 429 or response.status >= 500,
                                 details={"http_status": response.status, "status_code": response.status,
                                          "response_body": body_text})
-                        # Return the FULL unredacted body to the agent.
+                        # Return the FULL body to the agent (secrets scrubbed).
                         # The redacted preview is ONLY for the log.
                         return (
-                            f"HTTP {response.status}: {response.reason}"
+                            f"HTTP {response.status}: {reason}"
                             f"\n\nResponse body:\n{body_text}"
                         )
                     body = await response.text()
                     # Try to parse as JSON for cleaner output
                     try:
                         parsed = json.loads(body)
-                        return parsed if getattr(self, '_strict_errors', False) else json.dumps(parsed)
+                        return parsed if strict else json.dumps(parsed)
                     except (json.JSONDecodeError, ValueError):
                         return body
 
+        except FetchTemplateError as e:
+            if strict:
+                raise
+            logger.warning("Tool '%s' could not build its request: %s", self._tool_name, e)
+            return json.dumps({"error": f"Unexpected error: {e}"})
         except aiohttp.ClientResponseError as e:
-            if getattr(self, '_strict_errors', False):
+            message = secrets.scrub(e.message)
+            if strict:
                 from magic_agents.hooks.invocation_control import OperationFailure
-                raise OperationFailure("HTTP_ERROR", f"HTTP {e.status}: {e.message}",
+                raise OperationFailure("HTTP_ERROR", f"HTTP {e.status}: {message}",
                     retryable=e.status == 429 or e.status >= 500,
-                    details={"http_status": e.status, "status_code": e.status}) from e
+                    details={"http_status": e.status, "status_code": e.status}) from None
             logger.warning(
                 "Tool '%s' caught aiohttp.ClientResponseError: HTTP %d %s",
-                self._tool_name, e.status, e.message,
+                self._tool_name, e.status, message,
             )
-            return f"HTTP {e.status}: {e.message}"
+            return f"HTTP {e.status}: {message}"
         except aiohttp.ClientError as e:
-            if getattr(self, '_strict_errors', False):
+            # Never the full URL (query, user info, encoded secrets): an
+            # invalid-URL error keeps only scheme://host[:port]/path.
+            message = network_message(request, e) if request is not None else _scrub_exception(e, secrets)
+            if strict:
                 from magic_agents.hooks.invocation_control import OperationFailure
-                raise OperationFailure("NETWORK_ERROR", str(e), retryable=True,
-                    details={"exception_type": type(e).__name__}) from e
+                raise OperationFailure("NETWORK_ERROR", message or type(e).__name__, retryable=True,
+                    details={"exception_type": type(e).__name__}) from None
             logger.warning(
                 "Tool '%s' caught %s: %s",
-                self._tool_name, type(e).__name__, str(e),
+                self._tool_name, type(e).__name__, message,
             )
-            return json.dumps({"error": f"Network error: {str(e)}"})
+            return json.dumps({"error": f"Network error: {message}"})
         except Exception as e:
-            if getattr(self, '_strict_errors', False):
+            if strict:
                 raise
+            message = _scrub_exception(e, secrets)
+            if request is not None and isinstance(request.url, str) and request.url:
+                message = message.replace(request.url, request.safe_url)
             logger.warning(
                 "Tool '%s' caught %s: %s",
-                self._tool_name, type(e).__name__, str(e),
+                self._tool_name, type(e).__name__, message,
             )
-            return json.dumps({"error": f"Unexpected error: {str(e)}"})
+            return json.dumps({"error": f"Unexpected error: {message}"})
 
 
 class NodeFetch(Node):
@@ -534,6 +549,21 @@ class NodeFetch(Node):
         self.tool_parameters = getattr(data, 'tool_parameters', None)
         self.debug = getattr(data, 'debug', False)
 
+    def _runtime_literal_fields(self) -> frozenset[str]:
+        """Request fields whose value arrived on an input handle.
+
+        These values are data: they are sent verbatim, never compiled as
+        templates and never env-resolved. Templates and ``{{env.NAME}}``
+        placeholders apply only to the node's own static fields.
+        """
+        handles = {
+            'url': self.INPUT_HANDLE_URL,
+            'headers': self.INPUT_HANDLE_HEADERS,
+            'data': self.INPUT_HANDLE_DATA,
+            'json_data': self.INPUT_HANDLE_JSON_DATA,
+        }
+        return frozenset(field for field, handle in handles.items() if input_has_value(self.inputs, handle))
+
     def _resolve_runtime_request_config(self) -> tuple[str, str, Any, Any, Any]:
         url = self._default_url
         method = self._default_method
@@ -554,166 +584,103 @@ class NodeFetch(Node):
 
         return url, method, headers, data, jsondata
 
-    async def fetch(self, session, url, headers, data=None, json_data=None, params=None):
-        # Use the appropriate method (GET, POST, PUT, etc.)
-        method = session.request
-        kwargs = {
-            'method': self.method,
-            'url': url,
-            'headers': headers if type(headers) is dict else json.loads(headers)
-        }
+    def _build_tool_callable(self) -> FetchToolCallable:
+        """The LLM tool for this node's current configuration and inputs."""
+        url, method, headers, data, json_data = self._resolve_runtime_request_config()
+        return FetchToolCallable(
+            url_template=url,
+            method=method,
+            headers=headers,
+            data=data,
+            json_data=json_data,
+            params=self.params,
+            tool_name=self.tool_name,
+            tool_description=getattr(self, 'tool_description', None),
+            tool_parameters=getattr(self, 'tool_parameters', None),
+            debug=self.debug,
+            literal_fields=self._runtime_literal_fields(),
+        )
 
-        if params is not None:
-            params = params if type(params) is dict else json.loads(params)
-            kwargs['params'] = params
+    def _build_step_request(self) -> FetchRequest:
+        """Render the step-mode request; raises ``TemplateError``.
 
-        # Add data based on what's available
-        if json_data is not None:
-            json_data = json_data if type(json_data) is dict else json.loads(json_data)
-            kwargs['json'] = json_data
-        elif data is not None:
-            kwargs['data'] = data
+        Static fields are templates rendered with ``self.inputs`` (env
+        placeholders resolved); fields from input handles are sent verbatim.
+        Body fields are rendered per string leaf (see ``fetch_request``).
+        """
+        # A method from an input handle is data: it must be an HTTP token
+        # before it reaches a log line, a context or aiohttp.
+        check_method(self.method)
+        secrets = FetchSecrets()
+        renderer = FetchRenderer(self.inputs, secrets, base_context={"method": self.method})
+        literal = self._runtime_literal_fields()
 
-        if 'json' not in kwargs and 'data' not in kwargs:
-            if self.method != 'GET':
-                return {}
+        url = self.url if 'url' in literal else renderer.text(self.url, 'url')
+        if not isinstance(url, str) or not url:
+            raise FetchTemplateError("Fetch node has no URL", context={"field": "url", "method": self.method})
 
-        parts = urlsplit(url)
-        safe_url = f"{parts.scheme}://{parts.netloc}{parts.path}"
+        headers = parse_mapping(self.headers, 'headers', {"method": self.method})
+        if 'headers' not in literal:
+            headers = {key: renderer.text(value, 'headers') for key, value in headers.items()}
+        check_header_values(headers, {"method": self.method})
 
-        logger.info("NodeFetch:%s %s %s", self.node_id, self.method, safe_url)
-        if self.debug:
-            payload_type = 'json' if 'json' in kwargs else ('data' if 'data' in kwargs else 'none')
-            logger.debug("NodeFetch:%s request payload type=%s headers_keys=%s", self.node_id, payload_type, list(kwargs['headers'].keys()))
+        json_data = data = params = None
+        if self.jsondata is not None:
+            json_data = (parse_json_input(self.jsondata, 'json_data', {"method": self.method})
+                         if 'json_data' in literal else renderer.body(self.jsondata, 'json_data'))
+        elif self.data:
+            data = self.data if 'data' in literal else renderer.body(self.data, 'data')
+        if self.params is not None:
+            params = renderer.body(self.params, 'params')
 
-        async with method(**kwargs) as response:
-            if self.debug:
-                logger.debug("NodeFetch:%s response status=%s", self.node_id, response.status)
-            response.raise_for_status()
-            try:
-                return await response.json()
-            except aiohttp.ContentTypeError:
-                # Documentation endpoints such as llms.txt return text/plain.
-                # Keep declared JSON decoding errors visible to the caller.
-                return await response.text()
-
-    def _render_request_value(self, value):
-        resolved_value = resolve_env_placeholders(value)
-        template = Template(json.dumps(resolved_value))
-        return json.loads(template.render(self.inputs).replace('\n', ''))
+        return FetchRequest(self.method, url, headers, params=params, json_body=json_data,
+                            data_body=data, secrets=secrets)
 
     async def process(self, chat_log):
         self.url, self.method, self.headers, self.data, self.jsondata = self._resolve_runtime_request_config()
 
         # Tool mode: yield callable with explicit schema, do NOT execute fetch
         if self.tool_mode:
-            tool_parameters = getattr(self, 'tool_parameters', None)
-            callable_tool = FetchToolCallable(
-                url_template=self.url,
-                method=self.method,
-                headers=self.headers,
-                data=self.data,
-                json_data=self.jsondata,
-                params=self.params,
-                tool_name=self.tool_name,
-                tool_description=getattr(self, 'tool_description', None),
-                tool_parameters=tool_parameters,
-                debug=self.debug,
-            )
+            callable_tool = self._build_tool_callable()
             callable_tool._source_node_id = self.node_id
             yield self.yield_static(callable_tool, content_type=self.OUTPUT_HANDLE)
             return
 
-        # Normal mode: existing fetch execution logic (unchanged)
-        # Prepare the data to send
-        data_to_send = None
-        json_data_to_send = None
-        params_to_send = None
-        run = any(value is not None for value in self.inputs.values())
+        # Step mode. A failure raises a typed FetchError (HTTPError,
+        # NetworkError, TemplateError, UnexpectedError): the node fails, its
+        # downstream is bypassed at once and onError Hooks can recover it.
+        # An explicit Hook call (child call or redirect) always sends its
+        # request, also with empty content into a static-URL Fetch.
+        run = (any(value is not None for value in self.inputs.values())
+               or getattr(self, '_explicit_invocation', False))
         if not run:
             if self.debug:
                 logger.debug("NodeFetch:%s no inputs set; skipping request", self.node_id)
             yield self.yield_static({}, content_type=self.OUTPUT_HANDLE)
             return
-        
-        # Template the URL with Jinja2 to support dynamic query parameters and path segments
+
         try:
-            resolved_url = resolve_env_placeholders(self.url)
-            url_template = Template(resolved_url)
-            rendered_url = url_template.render(self.inputs)
-            if self.debug:
-                logger.debug("NodeFetch:%s templated URL: %s", self.node_id, rendered_url)
-        except Exception as e:
-            logger.error("NodeFetch:%s URL templating failed: %s", self.node_id, e)
-            yield self.yield_debug_error(
-                error_type="TemplateError",
-                error_message=f"URL templating failed: {str(e)}",
-                context={
-                    "url_template": self.url,
-                    "available_inputs": list(self.inputs.keys()),
-                    "exception_type": type(e).__name__
-                }
-            )
+            request = self._build_step_request()
+        except FetchTemplateError as error:
+            logger.error("NodeFetch:%s %s", self.node_id, error)
+            raise
+
+        if not request.has_body and request.method != 'GET':
+            yield self.yield_static({}, content_type=self.OUTPUT_HANDLE)
             return
 
-        resolved_headers = resolve_env_placeholders(self.headers)
-        
-        if self.jsondata is not None:
-            json_data_to_send = self._render_request_value(self.jsondata)
-        elif self.data:
-            data_to_send = self._render_request_value(self.data)
-
-        if self.params is not None:
-            params_to_send = self._render_request_value(self.params)
-
+        logger.info("NodeFetch:%s %s %s", self.node_id, request.method, request.safe_url)
+        if self.debug:
+            payload_type = 'json' if request.json_body is not None else ('data' if request.data_body is not None else 'none')
+            logger.debug("NodeFetch:%s request payload type=%s headers_keys=%s",
+                         self.node_id, payload_type, list(request.headers.keys()))
         try:
-            async with aiohttp.ClientSession() as session:
-                logger.debug("NodeFetch:%s executing fetch", self.node_id)
-                response_json = await self.fetch(
-                    session,
-                    rendered_url,  # Use templated URL instead of static self.url
-                    headers=resolved_headers,
-                    data=data_to_send,
-                    json_data=json_data_to_send,
-                    params=params_to_send
-                )
-            logger.info("NodeFetch:%s request completed", self.node_id)
-            yield self.yield_static(response_json, content_type=self.OUTPUT_HANDLE)
-        except aiohttp.ClientResponseError as e:
-            logger.error("NodeFetch:%s HTTP error %s: %s", self.node_id, e.status, e.message)
-            response_headers = dict(e.headers) if e.headers is not None else {}
-            yield self.yield_debug_error(
-                error_type="HTTPError",
-                error_message=f"HTTP request failed with status {e.status}: {e.message}",
-                context={
-                    "url": rendered_url,
-                    "method": self.method,
-                    "status_code": e.status,
-                    "headers": response_headers
-                }
-            )
-        except aiohttp.ClientError as e:
-            logger.error("NodeFetch:%s client error: %s", self.node_id, e)
-            yield self.yield_debug_error(
-                error_type="NetworkError",
-                error_message=f"Network request failed: {str(e)}",
-                context={
-                    "url": rendered_url,
-                    "method": self.method,
-                    "exception_type": type(e).__name__
-                }
-            )
-        except Exception as e:
-            logger.error("NodeFetch:%s unexpected error: %s", self.node_id, e)
-            yield self.yield_debug_error(
-                error_type="UnexpectedError",
-                error_message=f"Unexpected error during fetch: {str(e)}",
-                context={
-                    "url": rendered_url,
-                    "method": self.method,
-                    "exception_type": type(e).__name__
-                }
-            )
+            response = await send_step_request(request)
+        except Exception as error:
+            logger.error("NodeFetch:%s %s: %s", self.node_id, type(error).__name__, error)
+            raise
+        logger.info("NodeFetch:%s request completed", self.node_id)
+        yield self.yield_static(response, content_type=self.OUTPUT_HANDLE)
 
     def _capture_internal_state(self):
         """Capture Fetch-specific internal state for debugging."""

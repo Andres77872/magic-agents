@@ -90,9 +90,9 @@ class NodeUserInput(Node):
         yield self.yield_static(self._text, content_type=self.HANDLER_USER_MESSAGE)
         yield self.yield_static(self.files, content_type=self.HANDLER_USER_FILES)
         yield self.yield_static(self.images, content_type=self.HANDLER_USER_IMAGES)
-        # Yield client extras only if present (backward compatible)
-        if self._extras is not None:
-            yield self.yield_static(self._extras, content_type=self.HANDLER_CLIENT_EXTRAS)
+        # Always yield client extras: a request without extras (and no default)
+        # gives {}, so nodes wired to this output never wait for the input timeout.
+        yield self.yield_static(self._extras if self._extras is not None else {}, content_type=self.HANDLER_CLIENT_EXTRAS)
 
     def _capture_internal_state(self):
         """Capture UserInput-specific internal state for debugging."""

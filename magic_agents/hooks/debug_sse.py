@@ -183,17 +183,25 @@ class DebugSSEHook:
         )
 
     async def on_node_error(self, context: HookContext, error: Exception) -> None:
-        self._emit(
-            "node_error",
-            {
-                "node_id": context.node_id,
-                "node_type": context.node_type,
-                "error_type": type(error).__name__ if error else "UnknownError",
-                "error_message": str(error) if error else "Unknown error",
-                "duration_ms": context.duration_ms,
-            },
-            context=context,
-        )
+        from magic_agents.node_system.fetch_request import error_context
+
+        payload = {
+            "node_id": context.node_id,
+            "node_type": context.node_type,
+            "error_type": type(error).__name__ if error else "UnknownError",
+            "error_message": str(error) if error else "Unknown error",
+            "duration_ms": context.duration_ms,
+        }
+        from magic_agents.hooks.invocation_control import error_code
+        code = error_code(error) if error else None
+        if code:
+            # Typed outcome code, e.g. INNER_FLOW_FAILED or HTTP_ERROR.
+            payload["error_code"] = code
+        fetch_context = error_context(error) if error else None
+        if fetch_context:
+            # Sanitized: method, URL without query/user info, status code.
+            payload["context"] = fetch_context
+        self._emit("node_error", payload, context=context)
 
     async def on_node_bypass(self, context: HookContext, reason: str) -> None:
         self._emit("node_bypass", {"node_id": context.node_id, "reason": reason}, context=context)

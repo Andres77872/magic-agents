@@ -32,6 +32,7 @@ No Jev service or Jev credentials are used.
 - stores `selected_handle` for executor bypass propagation
 - uses `default_handle` only when the rendered result is empty
 - `__bypass_all__` is emitted on configuration/template errors, causing executor to skip all downstream branches
+- a rendered handle with no matching outgoing edge is a `GraphRoutingError`: the node counts as failed (graph error; a sub-flow fails its Inner Flow node) and all downstream branches are skipped
 
 ## Recommended fields
 
