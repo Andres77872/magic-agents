@@ -6,6 +6,7 @@ from magic_llm.model import ModelChat
 
 from magic_agents.models.factory.Nodes.ChatNodeModel import ChatNodeModel
 from magic_agents.node_system.Node import Node
+from magic_agents.node_system.chat_attachments import ChatAttachmentProcessor, MAX_CHAT_FILES
 from magic_agents.node_system.utils import apply_windowing
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,11 @@ class NodeChat(Node):
         - NodeChat does NOT load persisted history from DB - backend prepares it
         - NodeChat composes additional layers on top of backend-provided base
         """
+        file_cache = kwargs.pop('file_cache', None)
+        self._attachment_processor = ChatAttachmentProcessor(
+            redis_config=data.file_cache_redis, cache=file_cache,
+            ttl_seconds=data.file_cache_ttl_seconds,
+        )
         super().__init__(**kwargs)
         
         # Session configuration from validated model
@@ -147,10 +153,9 @@ class NodeChat(Node):
     ) -> list[tuple[str, str | bytes | list[str | bytes] | None]]:
         """Normalize file inputs already converted to prompt text and optional images.
 
-        ``ModelChat`` has no provider-neutral raw-file primitive. The file handle
-        therefore accepts the established ``[text, image]`` pair format and an
-        equivalent mapping format (``text``/``content`` plus optional image/url).
-        Text-only descriptors are useful for extracted document content.
+        Keep established ``[text, image]`` pairs and equivalent mappings
+        (``text``/``content`` with optional image/url) working alongside real
+        raw-file descriptors processed by ``ChatAttachmentProcessor``.
         """
         descriptors: list[tuple[str, str | bytes | list[str | bytes] | None]] = []
         for index, value in enumerate(values):
@@ -172,6 +177,82 @@ class NodeChat(Node):
             normalized_image = None if image is None else cls._normalize_image_reference(image)
             descriptors.append((text, normalized_image))
         return descriptors
+
+    async def prepare_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Inject file inputs into provider messages; keep caller history unmodified.
+
+        API clients can reuse this NodeChat boundary for chats without a graph.
+        Files stay descriptors in persisted history and are parsed here when the
+        provider messages are assembled. Owned Redis clients are always closed.
+        """
+        prepared: list[dict[str, Any]] = []
+        try:
+            for original in messages:
+                message = dict(original)
+                files = self._decode_attachment_input(message.pop('files', None))
+                images = self._decode_attachment_input(message.pop('images', None))
+                if len(files) > MAX_CHAT_FILES:
+                    raise ValueError(f'Chat supports at most {MAX_CHAT_FILES} file attachments per message.')
+                if not files and not images:
+                    prepared.append(message)
+                    continue
+                if message.get('role') != 'user':
+                    raise ValueError('File and image attachments must belong to a user message.')
+                for value in files:
+                    if isinstance(value, dict) and (any(key in value for key in ('data', 'mime_type'))
+                            or ('name' in value and not any(key in value for key in ('text', 'content', 'message')))):
+                        file_text = await self._attachment_processor.parse_file(value)
+                        prepared.append({'role': 'user', 'content': file_text})
+                    else:
+                        # Preserve previously extracted [text, image] inputs.
+                        file_text, file_image = self._normalize_file_descriptors([value])[0]
+                        temporary = ModelChat()
+                        temporary.add_user_message(file_text, file_image)
+                        prepared.extend(temporary.messages)
+                content = message.get('content', '')
+                if images:
+                    pair_like = [
+                        isinstance(item, (list, tuple, dict))
+                        and not (isinstance(item, dict)
+                                 and any(key in item for key in ('url', 'image', 'image_url'))
+                                 and not any(key in item for key in ('text', 'content', 'message')))
+                        for item in images
+                    ]
+                    if any(pair_like) and not all(pair_like):
+                        raise ValueError('Image entries must not mix image references with legacy file descriptors.')
+                    if all(pair_like):
+                        for file_text, file_image in self._normalize_file_descriptors(images):
+                            temporary = ModelChat()
+                            temporary.add_user_message(file_text, file_image)
+                            prepared.extend(temporary.messages)
+                        if content:
+                            prepared.append(message)
+                    else:
+                        normalized_images = [self._normalize_image_reference(image) for image in images]
+                        if isinstance(content, list):
+                            # Preserve already normalized image/text content from history.
+                            prepared.append({**message, 'content': [*content, *[
+                                {'type': 'image_url', 'image_url': {'url': image}}
+                                for image in normalized_images
+                            ]]})
+                        elif isinstance(content, str) or content is None:
+                            temporary = ModelChat()
+                            temporary.add_user_message(content or ' ', normalized_images)
+                            multimodal = temporary.messages[0]['content']
+                            if not content:
+                                multimodal = [part for part in multimodal if part.get('type') != 'text']
+                            prepared.append({**message, 'content': multimodal})
+                        else:
+                            raise ValueError('User message content must be text or multimodal content.')
+                elif content:
+                    prepared.append(message)
+            return prepared
+        finally:
+            await self.aclose()
+
+    async def aclose(self) -> None:
+        """Close only connections owned by this node; injected cache stays caller-owned."""
+        await self._attachment_processor.aclose()
 
     async def process(self, chat_log):
         """
@@ -225,71 +306,34 @@ class NodeChat(Node):
             logger.debug("NodeChat:%s setting system context", self.node_id)
             self.chat.set_system(c)
         
-        # Slot 5: User message (final slot)
-        if c := self.get_input(self.INPUT_HANDLER_USER_MESSAGE):
-            raw_images = self.get_input(self.INPUT_HANDLER_USER_IMAGES)
-            raw_files = self.get_input(self.INPUT_HANDLER_USER_FILES)
-            images: list[Any] = []
-            files: list[Any] = []
-            try:
-                images = self._decode_attachment_input(raw_images) if raw_images else []
-                files = self._decode_attachment_input(raw_files) if raw_files else []
+        # Slot 5: Files are real inputs; NodeChat injects their parsed content.
+        current_text = self.get_input(self.INPUT_HANDLER_USER_MESSAGE)
+        raw_images = self.get_input(self.INPUT_HANDLER_USER_IMAGES)
+        raw_files = self.get_input(self.INPUT_HANDLER_USER_FILES)
+        images: list[Any] = []
+        files: list[Any] = []
+        self._attachment_processor.warnings.clear()
+        try:
+            images = self._decode_attachment_input(raw_images)
+            files = self._decode_attachment_input(raw_files)
+            if current_text or files or images:
+                self.chat.messages.append({'role': 'user', 'content': current_text or '',
+                                           'files': files, 'images': images})
+            self.chat.messages = await self.prepare_messages(self.chat.messages)
+        except (TypeError, ValueError) as exc:
+            logger.error("NodeChat:%s invalid attachment input: %s", self.node_id, exc)
+            yield self.yield_debug_error(
+                error_type="ValidationError", error_message=str(exc),
+                context={"images_handle": self.INPUT_HANDLER_USER_IMAGES,
+                         "files_handle": self.INPUT_HANDLER_USER_FILES,
+                         "images_count": len(images), "files_count": len(files)},
+            )
+            return
+        for warning in self._attachment_processor.warnings:
+            diagnostic = self.yield_debug_error('FileCacheWarning', warning)
+            diagnostic['content']['severity'] = 'warning'
+            yield diagnostic
 
-                if images and files:
-                    raise ValueError("User images and files cannot be used together.")
-
-                if files:
-                    logger.debug("NodeChat:%s adding %d file descriptors", self.node_id, len(files))
-                    for file_text, file_image in self._normalize_file_descriptors(files):
-                        self.chat.add_user_message(file_text, file_image)
-                    self.chat.add_user_message(c)
-                elif images:
-                    pair_like = [
-                        isinstance(item, (list, tuple, dict))
-                        and not (
-                            isinstance(item, dict)
-                            and any(key in item for key in ("url", "image", "image_url"))
-                            and not any(key in item for key in ("text", "content", "message"))
-                        )
-                        for item in images
-                    ]
-                    if any(pair_like) and not all(pair_like):
-                        raise ValueError(
-                            "Image entries must not mix image references with legacy file descriptors."
-                        )
-                    if all(pair_like):
-                        # Backward compatibility for graphs that historically routed
-                        # file [text, image] pairs through the images handle.
-                        for file_text, file_image in self._normalize_file_descriptors(images):
-                            self.chat.add_user_message(file_text, file_image)
-                        self.chat.add_user_message(c)
-                    else:
-                        normalized_images = [
-                            self._normalize_image_reference(image) for image in images
-                        ]
-                        logger.debug(
-                            "NodeChat:%s adding user message with %d images",
-                            self.node_id,
-                            len(normalized_images),
-                        )
-                        self.chat.add_user_message(c, normalized_images)
-                else:
-                    logger.debug("NodeChat:%s adding user message", self.node_id)
-                    self.chat.add_user_message(c)
-            except (TypeError, ValueError) as exc:
-                logger.error("NodeChat:%s invalid attachment input: %s", self.node_id, exc)
-                yield self.yield_debug_error(
-                    error_type="ValidationError",
-                    error_message=str(exc),
-                    context={
-                        "images_handle": self.INPUT_HANDLER_USER_IMAGES,
-                        "files_handle": self.INPUT_HANDLER_USER_FILES,
-                        "images_count": len(images),
-                        "files_count": len(files),
-                    },
-                )
-                return
-        
         # Post-merge windowing (Layer 1 - PRIMARY)
         if self._max_messages is not None or self._max_input_tokens is not None:
             self._messages_before_windowing = len(self.chat.messages)
@@ -323,6 +367,8 @@ class NodeChat(Node):
         state['session_required'] = self._session_required
         state['messages_append_mode'] = self._messages_append_mode
         state['custom_messages_count'] = len(self._custom_messages)
+        state['file_cache_configured'] = bool(self._attachment_processor.redis_config or self._attachment_processor.cache is not None)
+        state['file_cache_warnings'] = list(self._attachment_processor.warnings)
         
         # Capture memory configuration
         state['memory'] = self._memory

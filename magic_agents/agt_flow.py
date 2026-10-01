@@ -666,7 +666,7 @@ def validate_graph(nodes: list[dict], edges: list[dict]) -> dict:
     }
 
 
-def build(agt_data, message: str, images: list[str] = None, load_chat=None, extras: Optional[dict[str, Any]] = None, history_messages: Optional[list[dict[str, Any]]] = None, deps: Optional[dict[str, Any]] = None, _node_path: tuple[str, ...] = ()) -> AgentFlowModel:
+def build(agt_data, message: str, images: list[str] = None, load_chat=None, extras: Optional[dict[str, Any]] = None, history_messages: Optional[list[dict[str, Any]]] = None, deps: Optional[dict[str, Any]] = None, _node_path: tuple[str, ...] = (), files: Optional[list[Any]] = None) -> AgentFlowModel:
     """
     Prepare and build the agent flow graph from input data and message.
     
@@ -679,6 +679,7 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
             - Nested structure: {'content': {'nodes': [...], 'edges': [...]}, ...}
         message (str): Message.
         images (list[str]): Images. Defaults to None.
+        files (Optional[list[Any]]): Real file descriptors routed via UserInput. None preserves graph defaults.
         load_chat: Load chat function. Defaults to None. (DEPRECATED - backend-authoritative)
         extras (Optional[dict[str, Any]]): Client-provided contextual data that flows 
             through UserInput node to downstream nodes. Defaults to None.
@@ -781,6 +782,8 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
             node['data']['text' if node['type'] == ModelAgentFlowTypesModel.USER_INPUT else 'message'] = message
             if node['type'] == ModelAgentFlowTypesModel.USER_INPUT:
                 node['data']['images'] = images
+                if files is not None:
+                    node['data']['files'] = copy.deepcopy(files)
                 # Pass extras to UserInput node if provided
                 if extras is not None:
                     node['data']['extras'] = extras
@@ -816,7 +819,7 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
     # unique IDs. Legacy string keys remain supported for direct callers.
     local_deps = dict(deps or {})
     for node in agt_data['nodes']:
-        if node['type'] == ModelAgentFlowTypesModel.MEMORY:
+        if node['type'] in (ModelAgentFlowTypesModel.MEMORY, ModelAgentFlowTypesModel.CHAT):
             path = (*_node_path, node['id'])
             node_deps = dict(local_deps.get(path, local_deps.get(node['id'], {})))
             if _node_path:

@@ -60,3 +60,11 @@ class ChatNodeModel(BaseNodeModel):
                     "which uses a hardcoded GPT-5 tokenizer. "
                     "Optional — purely informational."
     )
+
+    # Parsed PDF cache connection. Prefer server environment references in saved graphs.
+    file_cache_redis: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Redis PDF cache: {url_env: 'REDIS_URL', ttl_seconds: 86400}; "
+                    "headless callers can supply url or Redis host/port/db settings."
+    )
+    file_cache_ttl_seconds: int = Field(default=86400, ge=1)
