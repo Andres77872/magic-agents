@@ -100,7 +100,10 @@ class Node(abc.ABC):
                 f"Node ({self.node_id}): Adding input '{content}' from handle '{source_handle}' into '{target_handle}'"
             )
         if content is not None:
-            self.inputs[target_handle] = content['content']
+            if getattr(self, 'INPUT_HANDLER_SKILLS', None) is not None and target_handle == self.INPUT_HANDLER_SKILLS:
+                self._receive_skills_delivery(content['content'])
+            else:
+                self.inputs[target_handle] = content['content']
             if self.debug:
                 logger.debug(
                     f"Node ({self.node_id}): Received input '{content}' from handle '{source_handle}' into '{target_handle}'"
@@ -216,6 +219,22 @@ class Node(abc.ABC):
         - Invokes on_node_error hook in exception path
         - HookContext constructed only when hooks are registered (lazy)
         """
+        # Drop host-marked stale Skills pairs before lifecycle hooks/observers,
+        # and before a Chat node can window away the assistant provenance.
+        from copy import deepcopy
+        from magic_llm.model import ModelChat
+        from magic_agents.skills import strip_ephemeral_skills_history
+        for handle, value in list(self.inputs.items()):
+            if isinstance(value, ModelChat):
+                clean = strip_ephemeral_skills_history(value.messages)
+                if clean != value.messages:
+                    isolated = deepcopy(value)
+                    isolated.messages = clean
+                    self.inputs[handle] = isolated
+            elif isinstance(value, list) and value and all(isinstance(item, dict) and 'role' in item for item in value):
+                clean = strip_ephemeral_skills_history(value)
+                if clean != value:
+                    self.inputs[handle] = clean
         self._invocation_chat_log = chat_log
         control = getattr(self, '_invocation_control', None)
         definition = control.exports_tool_definitions(self) if control is not None else getattr(self, 'tool_mode', False)
@@ -505,6 +524,9 @@ class Node(abc.ABC):
     
     def _safe_value(self, value: Any) -> Any:
         """Convert value to a safe, serializable format."""
+        from magic_agents.skills import SkillPromptBundle
+        if isinstance(value, SkillPromptBundle):
+            return value.safe_summary()
         # Handle basic types
         if value is None or isinstance(value, (bool, int, float, str)):
             return value
@@ -521,6 +543,9 @@ class Node(abc.ABC):
         
         # Handle lists
         if isinstance(value, (list, tuple)):
+            if value and all(isinstance(item, dict) and 'role' in item for item in value):
+                from magic_agents.skills import strip_ephemeral_skills_history
+                value = strip_ephemeral_skills_history(value)
             return [self._safe_value(item) for item in value]
         
         # For complex objects, try to get a string representation

@@ -23,6 +23,7 @@ ModelAgentFlowType = Literal[
     'memory',
     'hook',
     'codex',
+    'skills',
 ]
 
 
@@ -47,6 +48,7 @@ class ModelAgentFlowTypesModel:
     MEMORY = 'memory'
     HOOK = 'hook'
     CODEX = 'codex'
+    SKILLS = 'skills'
 
 
 class BaseNodeModel(BaseModel):

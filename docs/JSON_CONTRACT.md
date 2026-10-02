@@ -48,7 +48,7 @@ Each node in `nodes` array must contain an `id` and `type`; `data` and `position
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `id` | `string` | **Required** | Unique non-empty identifier |
-| `type` | `string` | **Required** | Canonical type key (20 types) |
+| `type` | `string` | **Required** | Canonical type key (21 types) |
 | `data` | `object` | Optional | Node-specific configuration. Omitted `data` is treated as `{}` by `build()`. |
 | `position` | `object` | Optional | Canvas position `{x, y}` (default `{x:0, y:0}`) |
 
@@ -62,7 +62,7 @@ Each node in `nodes` array must contain an `id` and `type`; `data` and `position
 
 ---
 
-## Canonical Node Types (20 Types)
+## Canonical Node Types (21 Types)
 
 | Type Key | Node Class | Model Class | Description |
 |----------|------------|-------------|-------------|
@@ -83,6 +83,7 @@ Each node in `nodes` array must contain an `id` and `type`; `data` and `position
 | `python_exec` | `NodePythonExec` | `PythonExecNodeModel` | Python execution node |
 | `mcp` | `NodeMcp` | `McpNodeModel` | MCP tool integration node |
 | `node_tool` | `NodeTool` | `ToolNodeModel` | Schema-only OpenAI-compatible function tool for client execution |
+| `skills` | `NodeSkills` | `SkillsNodeModel` | Embedded prompt definitions; metadata-first model-selected batch loading |
 | `memory` | `NodeMemory` | `MemoryNodeModel` | Vector insights node — extraction, embedding, search, and injection of memory context via similarity |
 | `hook` | `NodeHook` | `HookNodeModel` | Python function template for hooks |
 | `codex` | `NodeCodex` | `CodexNodeModel` | Knowledge hub: trigger-based content injection into user messages |
@@ -167,6 +168,10 @@ arrays.
 | `tool_mode` | `boolean` | Optional | `false` | - |
 | `tool_name` | `string` | Optional | `null` | - |
 | `tool_parameters` | `object` | Optional | `null` | - |
+
+### skills Fields
+
+`skills` embeds ordered complete prompt records in `data.schema_version: 1` and `data.skills`. Dedicated `handle-skills` outputs connect to the collecting Skills input on an LLM. A source may feed multiple consumers; each consumer may receive multiple distinct sources. Every connected source is required, and enabled IDs must be unique across that consumer's merged catalog. Enabled metadata is discoverable; only a successful built-in `skills_load` tool returns complete selected definitions to the model. No new database or management API is used. For strict entry/props bounds, tool gates, privacy and context behavior, see [nodes/skills.md](nodes/skills.md).
 
 ### node_tool Fields
 
@@ -615,6 +620,7 @@ Each edge in `edges` array must contain:
 | `node_tool` | `handle-tool-definition` |
 | `hook` | `handle-user-output`, `handle-debug-output`, `handle-feedback-output` |
 | `codex` | `handle_user_message` |
+| `skills` | `handle-skills` |
 | `memory` | `handle_memory_output` |
 
 ### Default / Runtime Input Handles
@@ -627,7 +633,7 @@ Each edge in `edges` array must contain:
 | `parser` | Arbitrary template variables; `handle_parser_input_*` is the common dynamic pattern |
 | `fetch` | `handle-url`, `handle-fetch-method`, `handle-fetch-data`, `handle-fetch-json_data`, `handle-fetch-headers`, `handle_fetch_input` |
 | `client` | Runtime overrides: `handle-client-engine`, `handle-client-model` |
-| `llm` | `handle-client-provider`, `handle-chat`, `handle-system-context`, `handle_user_message`, tool handles; runtime-overridable generation handles: `handle-llm-temperature`, `handle-llm-top_p`, `handle-llm-max_tokens`, `handle-llm-stream`, `handle-llm-iterate`, `handle-llm-json_output` |
+| `llm` | `handle-client-provider`, `handle-chat`, `handle-skills`, `handle-system-context`, `handle_user_message`, tool handles; runtime-overridable generation handles: `handle-llm-temperature`, `handle-llm-top_p`, `handle-llm-max_tokens`, `handle-llm-stream`, `handle-llm-iterate`, `handle-llm-json_output` |
 | `chat` | `handle-system-context`, `handle_user_message`, `handle_messages`, `handle_user_files`, `handle_user_images` |
 | `send_message` | `handle_send_extra` |
 | `loop` | `handle_list`, `handle_loop` |
@@ -640,6 +646,7 @@ Each edge in `edges` array must contain:
 | `node_tool` | None |
 | `hook` | `handle-hook-context` (receives `HookContext` at runtime) |
 | `codex` | `handle_codex_input` |
+| `skills` | None (source node) |
 | `memory` | `handle_memory_input`, `handle-client-provider` |
 
 Some runtime-consumed input handles are accepted through warn-mode opaque-handle behavior even when the static registry has not promoted them to strict canonical inputs yet.

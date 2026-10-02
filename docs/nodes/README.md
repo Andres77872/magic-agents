@@ -4,7 +4,7 @@ One page per current built-in node type. This section is the detailed reference 
 
 ## Built-in nodes
 
-Current runtime node count: 20.
+Current runtime node count: 21.
 
 - [user_input.md](user_input.md)
 - [text.md](text.md)
@@ -13,6 +13,7 @@ Current runtime node count: 20.
 - [fetch.md](fetch.md)
 - [client.md](client.md)
 - [llm.md](llm.md)
+- [skills.md](skills.md)
 - [chat.md](chat.md)
 - [send_message.md](send_message.md)
 - [loop.md](loop.md)

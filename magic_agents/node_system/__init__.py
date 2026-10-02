@@ -75,6 +75,7 @@ from magic_agents.node_system.NodeTool import NodeTool
 from magic_agents.node_system.NodeHook import NodeHook
 from magic_agents.node_system.NodeCodex import NodeCodex
 from magic_agents.node_system.NodeMemory import NodeMemory
+from magic_agents.node_system.NodeSkills import NodeSkills
 
 _NodeMcp_class = None
 
@@ -360,6 +361,7 @@ __all__ = [
     "NodePythonExec",
     "NodeMcp",
     "NodeMemory",
+    "NodeSkills",
     "NodeHook",
     "build_graph",
     "detect_cycles",

@@ -11,6 +11,14 @@ SENSITIVE_KEYS = {"api_key", "private_key", "authorization", "password", "token"
 def _redact(value):
     """Recursively redact sensitive keys in nested structures."""
     try:
+        from magic_agents.skills import SkillPromptBundle, strip_ephemeral_skills_history
+        from magic_llm.model import ModelChat
+        if isinstance(value, SkillPromptBundle):
+            return value.safe_summary()
+        if isinstance(value, ModelChat):
+            return {'type': 'ModelChat', 'messages_count': len(value.messages)}
+        if isinstance(value, list) and value and all(isinstance(item, dict) and 'role' in item for item in value):
+            value = strip_ephemeral_skills_history(value)
         if isinstance(value, dict):
             return {k: ("***" if str(k).lower() in SENSITIVE_KEYS else _redact(v)) for k, v in value.items()}
         if isinstance(value, list):

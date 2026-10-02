@@ -58,7 +58,7 @@ async def collect(generator):
     {'evaluation_timeout': 0}, {'evaluation_timeout': -1},
     {'evaluation_timeout': float('inf')}, {'evaluation_timeout': float('nan')},
     {'evaluation_timeout': True}, {'evaluation_timeout': '30'},
-    {'evaluation_mode': 'jev'},
+    {'evaluation_mode': 'unknown'},
     {'questions': {'': QUESTIONS['ok']}},
     {'output_handles': ['yes', 'yes']}, {'output_handles': ['__bypass_all__']},
     {'output_handles': ['debug']},
@@ -72,7 +72,7 @@ def test_invalid_configuration_is_rejected(changes):
 
 
 @pytest.mark.parametrize('question', [
-    {'type': 'choice', 'instructions': 'x', 'criteria': {'a': 'A'}},
+    {'type': 'choice', 'instructions': 'x', 'criteria': {}},
     {'type': 'choice', 'instructions': 'x', 'criteria': {str(i): None for i in range(256)}},
     {'type': 'choice', 'instructions': 'x', 'criteria': {'a': 3, 'b': None}},
     {'type': 'score', 'instructions': 'x', 'criteria': ['one']},

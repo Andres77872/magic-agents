@@ -73,6 +73,10 @@ class HookRelay(AgentHooks):
         parent_run_id: Optional[str] = None,
         nested_depth: int = 0,
         nested_request_id: Optional[str] = None,
+        skills_source_node_id: Optional[str] = None,
+        skills_available_ids: Optional[list[str]] = None,
+        skills_source_node_ids: Optional[list[str]] = None,
+        skills_source_by_id: Optional[dict[str, str]] = None,
     ):
         """Initialize HookRelay with flow hooks and execution context.
 
@@ -96,6 +100,18 @@ class HookRelay(AgentHooks):
             nested_request_id: Unique UUID hex for nested invocation
                 correlation. Auto-generated if not provided.
         """
+        sources = tuple(skills_source_node_ids or ())
+        self._skills_source_node_id = skills_source_node_id or (sources[0] if len(sources) == 1 else None)
+        self._skills_source_by_id = dict(skills_source_by_id or {})
+        self._skills_marker_fields = {}
+        if self._skills_source_node_id is not None:
+            self._skills_marker_fields = {'source': 'builtin_skills', 'ephemeral': True,
+                                         'skills_source_node_id': self._skills_source_node_id}
+        elif sources:
+            self._skills_marker_fields = {'source': 'builtin_skills', 'ephemeral': True,
+                                         'skills_source_node_ids': list(sources)}
+        self._skills_available_ids = set(skills_available_ids or [])
+        self.skills_loaded_ids = []
         self._flow_hooks = flow_hooks
         self._registry = registry
         self._node_id = node_id
@@ -506,6 +522,15 @@ class HookRelay(AgentHooks):
             arguments: The parsed tool arguments.
             state: The current agent state (read-only).
         """
+        private_skills = bool(self._skills_marker_fields) and tool_name == 'skills_load'
+        marker = {}
+        if private_skills:
+            marker = dict(self._skills_marker_fields)
+            ids = arguments.get('skill_ids') if isinstance(arguments, dict) else None
+            arguments = {'skill_ids': list(dict.fromkeys(item for item in ids if isinstance(item, str) and item in self._skills_available_ids))[:16]} if isinstance(ids, list) else {'invalid_arguments': True}
+            if 'skills_source_node_ids' in marker:
+                marker['skill_sources'] = {identifier: self._skills_source_by_id[identifier]
+                    for identifier in arguments.get('skill_ids', []) if identifier in self._skills_source_by_id}
         provider_request_id = self._current_provider_request_id
         iteration = self._iteration_from_state(state)
         context = self._build_tool_context(
@@ -515,9 +540,11 @@ class HookRelay(AgentHooks):
             provider_request_id=provider_request_id,
             iteration=iteration,
         )
+        context.metadata.update(marker)
         self._safe_invoke_sync("on_tool_start", context)
 
         self._collected_tool_calls.append({
+            **marker,
             "id": tool_call_id,
             "type": "function",
             "function": {
@@ -545,7 +572,19 @@ class HookRelay(AgentHooks):
             state: The current agent state (read-only).
         """
         tool_name = getattr(result, 'name', 'unknown')
-        success = getattr(result, 'error', None) is None
+        marker = {}
+        if self._skills_marker_fields and tool_name == 'skills_load':
+            from magic_agents.skills import safe_loader_result
+            result = safe_loader_result(result)
+            summary = json.loads(result.content)
+            for identifier in summary.get('loaded_ids', []):
+                if identifier in self._skills_available_ids and identifier not in self.skills_loaded_ids:
+                    self.skills_loaded_ids.append(identifier)
+            marker = dict(self._skills_marker_fields)
+            if 'skills_source_node_ids' in marker:
+                marker['skill_sources'] = {identifier: self._skills_source_by_id[identifier]
+                    for identifier in summary.get('loaded_ids', []) if identifier in self._skills_source_by_id}
+        success = not getattr(result, 'is_error', False) and getattr(result, 'error', None) is None
         execution_time_ms = getattr(result, 'duration_ms', None)
         error_message = getattr(result, 'error', None)
         provider_request_id = self._current_provider_request_id
@@ -567,10 +606,13 @@ class HookRelay(AgentHooks):
         context.outputs["provider_request_id"] = provider_request_id
         context.outputs["tool_call_id"] = tool_call_id
         context.outputs["iteration"] = iteration
+        context.metadata.update(marker)
+        context.outputs.update(marker)
         self._safe_invoke_sync("on_tool_end", context)
 
         status = "error" if result.is_error else "success"
         entry: Dict[str, Any] = {
+            **marker,
             "role": "tool",
             "tool_call_id": result.tool_call_id or "",
             "content": result.content,
@@ -844,6 +886,7 @@ class HookRelay(AgentHooks):
                 "data": {
                     "role": "assistant",
                     "tool_calls": [tc],
+                    **({key: tc[key] for key in ('source', 'ephemeral', 'skills_source_node_id', 'skills_source_node_ids', 'skill_sources') if key in tc}),
                 },
             })
 

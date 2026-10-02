@@ -308,7 +308,13 @@ class GraphEventDispatcher:
                 callers[edge.id] = {"node_id": edge.source, "edge_id": edge.id}
                 node._control_callers = callers
             tool_prefix = getattr(node, 'INPUT_TOOL_PREFIX', '')
-            if getattr(node, 'node_type', None) == 'llm' and tool_prefix and handle.startswith(tool_prefix):
+            if getattr(node, 'INPUT_HANDLER_SKILLS', None) is not None and handle == node.INPUT_HANDLER_SKILLS:
+                received = tracker.get_all_inputs_by_edge()
+                values = [received[edge.id] for edge in self._incoming.get(target_node_id, [])
+                          if edge.targetHandle == handle and edge.id in received
+                          and edge.id not in tracker.bypassed_edges]
+                node.inputs[handle] = values[0] if len(values) == 1 else tuple(values)
+            elif getattr(node, 'node_type', None) == 'llm' and tool_prefix and handle.startswith(tool_prefix):
                 received = tracker.get_all_inputs_by_edge()
                 values = [received[edge.id] for edge in self._incoming.get(target_node_id, [])
                           if edge.targetHandle == handle and edge.id in received]
@@ -328,6 +334,10 @@ class GraphEventDispatcher:
         if target_node_id not in self._trackers:
             return
         
+        node = self.nodes.get(target_node_id)
+        skills_handle = getattr(node, 'INPUT_HANDLER_SKILLS', None)
+        if skills_handle is not None and (handle is None or handle == skills_handle):
+            node.inputs.pop(skills_handle, None)
         await self._trackers[target_node_id].receive_bypass(handle)
 
     async def dispatch_edge_hook(
@@ -375,7 +385,7 @@ class GraphEventDispatcher:
             sequence_number=self._sequence_counter,
             source=source_node_id,
             target=edge.target,
-            content=content,
+            content=source_node._safe_value(content) if source_node and getattr(source_node, 'node_type', None) == 'skills' else content,
             source_handle=edge.sourceHandle,
             target_handle=edge.targetHandle,
         )
@@ -425,6 +435,7 @@ class GraphEventDispatcher:
                     self._delivery_events.append({"type": "debug", "content": {"event_type": "HOOK_RESULT",
                         "node_id": edge.target, "data": {"execution": record}}})
                 if not assign:
+                    self._clear_bypassed_skills_input(edge.target, edge.id)
                     await self._trackers[edge.target].receive_bypass(edge_id=edge.id)
                     continue
                 await self.dispatch_input(
@@ -541,6 +552,7 @@ class GraphEventDispatcher:
         if not tracker:
             return
         
+        self._clear_bypassed_skills_input(node_id, edge_id)
         await tracker.receive_bypass(edge_id=edge_id)
         
         # If the node should bypass (all inputs bypassed)
@@ -624,6 +636,7 @@ class GraphEventDispatcher:
         if not tracker:
             return
         
+        self._clear_bypassed_skills_input(node_id, edge_id)
         # Only the edge from the failed (or bypassed) source can no longer
         # deliver; a fan-in sibling that is still running keeps its slot.
         await tracker.receive_bypass(edge_id=edge_id)
@@ -643,6 +656,20 @@ class GraphEventDispatcher:
                     edge.target, bypassed, edge_id=edge.id
                 )
     
+    def _clear_bypassed_skills_input(self, node_id, edge_id):
+        node = self.nodes.get(node_id)
+        edge = next((item for item in self.edges if item.id == edge_id), None)
+        if node is not None and edge is not None and getattr(node, 'INPUT_HANDLER_SKILLS', None) is not None and edge.targetHandle == node.INPUT_HANDLER_SKILLS:
+            from magic_agents.skills import SkillPromptBundle
+            value = node.inputs.get(edge.targetHandle)
+            bundles = list(value) if isinstance(value, (tuple, list)) else [value]
+            retained = [bundle for bundle in bundles if not isinstance(bundle, SkillPromptBundle)
+                        or bundle.source_node_id != edge.source]
+            if retained:
+                node.inputs[edge.targetHandle] = retained[0] if len(retained) == 1 else tuple(retained)
+            else:
+                node.inputs.pop(edge.targetHandle, None)
+
     def get_ready_nodes(self) -> List[str]:
         """Get list of nodes that are ready to execute."""
         ready = []

@@ -29,3 +29,5 @@ from magic_agents.models.factory.Nodes.HookNodeModel import (
     DEFAULT_OUTPUT_FEEDBACK,
 )
 from magic_agents.models.factory.Nodes.MemoryNodeModel import MemoryNodeModel
+
+from magic_agents.models.factory.Nodes.SkillsNodeModel import SkillsNodeModel, SkillPromptModel

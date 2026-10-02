@@ -1383,7 +1383,10 @@ async def execute_graph_loop_reactive(
         prepared = phase_deliveries.get(edge.id)
         if prepared is not None and prepared[0] is output:
             if not prepared[3] and prepared[1]:
-                target_node.inputs[edge.targetHandle] = prepared[2]
+                if getattr(target_node, 'INPUT_HANDLER_SKILLS', None) is not None and edge.targetHandle == target_node.INPUT_HANDLER_SKILLS:
+                    target_node._receive_skills_delivery(prepared[2])
+                else:
+                    target_node.inputs[edge.targetHandle] = prepared[2]
                 callers = getattr(target_node, "_control_callers", {})
                 callers[edge.id] = {"node_id": edge.source, "edge_id": edge.id}
                 target_node._control_callers = callers

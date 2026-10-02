@@ -33,6 +33,7 @@ class NodeLLM(Node):
     # Default handle names - can be overridden by JSON data.handles
     DEFAULT_INPUT_CLIENT_PROVIDER = 'handle-client-provider'
     DEFAULT_INPUT_CHAT = 'handle-chat'
+    DEFAULT_INPUT_SKILLS = 'handle-skills'
     DEFAULT_INPUT_SYSTEM_CONTEXT = 'handle-system-context'
     DEFAULT_INPUT_USER_MESSAGE = 'handle_user_message'
     DEFAULT_INPUT_TEMPERATURE = 'handle-llm-temperature'
@@ -67,6 +68,7 @@ class NodeLLM(Node):
         handles = handles or {}
         self.INPUT_HANDLER_CLIENT_PROVIDER = handles.get('client_provider', handles.get('client', self.DEFAULT_INPUT_CLIENT_PROVIDER))
         self.INPUT_HANDLER_CHAT = handles.get('chat', self.DEFAULT_INPUT_CHAT)
+        self.INPUT_HANDLER_SKILLS = handles.get('skills', self.DEFAULT_INPUT_SKILLS)
         self.INPUT_HANDLER_SYSTEM_CONTEXT = handles.get('system_context', handles.get('system', self.DEFAULT_INPUT_SYSTEM_CONTEXT))
         self.INPUT_HANDLER_USER_MESSAGE = handles.get('user_message', handles.get('message', self.DEFAULT_INPUT_USER_MESSAGE))
         self.INPUT_HANDLER_TEMPERATURE = handles.get('temperature', self.DEFAULT_INPUT_TEMPERATURE)
@@ -104,6 +106,19 @@ class NodeLLM(Node):
         self.json_output = self._default_json_output
         self.extra_data = dict(self._base_extra_data)
         self.generated = ''
+        self._skills_source_node_id = None
+        self._skills_source_node_ids = ()
+        self._skills_bundle = None
+        self._skills_request_guard = None
+        self._skills_relay = None
+        if (not isinstance(self.INPUT_HANDLER_SKILLS, str) or not self.INPUT_HANDLER_SKILLS
+                or self.INPUT_HANDLER_SKILLS.startswith(self.INPUT_TOOL_PREFIX)
+                or self.INPUT_HANDLER_SKILLS in {self.INPUT_HANDLER_CHAT, self.INPUT_HANDLER_CLIENT_PROVIDER,
+                    self.INPUT_HANDLER_USER_MESSAGE, self.INPUT_HANDLER_SYSTEM_CONTEXT,
+                    self.INPUT_HANDLER_TEMPERATURE, self.INPUT_HANDLER_TOP_P, self.INPUT_HANDLER_MAX_TOKENS,
+                    self.INPUT_HANDLER_REASONING_EFFORT, self.INPUT_HANDLER_STREAM, self.INPUT_HANDLER_ITERATE,
+                    self.INPUT_HANDLER_JSON_OUTPUT}):
+            raise ValueError('SKILLS_CONNECTION_INVALID: Skills input alias conflicts with another port')
 
     def _resolve_runtime_value(self, handle: str, default, value_type: str):
         if input_has_value(self.inputs, handle):
@@ -198,7 +213,79 @@ class NodeLLM(Node):
             for key in ('max_iterations', 'wall_clock_timeout', 'per_tool_timeout',
                         'max_parallel_tools', 'max_output_chars'):
                 options.pop(key, None)
+        if self._skills_request_guard is not None:
+            from magic_agents.skills import safe_loader_result
+            options['request_guard'] = self._skills_request_guard
+            options['tool_result_observer'] = safe_loader_result
         return options
+
+    def _receive_skills_delivery(self, packet):
+        """Legacy/loop routing retains each distinct source instead of overwriting."""
+        from magic_agents.skills import SkillPromptBundle
+        previous = self.inputs.get(self.INPUT_HANDLER_SKILLS)
+        values = list(previous) if isinstance(previous, (list, tuple)) else ([] if previous is None else [previous])
+        if isinstance(packet, SkillPromptBundle):
+            values = [value for value in values if not isinstance(value, SkillPromptBundle)
+                      or value.source_node_id != packet.source_node_id]
+        values.append(packet)
+        self.inputs[self.INPUT_HANDLER_SKILLS] = values[0] if len(values) == 1 else tuple(values)
+
+    def _prepare_skills(self):
+        from magic_agents.skills import SkillPromptBundle, SkillsCatalogError, merge_skill_bundles
+        from magic_agents.hooks.invocation_control import OperationFailure
+        self._skills_request_guard = None
+        self._skills_relay = None
+        self._skills_bundle = None
+        value = self.inputs.get(self.INPUT_HANDLER_SKILLS)
+        expected = self._skills_source_node_ids or ((self._skills_source_node_id,) if self._skills_source_node_id else ())
+        if not expected and self.INPUT_HANDLER_SKILLS not in self.inputs:
+            return False
+        bundles = tuple(value) if isinstance(value, (tuple, list)) else (value,)
+        if not bundles or any(not isinstance(bundle, SkillPromptBundle) for bundle in bundles):
+            raise OperationFailure('SKILLS_SOURCE_FAILED', 'Connected Skills sources did not deliver valid bundles')
+        by_source = {bundle.source_node_id: bundle for bundle in bundles}
+        if len(by_source) != len(bundles) or (expected and set(by_source) != set(expected)):
+            raise OperationFailure('SKILLS_SOURCE_FAILED', 'Every connected Skills source must deliver exactly once')
+        ordered = tuple(by_source[source] for source in expected) if expected else bundles
+        try:
+            self._skills_bundle = merge_skill_bundles(ordered)
+        except SkillsCatalogError as error:
+            raise OperationFailure(error.code, error.message) from None
+        return bool(self._skills_bundle.skills)
+
+    def _install_skills(self, client, chat, schemas, functions, subagent_bundle):
+        from copy import deepcopy
+        from magic_agents.skills import (SKILLS_TOOL_NAME, SKILLS_TOOL_SCHEMA, create_skills_loader, create_request_guard)
+        from magic_agents.hooks.invocation_control import OperationFailure
+        bundle = self._skills_bundle
+        if not bundle or not bundle.skills:
+            return
+        if self._has_schema_only_tools(schemas, functions):
+            raise OperationFailure('SKILLS_TOOL_CONFLICT', 'Skills loader cannot be combined with schema-only client tools')
+        names = {self._extract_tool_name(schema) or getattr(schema, '__name__', '')
+                 for schema in [*schemas, *getattr(subagent_bundle, 'tool_schemas', [])]} | set(functions)
+        registered_names = client.registered_tool_names() if callable(getattr(client, 'registered_tool_names', None)) else frozenset()
+        if SKILLS_TOOL_NAME in names or SKILLS_TOOL_NAME in registered_names:
+            raise OperationFailure('SKILLS_TOOL_CONFLICT', 'The skills_load tool name is reserved')
+        choice = self.extra_data.get('tool_choice', getattr(client.llm, 'kwargs', {}).get('tool_choice'))
+        if choice not in (None, 'auto'):
+            raise OperationFailure('SKILLS_TOOL_CONFLICT', 'Skills discovery requires auto tool choice')
+        engine = getattr(client.llm, 'engine', None) or getattr(client.llm, 'engine_name', None)
+        if engine not in {'openai', 'google', 'anthropic'}:
+            raise OperationFailure('SKILLS_PROVIDER_UNSUPPORTED', 'Selected provider has no supported Skills tool replay path')
+        method = 'run_agent_stream_async' if self.stream else 'run_agent_async'
+        if not callable(getattr(client, method, None)) or not callable(getattr(client, 'tool_content_limit', None)):
+            raise OperationFailure('SKILLS_CONTRACT_UNSUPPORTED', 'Skills requires current async loop and complete-output APIs')
+        options = self._agent_loop_options(chat)
+        limit = client.tool_content_limit(SKILLS_TOOL_NAME, tool_executor_options=options.get('tool_executor_options'))
+        loader = create_skills_loader(bundle, limit)
+        systems = [message.get('content') for message in chat.messages if message.get('role') == 'system']
+        text = '\n\n'.join(item if isinstance(item, str) else json.dumps(item, default=str) for item in systems if item)
+        chat.messages = [{'role': 'system', 'content': (text + '\n\n' + bundle.catalog()).strip()}] + [
+            message for message in chat.messages if message.get('role') != 'system']
+        schemas.append(deepcopy(SKILLS_TOOL_SCHEMA))
+        functions[SKILLS_TOOL_NAME] = loader
+        self._skills_request_guard = create_request_guard(self._max_input_tokens, source_node_id=bundle.source_node_id, source_node_ids=bundle.ordered_source_ids)
 
     def _drain_tool_call_events(self, relay):
         """Persist already-started/completed calls, including a failed loop."""
@@ -700,25 +787,40 @@ class NodeLLM(Node):
 
         hooks = getattr(self, '_hooks', None)
         if hooks is not None and not hooks.is_empty():
-            return HookRelay(
+            self._skills_relay = HookRelay(
                 registry=hooks,
                 node_id=self.node_id or '',
                 graph_id=getattr(hooks, 'execution_id', ''),
                 run_id=getattr(hooks, 'run_id', ''),
                 llm_config=llm_config,
+                skills_source_node_id=self._skills_bundle.source_node_id if self._skills_bundle and self._skills_bundle.skills else None,
+                skills_source_node_ids=self._skills_bundle.ordered_source_ids if self._skills_bundle and self._skills_bundle.skills else (),
+                skills_source_by_id=dict(self._skills_bundle.skill_sources) if self._skills_bundle else {},
+                skills_available_ids=[entry.id for entry in self._skills_bundle.skills] if self._skills_bundle else [],
                 timeout=30.0,  # Increased from 5s default for persistence hooks
             )
 
-        return HookRelay(
+            return self._skills_relay
+
+        self._skills_relay = HookRelay(
             node_id=self.node_id or '',
             llm_config=llm_config,
+            skills_source_node_id=self._skills_bundle.source_node_id if self._skills_bundle and self._skills_bundle.skills else None,
+                skills_source_node_ids=self._skills_bundle.ordered_source_ids if self._skills_bundle and self._skills_bundle.skills else (),
+                skills_source_by_id=dict(self._skills_bundle.skill_sources) if self._skills_bundle else {},
+            skills_available_ids=[entry.id for entry in self._skills_bundle.skills] if self._skills_bundle else [],
         )
+        return self._skills_relay
 
     _usage_detail_outputs = staticmethod(usage_detail_outputs)
 
     async def process(self, chat_log):
         # ``process`` may run repeatedly inside a loop. Generated content belongs
         # to one invocation and must never bleed into the next iteration.
+        from copy import deepcopy
+        from magic_agents.skills import strip_ephemeral_skills_history
+        skills_active = self._prepare_skills()
+        history_messages = strip_ephemeral_skills_history(self._history_messages)
         self.generated = ''
         self.stream = self._resolve_runtime_value(self.INPUT_HANDLER_STREAM, self._default_stream, 'bool')
         self.iterate = self._resolve_runtime_value(self.INPUT_HANDLER_ITERATE, self._default_iterate, 'bool')
@@ -727,7 +829,7 @@ class NodeLLM(Node):
         params = self.inputs
         # Avoid logging full params to prevent leaking content; log keys only
         logger.debug("NodeLLM:%s inputs keys: %s", self.node_id, list(params.keys()))
-        tool_continuation = bool(self._history_messages and self._history_messages[-1].get('role') == 'tool')
+        tool_continuation = bool(history_messages and history_messages[-1].get('role') == 'tool')
         no_inputs = False
         if not params.get(self.INPUT_HANDLER_SYSTEM_CONTEXT) and not params.get(self.INPUT_HANDLER_USER_MESSAGE) and not tool_continuation:
             no_inputs = True
@@ -780,7 +882,10 @@ class NodeLLM(Node):
 
         client: MagicLLM = self.get_input(self.INPUT_HANDLER_CLIENT_PROVIDER, required=True)
         if c := params.get(self.INPUT_HANDLER_CHAT):
-            chat = c
+            clean_messages = strip_ephemeral_skills_history(c.messages)
+            chat = deepcopy(c) if self._skills_bundle is not None or clean_messages != c.messages else c
+            if chat is not c:
+                chat.messages = clean_messages
             if sys_prompt := self.get_input(self.INPUT_HANDLER_SYSTEM_CONTEXT):
                 chat.set_system(extract_message(sys_prompt))
             if user_prompt := self.get_input(self.INPUT_HANDLER_USER_MESSAGE):
@@ -796,7 +901,7 @@ class NodeLLM(Node):
             # BACKEND-AUTHORITATIVE: Inject history_messages when no CHAT node provides them
             # This enables playground inline graphs (user_input -> llm without CHAT node)
             # to include loaded DB history in the ModelChat construction.
-            if self._history_messages:
+            if history_messages:
                 # Apply STM windowing (no-CHAT fallback path) (M1)
                 # Default max_messages=30 when not configured (L2)
                 effective_max_messages = (
@@ -809,16 +914,16 @@ class NodeLLM(Node):
                         "NodeLLM:%s applying no-CHAT windowing: max_messages=%s, max_input_tokens=%s",
                         self.node_id, effective_max_messages, self._max_input_tokens
                     )
-                    self._history_messages = apply_windowing(
-                        messages=self._history_messages,
+                    history_messages = apply_windowing(
+                        messages=history_messages,
                         max_messages=effective_max_messages,
                         max_input_tokens=self._max_input_tokens,
                         truncation_strategy=self._truncation_strategy or 'tail',
                     )
 
                 logger.debug("NodeLLM:%s injecting %d history_messages (no-CHAT graph path)",
-                             self.node_id, len(self._history_messages))
-                for msg in self._history_messages:
+                             self.node_id, len(history_messages))
+                for msg in history_messages:
                     inject_history_message(chat, msg)
             if k := params.get(self.INPUT_HANDLER_USER_MESSAGE):
                 chat.add_user_message(extract_message(k))
@@ -893,6 +998,10 @@ class NodeLLM(Node):
             # NOTE: tool_functions NOT merged — magic-llm routes via TaskExecutor
             # which wraps callables with safeguards (depth, timeout, semaphore)
 
+        self._install_skills(client, chat, tools_schemas, tool_functions, subagent_bundle)
+        if self._skills_bundle is not None:
+            yield {'type': 'debug', 'content': {'event_type': 'SKILLS_AVAILABLE', 'node_id': self.node_id,
+                'data': {'skills': {**self._skills_bundle.safe_summary(), 'loaded_ids': []}}}}
         agent_loop_required = bool(tool_functions) or subagent_bundle.registered_count > 0
 
         # Track tool calls for the handle-tool-calls output
@@ -1465,6 +1574,9 @@ class NodeLLM(Node):
         state['max_input_tokens'] = self._max_input_tokens
         state['truncation_strategy'] = self._truncation_strategy
         state['history_messages_count'] = len(self._history_messages)
+        if self._skills_bundle is not None:
+            state['skills'] = {**self._skills_bundle.safe_summary(),
+                'loaded_ids': list(self._skills_relay.skills_loaded_ids) if self._skills_relay is not None else []}
         
         return state
     

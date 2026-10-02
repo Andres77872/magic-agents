@@ -102,10 +102,10 @@ Current accepted node types from the runtime factory / model layer:
 ```text
 user_input, end, parser, client, llm, fetch, send_message,
 chat, text, constant, void, loop, inner, conditional, python_exec, mcp,
-hook, codex, memory, node_tool
+hook, codex, memory, node_tool, skills
 ```
 
-That is **20** implemented node types.
+That is **21** implemented node types.
 
 `node_tool` is backend-only schema authoring for client-executed tools. It emits `handle-tool-definition` and must be connected to an `llm` tool input. Frontend/UI support is a separate repository rollout requirement before public graph authoring.
 

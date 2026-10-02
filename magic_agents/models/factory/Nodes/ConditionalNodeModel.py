@@ -6,10 +6,12 @@ including Jinja2 template syntax and output handle declarations.
 """
 
 import json
+from urllib.parse import urlsplit
 from typing import Annotated, Optional, Dict, List, Literal, Union
 
 import jinja2
 from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict, JsonValue
+from magic_agents.util.env_resolver import ENV_PLACEHOLDER_PATTERN
 
 
 Description = Union[str, Dict[str, JsonValue], List[JsonValue]]
@@ -30,7 +32,7 @@ class QuestionBase(BaseModel):
 
 class ChoiceQuestion(QuestionBase):
     type: Literal['choice']
-    criteria: Dict[str, Optional[Description]] = Field(min_length=2, max_length=255)
+    criteria: Dict[str, Optional[Description]] = Field(min_length=1, max_length=255)
 
     @field_validator('criteria')
     @classmethod
@@ -54,7 +56,7 @@ class ScoreQuestion(QuestionBase):
 
 class NoulQuestion(QuestionBase):
     type: Literal['noul']
-    criteria: Optional[Dict[Literal['true', 'false'], Description]] = None
+    criteria: Optional[Dict[Literal['true', 'false'], Optional[Description]]] = None
 
     @field_validator('criteria')
     @classmethod
@@ -66,6 +68,30 @@ class NoulQuestion(QuestionBase):
 ConditionalQuestion = Annotated[
     Union[ChoiceQuestion, ScoreQuestion, NoulQuestion], Field(discriminator='type')
 ]
+
+
+class JevConnection(BaseModel):
+    """Only transport settings; Jev provides its own judgment model."""
+    model_config = ConfigDict(extra='forbid', strict=True)
+    base_url: str = 'https://api.typesafe.ai/v1'
+    api_key: Optional[str] = Field(default=None, repr=False)
+
+    @field_validator('base_url')
+    @classmethod
+    def validate_base_url(cls, value):
+        value = value.strip().rstrip('/')
+        if ENV_PLACEHOLDER_PATTERN.fullmatch(value):
+            return value  # Resolve only connection settings immediately before the request.
+        parsed = urlsplit(value)
+        try:
+            parsed.port
+        except ValueError:
+            raise ValueError('Jev base_url must contain a valid port') from None
+        if (parsed.scheme not in {'http', 'https'} or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or '?' in value or '#' in value or any(char.isspace() for char in value)):
+            raise ValueError('Jev base_url must be an HTTP(S) URL without credentials, query or fragment')
+        return value
 
 
 class ConditionalNodeModel(BaseModel):
@@ -92,11 +118,15 @@ class ConditionalNodeModel(BaseModel):
     """
     model_config = ConfigDict(extra='forbid')  # Reject unknown fields - strict validation
 
-    evaluation_mode: Literal['jinja', 'llm'] = Field(
-        default='jinja', description='Exact deterministic routing, or typed LLM judgments followed by deterministic routing'
+    evaluation_mode: Literal['jinja', 'llm', 'jev'] = Field(
+        default='jinja', description='Exact routing, or Jev-compatible typed judgments followed by deterministic routing'
     )
     questions: Optional[Dict[str, ConditionalQuestion]] = Field(default=None, min_length=1)
     evaluation_timeout: float = Field(default=30.0, gt=0, allow_inf_nan=False, strict=True)
+    evaluation_error_policy: Literal['fail', 'default'] = Field(
+        default='fail', description='Fail judgment errors, or route original state to the declared default branch'
+    )
+    jev: Optional[JevConnection] = None
     
     condition: str = Field(
         ...,
@@ -137,13 +167,19 @@ class ConditionalNodeModel(BaseModel):
     def validate_evaluation_configuration(self):
         if self.questions is not None and 'evaluation_mode' not in self.model_fields_set:
             raise ValueError('Specify evaluation_mode when configuring questions')
-        if self.evaluation_mode == 'llm':
+        if self.evaluation_mode in {'llm', 'jev'}:
             if not self.questions:
-                raise ValueError('LLM evaluation requires at least one typed question')
+                raise ValueError('Judgment evaluation requires at least one typed question')
             if not self.output_handles:
-                raise ValueError('LLM evaluation requires declared output_handles')
-        if self.evaluation_mode == 'llm' and self.handles and self.handles.get('client_provider', self.handles.get('client', 'handle-client-provider')) == self.handles.get('input', self.handles.get('context', 'handle_input')):
-            raise ValueError('Client and state input handles must be different')
+                raise ValueError('Judgment evaluation requires declared output_handles')
+        if self.evaluation_mode in {'llm', 'jev'} and self.handles:
+            client_handle = self.handles.get('client_provider', self.handles.get('client', 'handle-client-provider'))
+            state_handle = self.handles.get('input', self.handles.get('context', 'handle_input'))
+            if state_handle in {client_handle, 'handle-client-provider'}:
+                raise ValueError('Client and state input handles must be different')
+        if self.evaluation_error_policy == 'default' and (
+                not self.default_handle or not self.output_handles or self.default_handle not in self.output_handles):
+            raise ValueError('Default evaluation error policy requires a declared default_handle')
         return self
 
     @field_validator('condition')

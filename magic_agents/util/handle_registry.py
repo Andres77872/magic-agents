@@ -42,6 +42,7 @@ class CardinalityInfo:
 # These are the handles nodes emit by default. Custom handles via data.handles
 # are validated against the actual node instance after creation.
 CANONICAL_OUTPUT_HANDLES: Dict[str, Set[str]] = {
+    ModelAgentFlowTypesModel.SKILLS: {'handle-skills'},
     # Source/output handles per node type
     ModelAgentFlowTypesModel.USER_INPUT: {
         'handle_user_message',
@@ -120,6 +121,7 @@ CANONICAL_OUTPUT_HANDLES: Dict[str, Set[str]] = {
 # NEW: Canonical input handles per node type (Phase 1)
 # These are the handles nodes consume as inputs.
 CANONICAL_INPUT_HANDLES: Dict[str, Set[str]] = {
+    ModelAgentFlowTypesModel.SKILLS: set(),
     # Input handles per node type
     ModelAgentFlowTypesModel.USER_INPUT: set(),  # Source node - no inputs
     ModelAgentFlowTypesModel.TEXT: {
@@ -142,6 +144,7 @@ CANONICAL_INPUT_HANDLES: Dict[str, Set[str]] = {
         'handle-client-engine',
     },
     ModelAgentFlowTypesModel.LLM: {
+        'handle-skills',
         'handle_user_message',        # Primary user message input
         'handle-client-provider',     # Client provider input (actual handle)
         'handle-tool-definition',     # Tool definition inputs (variadic)
@@ -197,6 +200,7 @@ CANONICAL_INPUT_HANDLES: Dict[str, Set[str]] = {
 PORT_CARDINALITY: Dict[str, Dict[str, CardinalityInfo]] = {
     # LLM node: tool definition handles accept multiple tools (multi-compatible)
     ModelAgentFlowTypesModel.LLM: {
+        'handle-skills': CardinalityInfo(cardinality="many", exclusive=False, multi_compatible=True, merge_policy="collect"),
         'handle_user_message': CardinalityInfo(cardinality="one", exclusive=True),
         'handle-client-provider': CardinalityInfo(cardinality="one", exclusive=True),
         'handle-tool-definition': CardinalityInfo(
@@ -308,6 +312,8 @@ def get_port_cardinality(node_type: str, handle: str, node_instance=None) -> Car
     """
     node_cardinality = PORT_CARDINALITY.get(node_type, {})
     if node_type == ModelAgentFlowTypesModel.LLM and node_instance is not None:
+        if handle == getattr(node_instance, 'INPUT_HANDLER_SKILLS', None):
+            return node_cardinality['handle-skills']
         tool_prefix = getattr(node_instance, 'INPUT_TOOL_PREFIX', '')
         if tool_prefix and handle.startswith(tool_prefix):
             return node_cardinality['handle-tool-definition']

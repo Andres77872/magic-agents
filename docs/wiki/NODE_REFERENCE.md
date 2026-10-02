@@ -4,7 +4,7 @@ This wiki page is the conceptual node index used while reading the guide pages. 
 
 ## Built-in node types
 
-Current runtime node count: 20.
+Current runtime node count: 21.
 
 | Type | Purpose | Detail page |
 | --- | --- | --- |
@@ -15,6 +15,7 @@ Current runtime node count: 20.
 | `fetch` | HTTP request node, optionally a tool provider | [../nodes/fetch.md](../nodes/fetch.md) |
 | `client` | Construct a MagicLLM client | [../nodes/client.md](../nodes/client.md) |
 | `llm` | Generate text/JSON/tool calls | [../nodes/llm.md](../nodes/llm.md) |
+| `skills` | Embed prompt definitions with metadata discovery and model-selected batch loading | [../nodes/skills.md](../nodes/skills.md) |
 | `chat` | Build or reuse a chat transcript | [../nodes/chat.md](../nodes/chat.md) |
 | `send_message` | Emit user-facing message/extras payloads | [../nodes/send_message.md](../nodes/send_message.md) |
 | `loop` | Iterate over a list and aggregate results | [../nodes/loop.md](../nodes/loop.md) |

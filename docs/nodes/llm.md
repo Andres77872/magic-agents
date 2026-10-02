@@ -29,6 +29,7 @@ Run LLM generation in batch or streaming mode, optionally with tools or JSON par
 
 - `handle-client-provider`
 - `handle-chat`
+- `handle-skills` (collects distinct embedded Skills sources, alias `handles.skills`)
 - `handle-system-context`
 - `handle_user_message`
 - dynamic tool handles with prefix `handle-tool-`
@@ -59,6 +60,7 @@ The runtime also supports input handles that can override selected generation se
 - supports streaming and non-streaming execution
 - supports `json_output` with code-block extraction before JSON parsing
 - supports `iterate: true` so the node re-runs on each loop iteration
+- accepts enabled Skills metadata and registers the model-selected `skills_load` batch loader; see [skills.md](skills.md)
 - collects tools from `fetch`, `python_exec`, `mcp`, task-subagent bundles, and schema-only `node_tool` definitions
 - passes schema-only `node_tool` definitions directly through provider `tools=` and emits client-executable `handle-tool-calls` envelopes
 - rejects mixed callable/server tools plus schema-only `node_tool` inputs on the same LLM node in v1

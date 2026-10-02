@@ -11,6 +11,7 @@ Use this page as the navigation hub. The wiki explains concepts and execution be
 | Understand what the project is | [wiki/PROJECT_OVERVIEW.md](wiki/PROJECT_OVERVIEW.md) |
 | Understand build/runtime internals | [wiki/ARCHITECTURE.md](wiki/ARCHITECTURE.md) and [wiki/EXECUTION_MODEL.md](wiki/EXECUTION_MODEL.md) |
 | Author graph JSON correctly | [wiki/GRAPH_FORMAT.md](wiki/GRAPH_FORMAT.md) |
+| Add embedded prompt Skills | [nodes/skills.md](nodes/skills.md) |
 | Integrate MCP tools | [wiki/MCP_INTEGRATION.md](wiki/MCP_INTEGRATION.md) |
 | Learn routing and handles | [wiki/HANDLES_AND_ROUTING.md](wiki/HANDLES_AND_ROUTING.md) |
 | Debug or validate flows | [wiki/DEBUG_SYSTEM.md](wiki/DEBUG_SYSTEM.md) and [wiki/VALIDATION.md](wiki/VALIDATION.md) |

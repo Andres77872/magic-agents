@@ -299,7 +299,8 @@ class NodeChat(Node):
             base_messages.extend(self._custom_messages)
         
         # Build ModelChat with merged messages
-        self.chat.messages = base_messages
+        from magic_agents.skills import strip_ephemeral_skills_history
+        self.chat.messages = strip_ephemeral_skills_history(base_messages)
         
         # Slot 4: System context (INSERT at index 0)
         if c := self.get_input(self.INPUT_HANDLER_SYSTEM_CONTEXT):

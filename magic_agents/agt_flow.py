@@ -36,6 +36,7 @@ from magic_agents.models.factory.Nodes import (
     HookNodeModel,
     CodexNodeModel,
     MemoryNodeModel,
+    SkillsNodeModel,
 )
 from magic_agents.models.model_agent_run_log import ModelAgentRunLog
 from magic_agents.node_system import (
@@ -59,6 +60,7 @@ from magic_agents.node_system import (
     NodeHook,
     NodeCodex,
     NodeMemory,
+    NodeSkills,
     sort_nodes,
 )
 from magic_agents.execution import (
@@ -290,7 +292,7 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False, deps: Opti
         extra['handles'] = handles
     
     # Debug - log the raw node definition before instantiation
-    logger.debug("Creating node %s of type %s with data %s", node['id'], node_type, node_data)
+    logger.debug("Creating node %s of type %s (data keys: %s)", node['id'], node_type, list(node_data))
     
     # Mapping of node types to (constructor, model)
     node_map = {
@@ -314,6 +316,7 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False, deps: Opti
         ModelAgentFlowTypesModel.HOOK: (NodeHook, HookNodeModel),
         ModelAgentFlowTypesModel.CODEX: (NodeCodex, CodexNodeModel),
         ModelAgentFlowTypesModel.MEMORY: (NodeMemory, MemoryNodeModel),
+        ModelAgentFlowTypesModel.SKILLS: (NodeSkills, SkillsNodeModel),
     }
     
     if node_type not in node_map:
@@ -344,6 +347,13 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False, deps: Opti
         validated = MemoryNodeModel(**node_data)
         node_deps = (deps or {}).get(node['id'], {})
         return NodeMemory(**extra, data=validated, **node_deps)
+    elif node_type == ModelAgentFlowTypesModel.SKILLS:
+        from pydantic import ValidationError
+        try:
+            validated = SkillsNodeModel(**node_data)
+        except (ValidationError, TypeError, ValueError):
+            raise ValueError('SKILL_PROMPT_INVALID: invalid embedded skill configuration') from None
+        return constructor(**extra, data=validated)
     elif model_cls:
         # Validate node config using Pydantic model (strict validation)
         validated = model_cls(**node_data)
@@ -730,6 +740,9 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
         )
         del agt_data['hooks']
 
+    from magic_agents.skills import validate_skills_topology
+    skills_sources = validate_skills_topology(agt_data['nodes'], agt_data['edges'])
+
     # Validate the graph structure before building
     validation_result = validate_graph(agt_data['nodes'], agt_data['edges'])
     
@@ -832,12 +845,23 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
         node['id']: create_node(node, load_chat, agt_data.get('debug', False), deps=local_deps) for node in agt_data['nodes']
     }
     
+    from magic_agents.skills import merge_skill_bundles
+    for consumer_id, source_ids in skills_sources.items():
+        nodes[consumer_id]._skills_source_node_ids = source_ids
+        nodes[consumer_id]._skills_source_node_id = source_ids[0] if len(source_ids) == 1 else None
+        # Consumer-local conflicts/bounds are static and fail before execution.
+        merge_skill_bundles(tuple(nodes[source]._bundle for source in source_ids))
+
     # Real invocation controls instantiate fresh configured processors per call.
     for definition in agt_data['nodes']:
         prototype = nodes[definition['id']]
         private_definition = copy.deepcopy(definition)
         def invocation_factory(_definition=private_definition):
             fresh = create_node(copy.deepcopy(_definition), load_chat, agt_data.get('debug', False), deps=local_deps)
+            if _definition['id'] in skills_sources:
+                sources = skills_sources[_definition['id']]
+                fresh._skills_source_node_ids = sources
+                fresh._skills_source_node_id = sources[0] if len(sources) == 1 else None
             if isinstance(fresh, NodeInner) and fresh.magic_flow:
                 fresh.inner_graph = build(copy.deepcopy(fresh.magic_flow), message="", load_chat=load_chat,
                     extras=None, history_messages=history_messages, deps=deps, _node_path=(*_node_path, fresh.node_id))
