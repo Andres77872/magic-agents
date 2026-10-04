@@ -145,8 +145,9 @@ class CoordinationService:
         self.policy = policy.model_copy(deep=True)
         if type(inherit_limits) is not bool:
             raise CoordinationError("invalid_config", "Limit inheritance must be explicit")
-        requested = inherited_limits(policy.limits, budget._limits) if budget and inherit_limits else policy.limits
-        self.limits = requested.intersect_server_policy(server_limits)
+        invocation = bool(budget and budget.invocation)
+        requested = inherited_limits(policy.limits, budget._limits, require_complete=not invocation) if budget and inherit_limits else policy.limits
+        self.limits = requested.intersect_server_policy(server_limits, require_complete=not invocation)
         self.budget = budget.child(self.limits) if budget else WorkgroupBudget(self.limits, clock=clock)
         self.clock, self.authorize = self.budget.clock, authorize
         self.deadline = self.budget.deadline

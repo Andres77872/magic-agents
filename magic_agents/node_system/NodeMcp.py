@@ -99,6 +99,10 @@ class NodeMcp(Node):
         
         server_config = self._config.servers[0]
         scope = getattr(chat_log, 'coordination', None)
+        if scope is not None and getattr(scope.runtime, 'invocation_mode', False):
+            # Messaging does not replace the node's existing MCP transport,
+            # permissions, discovery or per-tool lifecycle.
+            scope = None
         def create_session():
             options = {'dispatch_session': scope.dispatch_session(self.node_id)} if scope is not None else {}
             return MCPSessionManager(config=server_config, node_id=self.node_id, debug=self.debug, **options)

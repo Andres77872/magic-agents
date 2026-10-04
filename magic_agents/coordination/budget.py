@@ -49,14 +49,14 @@ _CAPS = dict(input_tokens="max_input_tokens", output_tokens="max_output_tokens",
              image_jobs="max_image_jobs", messages="max_accepted_messages", wakeups="max_wakeups_per_workgroup", cost="max_cost")
 
 
-def inherited_limits(requested: CoordinationLimits, parent: CoordinationLimits) -> CoordinationLimits:
+def inherited_limits(requested: CoordinationLimits, parent: CoordinationLimits, *, require_complete=True) -> CoordinationLimits:
     """Only authored child fields narrow the already admitted parent policy."""
     values = parent.model_dump()
     for name in requested.model_fields_set:
         value = getattr(requested, name)
         if value is not None:
             values[name] = value
-    return CoordinationLimits.model_validate(values).intersect_server_policy(parent)
+    return CoordinationLimits.model_validate(values).intersect_server_policy(parent, require_complete=require_complete)
 
 
 def _zeros():
@@ -98,10 +98,11 @@ class _Shared:
 
 class WorkgroupBudget:
     def __init__(self, limits: CoordinationLimits, *, absolute_deadline: float | None = None,
-                 clock: Callable[[], float] = time.time, _parent: "WorkgroupBudget | None" = None):
+                 clock: Callable[[], float] = time.time, _parent: "WorkgroupBudget | None" = None, invocation=False):
         # Admission needs finite server-supplied spending ceilings, even when
         # the authored graph omits those optional narrowing fields.
-        self._limits = limits.intersect_server_policy(limits)
+        self.invocation = _parent.invocation if _parent else invocation
+        self._limits = limits.intersect_server_policy(limits, require_complete=not self.invocation)
         self.clock = _parent.clock if _parent else clock
         ceiling = self.clock() + self._limits.max_group_lifetime_seconds
         if absolute_deadline is not None:
@@ -117,7 +118,7 @@ class WorkgroupBudget:
         self._totals = _Totals()
 
     def child(self, requested: CoordinationLimits) -> "WorkgroupBudget":
-        return WorkgroupBudget(inherited_limits(requested, self._limits), _parent=self)
+        return WorkgroupBudget(inherited_limits(requested, self._limits, require_complete=not self.invocation), _parent=self)
 
     @property
     def condition(self):
@@ -131,10 +132,11 @@ class WorkgroupBudget:
     def _check_capacity(self, estimate: UsageBound, kind: str):
         for scope in self._path:
             totals = scope._totals
-            if kind == "model" and totals.model_turns >= scope._limits.max_model_turns:
+            if kind == "model" and scope._limits.max_model_turns is not None and totals.model_turns >= scope._limits.max_model_turns:
                 raise BudgetError("budget_exhausted", "Model attempt allowance exhausted")
             for field, limit_name in _CAPS.items():
                 cap = getattr(scope._limits, limit_name)
+                if cap is None: continue
                 cap = Decimal(cap.amount) if field == "cost" else cap
                 exposure = totals.spent[field] + totals.reserved[field] + totals.uncertain[field]
                 if exposure + getattr(estimate, field) > cap:
@@ -169,16 +171,20 @@ class WorkgroupBudget:
             values = []
             for scope in self._path:
                 cap = getattr(scope._limits, _CAPS[field])
+                if cap is None: continue
                 cap = Decimal(cap.amount) if field == "cost" else cap
                 used = sum(getattr(scope._totals, category)[field] for category in ("spent", "reserved", "uncertain"))
                 values.append(max(0, cap - used))
-            return min(values)
+            return min(values) if values else None
+        turns = [scope._limits.max_model_turns - scope._totals.model_turns for scope in self._path
+                 if scope._limits.max_model_turns is not None]
         return {"absoluteDeadline": datetime.fromtimestamp(self.deadline, timezone.utc).isoformat().replace("+00:00", "Z"),
                 "remainingMessages": remaining("messages"), "remainingWakeups": remaining("wakeups"),
-                "remainingModelTurns": min(scope._limits.max_model_turns - scope._totals.model_turns for scope in self._path),
+                "remainingModelTurns": min(turns) if turns else None,
                 "remainingInputTokens": remaining("input_tokens"), "remainingOutputTokens": remaining("output_tokens"),
                 "remainingToolCalls": remaining("tool_calls"), "remainingImageJobs": remaining("image_jobs"),
-                "remainingCost": {"amount": str(remaining("cost")), "currency": self._limits.max_cost.currency}}
+                "remainingCost": ({"amount": str(remaining("cost")), "currency": self._limits.max_cost.currency}
+                                  if self._limits.max_cost is not None else None)}
 
     async def charge_tool_call(self, operation_id: str, *, guard: Callable[[], None] = lambda: None,
                                new_guard: Callable[[], None] = lambda: None):
@@ -303,7 +309,7 @@ class WorkgroupBudget:
                 if entry.state == state and entry.actual == actual: return
                 raise BudgetError("settlement_conflict", "Operation has a different recorded settlement")
             bound = entry.estimate
-            exceeded = actual is not None and any(getattr(actual, name) > getattr(bound, name) for name in _RESOURCE_FIELDS)
+            exceeded = not self.invocation and actual is not None and any(getattr(actual, name) > getattr(bound, name) for name in _RESOURCE_FIELDS)
             for scope in self._path:
                 totals = scope._totals
                 if entry.kind == "model": totals.active_models -= 1
@@ -314,6 +320,9 @@ class WorkgroupBudget:
                     totals.spent[name] += known
                     if uncertain: totals.uncertain[name] += max(0, getattr(bound, name) - known)
             entry.state, entry.actual = state, actual
+            if self.invocation:
+                try: self._check_capacity(UsageBound(), 'quota')
+                except BudgetError: exceeded = True
             self._shared.exceeded |= exceeded
             self.condition.notify_all()
             if exceeded: raise BudgetError("usage_bound_exceeded", "Actual usage exceeded the reserved upper bound; further admission stopped")

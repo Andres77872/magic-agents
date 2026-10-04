@@ -9,6 +9,7 @@ inputs are ready, enabling natural parallelism based on graph topology.
 from __future__ import annotations
 
 import asyncio
+from anyio import CancelScope
 import logging
 import os
 import time
@@ -422,6 +423,9 @@ async def execute_graph_reactive(
         Streaming content and final outputs from nodes
     """
     coordination_parent = getattr(runtime_config, "coordination", None)
+    if coordination_parent is None:
+        from magic_agents.coordination.invocation import invocation_runtime
+        coordination_parent = invocation_runtime(graph)
     require_runtime_coordination(graph, coordination_parent)
     coordination_scope = None
     if coordination_parent is not None:
@@ -1029,6 +1033,7 @@ async def execute_graph_reactive(
     coordination_monitor = asyncio.create_task(watch_coordination_failure()) if coordination_scope is not None else None
     
     # Cancellation/closing the consumer must stop every owned node task.
+    cancellation_error = None
     try:
         while True:
             try:
@@ -1049,14 +1054,30 @@ async def execute_graph_reactive(
         # Wait for waiter task
         await waiter
 
+    except (asyncio.CancelledError, GeneratorExit) as error:
+        cancellation_error = error
+        raise
     finally:
-        owned_tasks = [waiter, *tasks.values(), *([coordination_monitor] if coordination_monitor else [])]
-        for task in owned_tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*owned_tasks, return_exceptions=True)
-        if coordination_scope is not None:
-            await coordination_scope.close(cancelled=not all_done.is_set())
+        # Keep cleanup in this task: nested generators own ContextVar tokens.
+        # The HTTP disconnect scope may already be cancelled before the API
+        # wrapper receives the exception, so protect the join at its source.
+        with CancelScope(shield=True):
+            owned_nodes = [*tasks.values(), *([coordination_monitor] if coordination_monitor else [])]
+            for task in owned_nodes:
+                if not task.done() and not task.cancelling():
+                    task.cancel()
+            # Do not cancel waiter as well: it awaits gather(*tasks), which
+            # would send a second cancellation into each node's finally block.
+            await asyncio.gather(waiter, *owned_nodes, return_exceptions=True)
+            if coordination_scope is not None:
+                await coordination_scope.close(cancelled=cancellation_error is not None or not all_done.is_set())
+            if cancellation_error is not None and _graph_hook_context is not None:
+                _graph_hook_context.timestamp = datetime.now(UTC)
+                _graph_hook_context.duration_ms = (_graph_hook_context.timestamp - _exec_start_time).total_seconds() * 1000
+                _graph_hook_context.error = cancellation_error
+                _graph_hook_context.error_type = type(cancellation_error).__name__
+                _graph_hook_context.error_message = str(cancellation_error)
+                await hooks.invoke("on_graph_error", _graph_hook_context, error=cancellation_error)
 
     # === HOOK: on_graph_end / on_graph_error (AFTER all tasks complete, BEFORE return, Phase 4) ===
     # Spec requirement: on_graph_end fires for successful execution only.

@@ -56,7 +56,7 @@ def normalize_definition(definition: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
-def validate_coordination_definition(definition: dict[str, Any], *, path: tuple[str, ...] = ()) -> list[CoordinationDiagnostic]:
+def validate_coordination_definition(definition: dict[str, Any], *, path: tuple[str, ...] = (), invocation=False) -> list[CoordinationDiagnostic]:
     graph = normalize_definition(definition)
     policy = CoordinationPolicy.model_validate(graph["coordination"]) if graph.get("coordination") is not None else None
     raw_nodes = graph.get("nodes", [])
@@ -93,7 +93,7 @@ def validate_coordination_definition(definition: dict[str, Any], *, path: tuple[
         if node.get("type") == "inner":
             child = next((data[k] for k in ("magic_flow", "flow", "graph", "subgraph") if data.get(k) is not None), None)
             if isinstance(child, dict):
-                child_diagnostics = validate_coordination_definition(child, path=path + (node_id,))
+                child_diagnostics = validate_coordination_definition(child, path=path + (node_id,), invocation=invocation)
                 diagnostics.extend(child_diagnostics)
                 child_policy = normalize_definition(child).get("coordination") or {}
                 if data.get("tool_mode") and child_policy.get("enabled"):
@@ -130,11 +130,12 @@ def validate_coordination_definition(definition: dict[str, Any], *, path: tuple[
             if target in participant_ids:
                 error("unsupported_coordination_topology", "On-demand participants require one proven actor-owned activation path", target)
             continue
-        if target in participant_ids and source_node.get("type") in ("node_tool", "skills"):
+        if target in participant_ids and (source_node.get("type") == "node_tool" or
+                                         source_node.get("type") == "skills" and not invocation):
             reason = "Schema-only client tools cannot be mixed with native messaging" if source_node.get("type") == "node_tool" else "Skills continuation requires compatible canonical checkpoints"
             error("unsupported_coordination_topology", reason, target)
         hooks = edge.get("hooks") or {}
-        if hooks.get("enabled") and target in participant_ids:
+        if hooks.get("enabled") and target in participant_ids and not invocation:
             hook_data = (nodes.get(hooks.get('hook_node_id'), {}).get('data') or {})
             if not supported_participant_callback(hook_data.get('lifecycle_event'), hook_data.get('function_template')):
                 error("unsupported_coordination_topology", "Participant lifecycle callbacks require a supported async owner route; onDeliver is not yet admitted", target)
@@ -147,7 +148,7 @@ def validate_coordination_definition(definition: dict[str, Any], *, path: tuple[
         except ValueError:
             error('invalid_coordination_config', 'Invalid Hook target identities', node.get('id'))
             continue
-        if targets.intersection(participant_ids):
+        if targets.intersection(participant_ids) and not invocation:
             if not supported_participant_callback(data.get('lifecycle_event'), data.get('function_template')):
                 error("unsupported_coordination_topology", "Participant lifecycle callbacks require a supported async owner route; onDeliver is not yet admitted", node.get("id"))
 
@@ -164,7 +165,7 @@ def validate_coordination_definition(definition: dict[str, Any], *, path: tuple[
     return diagnostics
 
 
-def require_valid_coordination(definition: dict[str, Any]) -> None:
-    diagnostics = validate_coordination_definition(definition)
+def require_valid_coordination(definition: dict[str, Any], *, invocation=False) -> None:
+    diagnostics = validate_coordination_definition(definition, invocation=invocation)
     if diagnostics:
         raise CoordinationValidationError(diagnostics)

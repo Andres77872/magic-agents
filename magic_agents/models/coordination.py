@@ -57,16 +57,18 @@ class CoordinationLimits(CoordinationModel):
     max_image_jobs: int | None = Field(default=None, ge=0, alias="maxImageJobs")
     max_cost: CostLimit | None = Field(default=None, alias="maxCost")
 
-    def intersect_server_policy(self, server: "CoordinationLimits") -> "CoordinationLimits":
+    def intersect_server_policy(self, server: "CoordinationLimits", *, require_complete: bool = True) -> "CoordinationLimits":
         """Effective ceilings never exceed server policy; counters live elsewhere."""
         required = ("max_model_turns", "max_input_tokens", "max_output_tokens",
                     "max_tool_calls", "max_image_jobs", "max_cost")
-        if any(getattr(server, name) is None for name in required):
+        if require_complete and any(getattr(server, name) is None for name in required):
             raise ValueError("A complete finite server spending policy is required")
         effective = {}
         for name in type(self).model_fields:
             requested, ceiling = getattr(self, name), getattr(server, name)
-            if name == "max_cost":
+            if ceiling is None:
+                effective[name] = requested
+            elif name == "max_cost":
                 if requested is not None and requested.currency != ceiling.currency:
                     raise ValueError("Cost currencies must match the server policy")
                 effective[name] = (requested if requested is not None and

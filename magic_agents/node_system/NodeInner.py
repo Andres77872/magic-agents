@@ -1,5 +1,6 @@
 from typing import Callable, Optional, TYPE_CHECKING, Any
 import json
+from contextlib import aclosing
 import logging
 import uuid
 from datetime import datetime, UTC
@@ -330,7 +331,7 @@ class NodeInner(Node):
             parent_scope.path = (*parent_scope.path, self.node_id)
             child_runtime = RuntimeConfig(coordination=parent_scope)
 
-        async for evt in execute_graph_reactive(
+        async with aclosing(execute_graph_reactive(
                 self.inner_graph,
                 id_chat=chat_log.id_chat,
                 id_thread=chat_log.id_thread,
@@ -342,45 +343,46 @@ class NodeInner(Node):
                 hooks=_child_hooks,
                 runtime_config=child_runtime,
                 result=outcome.result,
-        ):
-            # Legacy diagnostics and progress travel through the generator,
-            # while FlowHooks use their shared sink directly. Prefix only these
-            # child-relative events; never mutate a child's original envelope.
-            if evt.get('type') in (SYSTEM_EVENT_DEBUG, SYSTEM_EVENT_DEBUG_SUMMARY, 'loop_progress'):
-                evt_content = evt.get('content') or {}
-                child_path = evt.get('source_node_path')
-                if child_path is None:
-                    child_id = (evt.get('source_node') or evt_content.get('node_id')
-                                or evt_content.get('loop_node_id') or evt_content.get('loop_id'))
-                    child_path = [child_id] if child_id else []
-                yield {**evt, 'source_node_path': [self.node_id, *child_path]}
-                if evt.get('type') == SYSTEM_EVENT_DEBUG:
-                    outcome.observe(evt_content, child_path)
-                continue
+        )) as child_events:
+            async for evt in child_events:
+                # Legacy diagnostics and progress travel through the generator,
+                # while FlowHooks use their shared sink directly. Prefix only these
+                # child-relative events; never mutate a child's original envelope.
+                if evt.get('type') in (SYSTEM_EVENT_DEBUG, SYSTEM_EVENT_DEBUG_SUMMARY, 'loop_progress'):
+                    evt_content = evt.get('content') or {}
+                    child_path = evt.get('source_node_path')
+                    if child_path is None:
+                        child_id = (evt.get('source_node') or evt_content.get('node_id')
+                                    or evt_content.get('loop_node_id') or evt_content.get('loop_id'))
+                        child_path = [child_id] if child_id else []
+                    yield {**evt, 'source_node_path': [self.node_id, *child_path]}
+                    if evt.get('type') == SYSTEM_EVENT_DEBUG:
+                        outcome.observe(evt_content, child_path)
+                    continue
 
-            event = evt['content']
-            # Check if event is a ChatCompletionModel
-            if hasattr(event, 'choices') and event.choices:
-                # It's a ChatCompletionModel
-                event_content = event
-                # Preserve the child origin through arbitrary nesting. Consumers
-                # can distinguish terminal output from internal child steps.
-                forwarded = self.yield_static(event_content, content_type=self.OUTPUT_HANDLE_CONTENT)
-                child_path = evt.get('source_node_path') or [evt.get('source_node')]
-                forwarded['source_node_path'] = [self.node_id, *child_path]
-                # Usage-only terminal chunks are part of the stream contract too.
-                yield forwarded
-                if event_content.choices[0].delta.content:
-                    content += event_content.choices[0].delta.content
-                if hasattr(event_content, 'extras') and event_content.extras:
-                    extras.append(event_content.extras)
-            else:
-                # It's some other type of output - try to convert to string
-                if self.debug:
-                    logger.debug("NodeInner:%s received non-ChatCompletionModel: %s", self.node_id, type(event))
-                # For now, we'll skip non-ChatCompletionModel outputs
-                # In a full implementation, you might want to handle these differently
-                pass
+                event = evt['content']
+                # Check if event is a ChatCompletionModel
+                if hasattr(event, 'choices') and event.choices:
+                    # It's a ChatCompletionModel
+                    event_content = event
+                    # Preserve the child origin through arbitrary nesting. Consumers
+                    # can distinguish terminal output from internal child steps.
+                    forwarded = self.yield_static(event_content, content_type=self.OUTPUT_HANDLE_CONTENT)
+                    child_path = evt.get('source_node_path') or [evt.get('source_node')]
+                    forwarded['source_node_path'] = [self.node_id, *child_path]
+                    # Usage-only terminal chunks are part of the stream contract too.
+                    yield forwarded
+                    if event_content.choices[0].delta.content:
+                        content += event_content.choices[0].delta.content
+                    if hasattr(event_content, 'extras') and event_content.extras:
+                        extras.append(event_content.extras)
+                else:
+                    # It's some other type of output - try to convert to string
+                    if self.debug:
+                        logger.debug("NodeInner:%s received non-ChatCompletionModel: %s", self.node_id, type(event))
+                    # For now, we'll skip non-ChatCompletionModel outputs
+                    # In a full implementation, you might want to handle these differently
+                    pass
 
         # A child graph may terminate with a non-streaming value (for example
         # Text -> END). The child executor routes that value into the END node,

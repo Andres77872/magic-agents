@@ -127,7 +127,8 @@ def _copy_run_log(chat_log):
 
 
 def _reject_sync_tool(chat_log):
-    if getattr(chat_log, "coordination", None) is not None:
+    scope = getattr(chat_log, "coordination", None)
+    if scope is not None and not getattr(scope.runtime, 'invocation_mode', False):
         from magic_agents.coordination.service import CoordinationError
         raise CoordinationError("unsupported_coordination_capability",
                                 "Synchronous child tools require outstanding-work reconciliation")

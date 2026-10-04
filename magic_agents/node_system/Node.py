@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import abc
+import asyncio
+from anyio import CancelScope
 from contextlib import aclosing
 import logging
 from typing import Any, Dict, Optional, AsyncGenerator, TYPE_CHECKING
@@ -294,49 +296,50 @@ class Node(abc.ABC):
                 async for result in source:
                     yield result
             completed = True
-        except Exception as e:
-            error_msg = str(e)
-            if self.debug:
-                logger.error(f"Node ({self.node_id}): Execution failed with error: {error_msg}")
+        except (Exception, asyncio.CancelledError, GeneratorExit) as e:
+            with CancelScope(shield=isinstance(e, (asyncio.CancelledError, GeneratorExit))):
+                error_msg = str(e)
+                if self.debug:
+                    logger.error(f"Node ({self.node_id}): Execution failed with error: {error_msg}")
 
-            _node_end_time = datetime.now(UTC)
-            _duration_ms = (_node_end_time - _node_start_time).total_seconds() * 1000
+                _node_end_time = datetime.now(UTC)
+                _duration_ms = (_node_end_time - _node_start_time).total_seconds() * 1000
 
-            # === OBSERVER: on_node_error (BEFORE hook, BEFORE re-raise) ===
-            if observer is not None:
-                await observer.on_node_error(
-                    node_id=self.node_id or "unknown",
-                    node_type=self.node_type or "unknown",
-                    node_class=type(self).__name__,
-                    error=str(e),
-                    error_type=type(e).__name__,
-                    inputs=self._safe_copy_dict(self.inputs),
-                    outputs=self._safe_copy_dict(getattr(self, "outputs", {})),
-                    duration_ms=_duration_ms,
-                    start_time=_node_start_time_iso,
-                )
+                # === OBSERVER: on_node_error (BEFORE hook, BEFORE re-raise) ===
+                if observer is not None:
+                    await observer.on_node_error(
+                        node_id=self.node_id or "unknown",
+                        node_type=self.node_type or "unknown",
+                        node_class=type(self).__name__,
+                        error=str(e),
+                        error_type=type(e).__name__,
+                        inputs=self._safe_copy_dict(self.inputs),
+                        outputs=self._safe_copy_dict(getattr(self, "outputs", {})),
+                        duration_ms=_duration_ms,
+                        start_time=_node_start_time_iso,
+                    )
 
-            # === HOOK: on_node_error (Phase 4) ===
-            if _hook_ctx is not None:
-                _hook_end = datetime.now(UTC)
-                _hook_ctx.timestamp = _hook_end
-                _hook_ctx.end_time = _hook_end
-                if _hook_ctx.start_time:
-                    _hook_ctx.duration_ms = (_hook_end - _hook_ctx.start_time).total_seconds() * 1000
-                _hook_ctx.error = e
-                _hook_ctx.error_type = type(e).__name__
-                _hook_ctx.error_message = error_msg
-                await hooks.invoke("on_node_error", _hook_ctx, error=e)
-                # Lets the executor mark its failure frame as a duplicate.
-                self._hook_reported_error = e
+                # === HOOK: on_node_error (Phase 4) ===
+                if _hook_ctx is not None:
+                    _hook_end = datetime.now(UTC)
+                    _hook_ctx.timestamp = _hook_end
+                    _hook_ctx.end_time = _hook_end
+                    if _hook_ctx.start_time:
+                        _hook_ctx.duration_ms = (_hook_end - _hook_ctx.start_time).total_seconds() * 1000
+                    _hook_ctx.error = e
+                    _hook_ctx.error_type = type(e).__name__
+                    _hook_ctx.error_message = error_msg
+                    await hooks.invoke("on_node_error", _hook_ctx, error=e)
+                    # Lets the executor mark its failure frame as a duplicate.
+                    self._hook_reported_error = e
 
-            # Legacy debug tracking — only when observer is inactive
-            if observer is None:
-                self._run_legacy_debug_tracking(self._end_debug_tracking, error=error_msg)
+                # Legacy debug tracking — only when observer is inactive
+                if observer is None:
+                    self._run_legacy_debug_tracking(self._end_debug_tracking, error=error_msg)
 
-            # Re-raise so executor can mark node ERROR and propagate
-            # error cascade bypass to downstream nodes (Phase 4).
-            raise
+                # Re-raise so executor can mark node ERROR and propagate
+                # error cascade bypass to downstream nodes (Phase 4).
+                raise
         finally:
             # End legacy debug tracking if not already done (normal execution path)
             if completed and error_msg is None:

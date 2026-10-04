@@ -107,6 +107,7 @@ class GraphPersistenceHook:
 
         self._run_id = ""
         self._root_execution_id = ""
+        self._terminal_status: str | None = None
         self._node_execution_ids: dict[str, str] = {}
         # LLM calls from independent NodeLLM instances may overlap.  Keep each
         # span under its graph/node/iteration correlation key instead of one
@@ -144,6 +145,7 @@ class GraphPersistenceHook:
     def _reset(self) -> None:
         self._run_id = ""
         self._root_execution_id = ""
+        self._terminal_status = None
         self._node_execution_ids.clear()
         self._llm_execution_ids.clear()
         self._llm_locks.clear()
@@ -189,14 +191,17 @@ class GraphPersistenceHook:
         self,
         context: HookContext,
         payload: dict[str, Any] | None = None,
+        *, consume: bool = True,
     ) -> str | None:
         """Resolve an LLM span exactly, with a node-scoped FIFO fallback."""
         key = self._llm_correlation_key(context, payload)
         queue = self._llm_execution_ids.get(key)
         if queue:
-            execution_id = queue.popleft()
-            if not queue:
-                self._llm_execution_ids.pop(key, None)
+            execution_id = queue[0]
+            if consume:
+                queue.popleft()
+                if not queue:
+                    self._llm_execution_ids.pop(key, None)
             return execution_id
 
         # Older/custom relays may omit iteration on one side.  Restrict the
@@ -210,9 +215,11 @@ class GraphPersistenceHook:
         for candidate_key, candidate_queue in list(self._llm_execution_ids.items()):
             if candidate_key[:4] != base_key or not candidate_queue:
                 continue
-            execution_id = candidate_queue.popleft()
-            if not candidate_queue:
-                self._llm_execution_ids.pop(candidate_key, None)
+            execution_id = candidate_queue[0]
+            if consume:
+                candidate_queue.popleft()
+                if not candidate_queue:
+                    self._llm_execution_ids.pop(candidate_key, None)
             return execution_id
         return None
 
@@ -367,7 +374,7 @@ class GraphPersistenceHook:
         )
 
     async def on_graph_end(self, context: HookContext) -> None:
-        if not self._run_id or not self._root_execution_id:
+        if not self._run_id or not self._root_execution_id or self._terminal_status is not None:
             return
         await self._sink.record_event(
             id_execution=self._root_execution_id,
@@ -376,17 +383,37 @@ class GraphPersistenceHook:
         )
         await self._sink.complete_execution(id_execution=self._root_execution_id, status="completed")
         await self._sink.complete_run(id_run=self._run_id, status="completed")
+        self._terminal_status = "completed"
 
-    async def on_graph_error(self, context: HookContext, error: Exception) -> None:
-        if not self._run_id or not self._root_execution_id:
+    async def on_graph_error(self, context: HookContext, error: BaseException) -> None:
+        if not self._run_id or not self._root_execution_id or self._terminal_status is not None:
             return
+        status = "cancelled" if isinstance(error, (asyncio.CancelledError, GeneratorExit)) else "failed"
+        # The executor invokes this after joining its owned node/relay tasks.
+        # Finalize only still-owned spans; never fabricate a provider response,
+        # usage counts, or a tool result for an interrupted operation.
+        active = dict.fromkeys([
+            *self._tool_execution_ids,
+            *(item for queue in self._llm_execution_ids.values() for item in queue),
+            *self._node_execution_ids.values(),
+        ])
+        for execution_id in active:
+            await self._sink.record_event(id_execution=execution_id, event_type="error",
+                                          event_payload=self._error_payload(error))
+            await self._sink.complete_execution(id_execution=execution_id, status=status)
+            self._discard_tool_execution_id(execution_id)
+            self._remove_from_queue_map(self._llm_execution_ids, execution_id)
+            for node_id, owned in list(self._node_execution_ids.items()):
+                if owned == execution_id:
+                    self._node_execution_ids.pop(node_id, None)
         await self._sink.record_event(
             id_execution=self._root_execution_id,
             event_type="error",
             event_payload=self._error_payload(error),
         )
-        await self._sink.complete_execution(id_execution=self._root_execution_id, status="failed")
-        await self._sink.complete_run(id_run=self._run_id, status="failed")
+        await self._sink.complete_execution(id_execution=self._root_execution_id, status=status)
+        await self._sink.complete_run(id_run=self._run_id, status=status)
+        self._terminal_status = status
 
     async def on_node_start(self, context: HookContext) -> None:
         if not self._run_id:
@@ -409,7 +436,7 @@ class GraphPersistenceHook:
 
     async def on_node_end(self, context: HookContext) -> None:
         node_id = context.node_id or "unknown"
-        execution_id = self._node_execution_ids.pop(node_id, None)
+        execution_id = self._node_execution_ids.get(node_id)
         if not execution_id:
             return
         await self._sink.record_event(
@@ -418,10 +445,11 @@ class GraphPersistenceHook:
             event_payload={"duration_ms": context.duration_ms} if context.duration_ms is not None else None,
         )
         await self._sink.complete_execution(id_execution=execution_id, status="completed")
+        self._node_execution_ids.pop(node_id, None)
 
     async def on_node_error(self, context: HookContext, error: Exception) -> None:
         node_id = context.node_id or "unknown"
-        execution_id = self._node_execution_ids.pop(node_id, None)
+        execution_id = self._node_execution_ids.get(node_id)
         if not execution_id:
             return
         await self._sink.record_event(
@@ -429,7 +457,9 @@ class GraphPersistenceHook:
             event_type="error",
             event_payload=self._error_payload(error),
         )
-        await self._sink.complete_execution(id_execution=execution_id, status="failed")
+        status = "cancelled" if isinstance(error, (asyncio.CancelledError, GeneratorExit)) else "failed"
+        await self._sink.complete_execution(id_execution=execution_id, status=status)
+        self._node_execution_ids.pop(node_id, None)
 
     async def on_node_bypass(self, context: HookContext, reason: str) -> None:
         if not self._root_execution_id:
@@ -477,7 +507,7 @@ class GraphPersistenceHook:
         )
         lock = self._llm_locks.setdefault(base_key, asyncio.Lock())
         async with lock:
-            execution_id = self._pop_llm_execution_id(context, data)
+            execution_id = self._pop_llm_execution_id(context, data, consume=False)
             if not execution_id:
                 return
             usage_data = {
@@ -517,6 +547,7 @@ class GraphPersistenceHook:
                 id_execution=execution_id,
                 status="failed" if context.error is not None else "completed",
             )
+            self._remove_from_queue_map(self._llm_execution_ids, execution_id)
 
     async def on_llm_loop_end(self, context: HookContext) -> None:
         if self._root_execution_id:
@@ -571,7 +602,6 @@ class GraphPersistenceHook:
             execution_id = self._resolve_tool_execution_id(context)
             if not execution_id:
                 return
-            self._discard_tool_execution_id(execution_id)
             failed = bool(context.error_message)
             await self._sink.record_event(
                 id_execution=execution_id,
@@ -582,6 +612,7 @@ class GraphPersistenceHook:
                 id_execution=execution_id,
                 status="failed" if failed else "completed",
             )
+            self._discard_tool_execution_id(execution_id)
 
 
 # Compatibility alias for consumers migrating from api.magic_llm naming.

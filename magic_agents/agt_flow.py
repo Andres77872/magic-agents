@@ -8,6 +8,7 @@ Uses a reactive event-based execution model for automatic parallel execution.
 import copy
 import logging
 import uuid
+from contextlib import aclosing
 from typing import Callable, Dict, Any, AsyncGenerator, Optional, Union
 from datetime import datetime
 
@@ -410,7 +411,7 @@ async def execute_graph(
         _registry = HookRegistry()
         _registry.register_graph(graph.hooks)
 
-    async for result in execute_graph_reactive(
+    async with aclosing(execute_graph_reactive(
         graph=graph,
         id_chat=id_chat,
         id_thread=id_thread,
@@ -422,8 +423,9 @@ async def execute_graph(
         hooks=_registry,
         runtime_config=hooks,
         debug_callback=debug_callback,
-    ):
-        yield result
+    )) as events:
+        async for result in events:
+            yield result
 
 
 async def execute_graph_loop(
@@ -710,7 +712,7 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
     from magic_agents.util.coordination_validation import normalize_definition, require_valid_coordination
     # Validate raw scopes before constructing clients or resolving credentials.
     agt_data = normalize_definition(agt_data)
-    require_valid_coordination(agt_data)
+    require_valid_coordination(agt_data, invocation=True)
 
     # Work on a private copy: build() rewrites nodes and edges in place, and callers
     # reuse definitions (for example once per inner tool invocation).
@@ -1069,7 +1071,7 @@ async def run_agent(
             "AgentFlowModel — deps are ignored."
         )
 
-    async for result in execute_graph(
+    async with aclosing(execute_graph(
         graph=graph,
         id_chat=id_chat,
         id_thread=id_thread,
@@ -1077,5 +1079,6 @@ async def run_agent(
         extras=extras,
         hooks=hooks,
         debug_callback=debug_callback,
-    ):
-        yield result
+    )) as events:
+        async for result in events:
+            yield result

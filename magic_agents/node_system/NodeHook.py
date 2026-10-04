@@ -231,7 +231,8 @@ class NodeHook(Node):
         function = self._compile_hook_function(self._function_template)
         if function is None:
             raise ValueError("Hook function template could not be compiled")
-        if getattr(chat_log, "coordination", None) is not None and not inspect.iscoroutinefunction(function):
+        scope = getattr(chat_log, "coordination", None)
+        if scope is not None and not getattr(scope.runtime, 'invocation_mode', False) and not inspect.iscoroutinefunction(function):
             from magic_agents.coordination.service import CoordinationError
             raise CoordinationError("unsupported_coordination_capability",
                                     "Coordinated lifecycle callbacks require an async function; synchronous threads cannot be fenced after cancellation")
@@ -257,6 +258,10 @@ class NodeHook(Node):
         if inspect.iscoroutinefunction(func):
             return await func(hook_context, chat_log)
         else:
+            scope = getattr(chat_log, 'coordination', None)
+            if scope is not None and getattr(scope.runtime, 'invocation_mode', False):
+                from magic_agents.coordination.invocation import owned_thread
+                return await owned_thread(func, hook_context, chat_log)
             return await asyncio.to_thread(func, hook_context, chat_log)
 
     def _compile_hook_function(self, template: str) -> Optional[Callable]:

@@ -776,6 +776,10 @@ async def send_admitted_request(request: FetchRequest, *, timeout: float, max_re
 async def coordinated_fetch(scope, node_id, request: FetchRequest):
     """Quote the rendered request, retaining semantic fields and private headers."""
     session = scope.dispatch_session(node_id)
+    if getattr(scope.runtime, 'invocation_mode', False):
+        async def ordinary_request():
+            return await send_step_request(request)
+        return await session.call('http.fetch', {}, ordinary_request)
     timeout = min(300, max(0, scope.budget.deadline - scope.budget.clock()))
     prepared = admitted_http_options(request)
     effective = {**copy.deepcopy(prepared), 'timeout_seconds': timeout,

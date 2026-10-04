@@ -54,7 +54,8 @@ class CoordinationRuntime:
                  allowed_activity_tools: dict[tuple[str, ...], frozenset[str]] | None = None,
                  authorize_skills: Callable | None = None,
                  authorize_external: Callable | None = None, external_estimate: Callable | None = None,
-                 external_usage: Callable | None = None):
+                 external_usage: Callable | None = None, invocation=False):
+        self.invocation_mode = invocation
         self.server_limits = server_limits.model_copy(deep=True)
         self.authorize, self.estimate, self.usage = authorize, estimate, usage
         self.authorize_attempt = authorize_attempt
@@ -63,7 +64,7 @@ class CoordinationRuntime:
         from magic_agents.coordination.events import PrivateEventJournal
         self.events = PrivateEventJournal()
         self.tool_estimate, self.tool_usage = tool_estimate, tool_usage
-        self.budget = WorkgroupBudget(self.server_limits)
+        self.budget = WorkgroupBudget(self.server_limits, invocation=invocation)
         self.scopes: list[CoordinationScope] = []
         if public_source is not None and (not isinstance(public_source, tuple) or not public_source
                 or len(public_source) > 64 or any(not isinstance(part, str) or not part
@@ -108,7 +109,8 @@ class CoordinationRuntime:
             if self._root is not None:
                 raise CoordinationError('runtime_already_used', 'An admitted runtime owns one root graph invocation')
             self._validate_public_source(graph)
-        scope = CoordinationScope(self, graph, parent=parent, path=path)
+        scope_type = getattr(self, "scope_type", CoordinationScope)
+        scope = scope_type(self, graph, parent=parent, path=path)
         self.scopes.append(scope)
         if parent is None: self._root = scope
         return scope
@@ -192,7 +194,7 @@ class CoordinationScope:
         for node_id, node in graph.nodes.items():
             if (getattr(node, '_skills_source_node_ids', ()) or getattr(node, '_skills_source_node_id', None)
                     or getattr(node, 'INPUT_HANDLER_SKILLS', None) in getattr(node, 'inputs', {})):
-                if runtime.authorize_skills is None or node_id not in self.roles:
+                if not runtime.invocation_mode and (runtime.authorize_skills is None or node_id not in self.roles):
                     raise CoordinationError('unsupported_coordination_capability',
                         'Coordinated Skills require an actor and a trusted pinned-resource authorizer')
         from magic_agents.util.coordination_validation import supported_participant_callback
@@ -207,7 +209,7 @@ class CoordinationScope:
             if edge.target in self.roles and edge.hooks and edge.hooks.enabled:
                 callbacks.append(graph.nodes.get(edge.hooks.hook_node_id))
         for callback in callbacks:
-            if not supported_participant_callback(getattr(callback, 'lifecycle_event', None), getattr(callback, '_function_template', None)):
+            if not runtime.invocation_mode and not supported_participant_callback(getattr(callback, 'lifecycle_event', None), getattr(callback, '_function_template', None)):
                 raise CoordinationError('unsupported_coordination_topology',
                     'Participant lifecycle callbacks require a plain async function; pre-readiness onDeliver is unsupported')
         self.withheld_descendants = set()
@@ -304,7 +306,10 @@ class CoordinationScope:
         dispatch_owned = not provider_owned and dispatches_externally(node)
         identity = hashlib.sha256(repr((self.budget.id, self.path, node_id, operation_id)).encode()).hexdigest()
         path, name = self.path + (node_id,), 'child:' + str(node.node_type)
-        if not provider_owned and not dispatch_owned:
+        invocation_local = self.runtime.invocation_mode and not provider_owned and not dispatch_owned
+        if invocation_local:
+            await self.budget.charge_tool_call(identity, new_guard=guard)
+        elif not provider_owned and not dispatch_owned:
             if self.runtime.tool_estimate is None or self.runtime.tool_usage is None:
                 raise CoordinationError('usage_bound_unavailable', 'Child operations require trusted cost and resource adapters')
             estimate = self.runtime.tool_estimate(path, name, (content,), {})
@@ -319,7 +324,10 @@ class CoordinationScope:
         self.child_operations[operation_id] = entry
         actual, uncertain = None, True
         try:
-            if dispatch_owned:
+            if invocation_local:
+                async with asyncio.timeout(max(0, self.budget.deadline - self.budget.clock())):
+                    result = await operation()
+            elif dispatch_owned:
                 async with invocation_charge(self, identity, guard):
                     result = await operation()
             else:
@@ -327,7 +335,7 @@ class CoordinationScope:
             # Retain detached bounded data, never live clients or tasks.
             import json
             detached = json.loads(_json(result, max_bytes=4 * 1024 * 1024))
-            if not provider_owned and not dispatch_owned:
+            if not provider_owned and not dispatch_owned and not invocation_local:
                 actual = self.runtime.tool_usage(path, name, result)
                 uncertain = actual is None
             guard()
@@ -335,7 +343,7 @@ class CoordinationScope:
             entry['state'] = 'unknown'
             raise
         finally:
-            if not provider_owned and not dispatch_owned:
+            if not provider_owned and not dispatch_owned and not invocation_local:
                 try:
                     await self.budget.settle(identity, actual, uncertain=uncertain)
                 except BaseException:
@@ -654,6 +662,18 @@ class CoordinationScope:
                 caller = await self.service.wait_for_activation(self.roles[node_id])
             sealed = await self.service.seal()
             node.outputs = copy.deepcopy(sealed[self.roles[node_id]]['output'])
+            if self.runtime.invocation_mode:
+                # Normal graphs expose the final sealed participant through the
+                # ordinary LLM content handle; no separate author is required.
+                from magic_llm.model.ModelChatStream import ChatCompletionModel, ChoiceModel, DeltaModel
+                value = node.outputs.get(node.OUTPUT_HANDLE_GENERATED)
+                if isinstance(value, dict) and 'node' in value and 'content' in value:
+                    value = value['content']
+                if value is not None:
+                    text = value if isinstance(value, str) else __import__('json').dumps(value, ensure_ascii=False)
+                    yield node.yield_static(ChatCompletionModel(id='', model='', choices=[
+                        ChoiceModel(delta=DeltaModel(content=text), finish_reason='stop')]),
+                        content_type=node.OUTPUT_HANDLE_CONTENT)
         except asyncio.CancelledError:
             await self.service.cancel()
             raise
