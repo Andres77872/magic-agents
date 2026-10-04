@@ -322,6 +322,14 @@ class NodeInner(Node):
         if self.inner_graph.hooks is not None:
             _child_hooks.register_graph(self.inner_graph.hooks)
         
+        child_runtime = None
+        if getattr(chat_log, "coordination", None) is not None:
+            from copy import copy
+            from magic_agents.hooks.runtime_config import RuntimeConfig
+            parent_scope = copy(chat_log.coordination)
+            parent_scope.path = (*parent_scope.path, self.node_id)
+            child_runtime = RuntimeConfig(coordination=parent_scope)
+
         async for evt in execute_graph_reactive(
                 self.inner_graph,
                 id_chat=chat_log.id_chat,
@@ -332,6 +340,7 @@ class NodeInner(Node):
                 run_id=child_run_id,           # Phase 0
                 parent_run_id=parent_run_id,   # Phase 0
                 hooks=_child_hooks,
+                runtime_config=child_runtime,
                 result=outcome.result,
         ):
             # Legacy diagnostics and progress travel through the generator,

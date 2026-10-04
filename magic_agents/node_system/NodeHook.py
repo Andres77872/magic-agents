@@ -79,12 +79,16 @@ class NodeHook(Node):
 
         super().__init__(node_id=node_id, debug=debug, **kwargs)
         self._function_template = data.function_template
+        self.hook_mode = data.hook_mode
+        self._messaging_by_target = {key: value.model_copy(deep=True)
+                                    for key, value in (data.messaging_by_target or {}).items()}
         self._timeout_seconds = (
             data.timeout_override if data.timeout_override is not None
             else self.DEFAULT_TIMEOUT_SECONDS
         )
         self.lifecycle_event = data.lifecycle_event
         self.target_node_id = data.target_node_id
+        self.target_node_ids = data.target_ids
         self.failure_policy = data.failure_policy
         self.OUTPUT_HANDLE_CALL = handles.get('child_call', 'handle-child-call')
         self._hook_type = data.hook_type  # 'pre', 'post', 'error', 'custom'
@@ -103,6 +107,19 @@ class NodeHook(Node):
             'feedback_output', self.DEFAULT_OUTPUT_FEEDBACK
         )
 
+    def bind_target(self, target):
+        """Install this built-in Hook before the target joins its actor scope."""
+        from magic_agents.hooks.messages_hook import MessagesHookBindingError
+        from magic_agents.node_system.NodeLLM import NodeLLM
+        if (self.hook_mode != 'messages' or not isinstance(target, NodeLLM)
+                or target.node_id not in self.target_node_ids):
+            raise MessagesHookBindingError('Messages Hook target must be an LLM in the same graph scope')
+        prior = getattr(target, '_messages_hook_id', None)
+        if prior is not None and prior != self.node_id or prior is None and target.messaging is not None:
+            raise MessagesHookBindingError('An LLM accepts one Messages Hook and cannot also declare inline messaging')
+        target.messaging = self._messaging_by_target[target.node_id].model_copy(deep=True)
+        target._messages_hook_id = self.node_id
+
     async def process(
         self, chat_log
     ) -> AsyncGenerator[Dict[str, Any], None]:
@@ -117,6 +134,8 @@ class NodeHook(Node):
         Yields:
             Dict with type/content for emit outputs or debug error events.
         """
+        if self.hook_mode == 'messages':
+            raise RuntimeError('Messages Hooks are bound by the Hook controller, not ordinary node dispatch')
         # Get HookContext from input handle
         hook_context = self.get_input(self.INPUT_HANDLE_HOOK_CONTEXT)
 
@@ -207,9 +226,15 @@ class NodeHook(Node):
 
     async def invoke_control(self, context, chat_log):
         """Run this real Hook template without shared graph-node input state."""
+        if self.hook_mode == 'messages':
+            raise RuntimeError('Messages mode does not execute a Python lifecycle callback')
         function = self._compile_hook_function(self._function_template)
         if function is None:
             raise ValueError("Hook function template could not be compiled")
+        if getattr(chat_log, "coordination", None) is not None and not inspect.iscoroutinefunction(function):
+            from magic_agents.coordination.service import CoordinationError
+            raise CoordinationError("unsupported_coordination_capability",
+                                    "Coordinated lifecycle callbacks require an async function; synchronous threads cannot be fenced after cancellation")
         function.__globals__['emit'] = context.emit
         return await self._execute_function(function, context, chat_log)
 

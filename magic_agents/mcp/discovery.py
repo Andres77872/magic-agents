@@ -11,6 +11,11 @@ from magic_agents.mcp.errors import MCPTransportError
 
 logger = logging.getLogger(__name__)
 
+MAX_DISCOVERY_PAGES = 100
+MAX_DISCOVERY_CURSOR_BYTES = 4096
+MAX_DISCOVERY_TOOLS = 1024
+MAX_DISCOVERY_CACHE_BYTES = 1024 * 1024
+
 
 class MCPToolDiscovery:
     """Discover tools from MCP server via paginated tools/list.
@@ -42,6 +47,12 @@ class MCPToolDiscovery:
         return self._cached_tools
     
     async def list_tools(self) -> list[dict]:
+        if getattr(self._session, '_dispatch', None) is not None:
+            # A page is transport progress, not a new logical discovery budget.
+            return await self._session._run_discovery(self._collect_tools, timeout=self._timeout)
+        return await self._collect_tools()
+
+    async def _collect_tools(self) -> list[dict]:
         """Discover all tools from MCP server.
         
         Paginated loop until nextCursor is absent.
@@ -65,6 +76,8 @@ class MCPToolDiscovery:
         all_tools: list[dict] = []
         cursor: Optional[str] = None
         page_count = 0
+        coordinated = getattr(self._session, '_dispatch', None) is not None
+        seen_cursors, seen_names = set(), set()
         
         try:
             while True:
@@ -75,7 +88,22 @@ class MCPToolDiscovery:
                 
                 # Extract tools from result
                 tools = self._extract_tools(result)
-                all_tools.extend(tools)
+                if coordinated:
+                    from magic_agents.coordination.dispatch import _encoded
+                    from magic_agents.coordination.service import CoordinationError
+                    if len(all_tools) + len(tools) > MAX_DISCOVERY_TOOLS:
+                        raise CoordinationError('mcp_discovery_limit', 'MCP discovery exceeds its retained tool count')
+                    names = [tool['name'] for tool in tools]
+                    if len(set(names)) != len(names) or any(name in seen_names for name in names):
+                        raise CoordinationError('mcp_discovery_invalid', 'MCP discovery contains ambiguous duplicate tool names')
+                    candidate = all_tools + tools
+                    _encoded(candidate, max_bytes=MAX_DISCOVERY_CACHE_BYTES)
+                    # Assign only after both retained-count and encoded-cache
+                    # bounds pass; rejected discoveries never publish a cache.
+                    all_tools = candidate
+                    seen_names.update(names)
+                else:
+                    all_tools.extend(tools)
                 
                 # Check for pagination cursor
                 next_cursor = self._extract_cursor(result)
@@ -83,6 +111,16 @@ class MCPToolDiscovery:
                 if not next_cursor:
                     # No more pages
                     break
+
+                if coordinated:
+                    if (type(next_cursor) is not str
+                            or len(next_cursor.encode('utf-8')) > MAX_DISCOVERY_CURSOR_BYTES):
+                        raise CoordinationError('mcp_discovery_limit', 'MCP discovery cursor exceeds its byte ceiling')
+                    if next_cursor in seen_cursors:
+                        raise CoordinationError('mcp_discovery_invalid', 'MCP discovery repeated a pagination cursor')
+                    if page_count >= MAX_DISCOVERY_PAGES:
+                        raise CoordinationError('mcp_discovery_limit', 'MCP discovery ended before its final page')
+                    seen_cursors.add(next_cursor)
                 
                 cursor = next_cursor
                 
@@ -95,7 +133,7 @@ class MCPToolDiscovery:
                 )
                 
                 # Safety limit: don't loop forever
-                if page_count > 100:
+                if not coordinated and page_count > 100:
                     logger.warning(
                         "MCPToolDiscovery:%s exceeded 100 pages, stopping",
                         self._session._node_id
@@ -118,6 +156,9 @@ class MCPToolDiscovery:
         except MCPTransportError:
             raise
         except Exception as e:
+            if getattr(self._session, '_dispatch', None) is not None:
+                from magic_agents.coordination.dispatch import is_protected
+                if is_protected(e): raise
             logger.error(
                 "MCPToolDiscovery:%s discovery failed: %s",
                 self._session._node_id,

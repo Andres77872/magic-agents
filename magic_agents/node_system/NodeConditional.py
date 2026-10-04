@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 
 class NodeConditional(Node):
+    coordination_external_dispatch_version = 1
+
     """Route state deterministically, optionally after typed Jev or LLM judgments.
     
     Handle names are configurable via JSON data.handles.
@@ -173,7 +175,7 @@ class NodeConditional(Node):
         """Client readiness alone never makes a conditional ready for loop state."""
         return any(value is not None for handle, value in self.inputs.items() if not self._is_client_input(handle))
 
-    async def _generate_judgments(self, render_ctx):
+    async def _generate_judgments(self, render_ctx, chat_log=None):
         client = self.get_input(self.INPUT_HANDLE_CLIENT, required=True) if self.evaluation_mode == 'llm' else None
         chat = build_judgment_chat(render_ctx, self.questions) if client is not None else None
         hooks = self._hooks
@@ -193,10 +195,16 @@ class NodeConditional(Node):
             )
             await hooks.invoke('on_llm_start', ctx)
         started = time.monotonic()
+        scope = getattr(chat_log, 'coordination', None)
+        options = {'json_output': True}
+        if scope is not None and client is not None:
+            options['provider_attempt_control'] = scope.attempt_control(self.node_id)
+        dispatch = scope.dispatch_session(self.node_id) if scope is not None and client is None else None
         try:
             response = await asyncio.wait_for(
-                client.llm.async_generate(chat, json_output=True) if client is not None else
-                    evaluate_jev(render_ctx, self.questions, self.jev, timeout=self.evaluation_timeout),
+                client.llm.async_generate(chat, **options) if client is not None else
+                    evaluate_jev(render_ctx, self.questions, self.jev, timeout=self.evaluation_timeout,
+                                 **({'dispatch_session': dispatch} if dispatch is not None else {})),
                 timeout=self.evaluation_timeout,
             )
         except BaseException as exc:
@@ -389,7 +397,10 @@ class NodeConditional(Node):
         if self.evaluation_mode in {'llm', 'jev'}:
             provider_returned = False
             try:
-                response, generation_event = await self._generate_judgments(render_ctx)
+                if getattr(chat_log, 'coordination', None) is not None:
+                    response, generation_event = await self._generate_judgments(render_ctx, chat_log)
+                else:
+                    response, generation_event = await self._generate_judgments(render_ctx)
                 provider_returned = True
                 # Usage is emitted even if the provider returned malformed JSON.
                 yield generation_event
@@ -400,6 +411,12 @@ class NodeConditional(Node):
                     self.answers = parse_judgments(response.content, self.questions, diagnostics=self.judgment_diagnostics)
                 route_ctx = {**render_ctx, 'state': render_ctx, 'answers': self.answers}
             except Exception as exc:
+                if getattr(chat_log, 'coordination', None) is not None:
+                    from magic_agents.coordination.dispatch import is_protected
+                    if is_protected(exc): raise
+                    if isinstance(exc, asyncio.TimeoutError):
+                        from magic_agents.coordination.service import CoordinationError
+                        raise CoordinationError('deadline_exceeded', 'Admitted judgment deadline expired') from exc
                 timed_out = isinstance(exc, asyncio.TimeoutError)
                 self.judgment_error = {
                     'code': 'EVALUATION_TIMEOUT' if timed_out else 'JUDGMENT_ERROR',

@@ -420,7 +420,7 @@ async def execute_graph(
         run_id=run_id,
         parent_run_id=parent_run_id,
         hooks=_registry,
-        runtime_config=hooks if hooks is not None and hooks.has_auto_wired_hooks() else None,
+        runtime_config=hooks,
         debug_callback=debug_callback,
     ):
         yield result
@@ -478,7 +478,7 @@ async def execute_graph_loop(
         run_id=run_id,
         parent_run_id=parent_run_id,
         hooks=_registry,
-        runtime_config=hooks if hooks is not None and hooks.has_auto_wired_hooks() else None,
+        runtime_config=hooks,
         debug_callback=debug_callback,
     ):
         yield result
@@ -591,6 +591,8 @@ def validate_graph(nodes: list[dict], edges: list[dict]) -> dict:
     for hook_node in hook_nodes:
         node_id = hook_node.get('id', 'unknown')
         data = hook_node.get('data', {})
+        if data.get('hook_mode') == 'messages':
+            continue  # Built-in Hook binding is validated below, not Python.
         # function_template can be in data or at top level
         function_template = data.get('function_template') or hook_node.get('function_template')
         if not function_template:
@@ -705,23 +707,11 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
     # is available. magic-llm's load_subagents() is async and requires a client.
     # Feature flag checked at execution time via is_task_subagents_enabled().
     
-    # Normalize data structure - handle nested 'content' wrapper
-    if 'content' in agt_data and isinstance(agt_data['content'], dict):
-        # Nested structure: extract nodes/edges from content
-        content = agt_data['content']
-        graph_data = {
-            'type': agt_data.get('type', 'graph'),
-            'debug': agt_data.get('debug', False),
-            'debug_config': agt_data.get('debug_config'),
-            'nodes': content.get('nodes', []),
-            'edges': content.get('edges', []),
-        }
-        # Copy any additional top-level properties
-        for key in agt_data:
-            if key not in ('content', 'type', 'debug', 'debug_config'):
-                graph_data[key] = agt_data[key]
-        agt_data = graph_data
-    
+    from magic_agents.util.coordination_validation import normalize_definition, require_valid_coordination
+    # Validate raw scopes before constructing clients or resolving credentials.
+    agt_data = normalize_definition(agt_data)
+    require_valid_coordination(agt_data)
+
     # Work on a private copy: build() rewrites nodes and edges in place, and callers
     # reuse definitions (for example once per inner tool invocation).
     agt_data = copy.deepcopy(agt_data)
@@ -845,6 +835,9 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
         node['id']: create_node(node, load_chat, agt_data.get('debug', False), deps=local_deps) for node in agt_data['nodes']
     }
     
+    from magic_agents.hooks.messages_hook import bind_messages_hooks
+    bind_messages_hooks(nodes)
+
     from magic_agents.skills import merge_skill_bundles
     for consumer_id, source_ids in skills_sources.items():
         nodes[consumer_id]._skills_source_node_ids = source_ids
@@ -858,6 +851,9 @@ def build(agt_data, message: str, images: list[str] = None, load_chat=None, extr
         private_definition = copy.deepcopy(definition)
         def invocation_factory(_definition=private_definition):
             fresh = create_node(copy.deepcopy(_definition), load_chat, agt_data.get('debug', False), deps=local_deps)
+            hook_id = getattr(nodes[_definition['id']], '_messages_hook_id', None)
+            if hook_id is not None:
+                nodes[hook_id].bind_target(fresh)
             if _definition['id'] in skills_sources:
                 sources = skills_sources[_definition['id']]
                 fresh._skills_source_node_ids = sources

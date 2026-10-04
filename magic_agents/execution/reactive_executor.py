@@ -33,6 +33,7 @@ from magic_agents.hooks.hook_registry import HookRegistry
 from magic_agents.hooks.runtime_config import RuntimeConfig
 from magic_agents.debug.registry import ObserverRegistry
 from magic_agents.debug.observer import DebugObserver
+from magic_agents.util.coordination_capabilities import require_runtime_coordination
 
 logger = logging.getLogger(__name__)
 
@@ -420,6 +421,17 @@ async def execute_graph_reactive(
     Yields:
         Streaming content and final outputs from nodes
     """
+    coordination_parent = getattr(runtime_config, "coordination", None)
+    require_runtime_coordination(graph, coordination_parent)
+    coordination_scope = None
+    if coordination_parent is not None:
+        from magic_agents.coordination.context import CoordinationRuntime
+        if isinstance(coordination_parent, CoordinationRuntime):
+            coordination_scope = coordination_parent.enter_graph(graph)
+        else:
+            coordination_scope = coordination_parent.runtime.enter_graph(
+                graph, parent=coordination_parent, path=coordination_parent.path)
+
     # Check for validation errors — fail fast on blocking errors before starting execution
     if hasattr(graph, '_validation_errors') and graph._validation_errors:
         # Only block on structural graph errors that make execution impossible.
@@ -461,6 +473,9 @@ async def execute_graph_reactive(
     from magic_agents.node_system import NodeLoop
     loop_nodes = [nid for nid, node in graph.nodes.items() if isinstance(node, NodeLoop)]
     if loop_nodes:
+        if coordination_scope is not None:
+            from magic_agents.coordination.service import CoordinationError
+            raise CoordinationError('unsupported_coordination_topology', 'Loop scheduling cannot discard an inherited coordination authority')
         logger.info("Detected loop nodes: %s. Delegating to loop executor.", loop_nodes)
         async for msg in execute_graph_loop_reactive(
             graph, id_chat=id_chat, id_thread=id_thread, id_user=id_user,
@@ -474,6 +489,7 @@ async def execute_graph_reactive(
     
     nodes = graph.nodes
     chat_log = ModelAgentRunLog(
+        coordination=coordination_scope,
         id_chat=id_chat, id_thread=id_thread, id_user=id_user,
         id_app=getattr(graph, 'app_id', None) or getattr(graph, 'id_app', None),
         flow_state=flow_state or {},  # Initialize per-flow volatile state (isolated per flow)
@@ -541,6 +557,12 @@ async def execute_graph_reactive(
         )
         await hooks.invoke("on_graph_start", _graph_hook_context)
 
+    if coordination_scope is not None:
+        run_id = coordination_scope.bind_execution(run_id=run_id, hooks=hooks)
+        chat_log.run_id = run_id
+        if hooks is not None:
+            hooks.run_id = run_id
+
     # Initialize observer registry (replaces inline GraphDebugFeedback)
     _debug_enabled_global = os.environ.get('DEBUG_ENABLED', 'true').strip().lower() in {'1', 'true', 'yes', 'on'}
     _resolved_debug_config = getattr(graph, 'resolved_debug_config', None)
@@ -601,6 +623,9 @@ async def execute_graph_reactive(
         initial_hook_wait = hook_wait_duration()
         ready_task = asyncio.create_task(tracker.wait_ready())
         try:
+            if coordination_scope is not None and tracker.node_id in coordination_scope.withheld_descendants:
+                remaining = max(0, coordination_scope.budget.deadline - coordination_scope.budget.clock())
+                return await asyncio.wait_for(asyncio.shield(ready_task), timeout=remaining)
             while True:
                 if tracker.is_ready:
                     return tracker.should_execute
@@ -704,6 +729,8 @@ async def execute_graph_reactive(
             )
             
             if not should_execute:
+                if coordination_scope is not None:
+                    await coordination_scope.terminate(node_id, state="bypassed", reason="inputs_not_ready")
                 # GUARD: If error cascade already bypassed this node via
                 # _propagate_error_bypass, the dispatcher state
                 # is already BYPASSED and the hook was already fired with
@@ -751,7 +778,9 @@ async def execute_graph_reactive(
             # Resolve observer for this node (allows per-node specialization)
             _node_observer = observer_registry.observer_for(node_id, node) if observer_registry.is_active else None
 
-            async for item in node(chat_log, hooks=hooks, observer=_node_observer):
+            source = (coordination_scope.run_node(node, chat_log, hooks=hooks, observer=_node_observer)
+                      if coordination_scope is not None else node(chat_log, hooks=hooks, observer=_node_observer))
+            async for item in source:
                 item_type = item.get("type", "")
                 
                 # Check if this is a streaming content event (for immediate output)
@@ -852,8 +881,13 @@ async def execute_graph_reactive(
                         previously_bypassed = _bypassed_node_ids()
                         await dispatcher.propagate_conditional_bypass(node_id, selected_handle)
                         await _notify_conditional_bypasses(previously_bypassed)
+
+            if coordination_scope is not None and dispatcher.get_state(node_id) == NodeState.COMPLETED:
+                coordination_scope.record_completed(node)
         
         except asyncio.TimeoutError as e:
+            if coordination_scope is not None:
+                await coordination_scope.terminate(node_id, state="timed_out", reason="input_deadline_exceeded")
             dispatcher.set_state(node_id, NodeState.ERROR)
             _graph_has_errors = True
             _node_failures[node_id] = {"error_type": "TimeoutError", "error_code": None, "retryable": None}
@@ -871,6 +905,8 @@ async def execute_graph_reactive(
             await _propagate_error_bypass(node_id)
         
         except Exception as e:
+            if coordination_scope is not None:
+                await coordination_scope.terminate(node_id, reason=getattr(e, "code", type(e).__name__))
             dispatcher.set_state(node_id, NodeState.ERROR)
             _graph_has_errors = True
             _node_failures[node_id] = _failure_record(e)
@@ -900,6 +936,9 @@ async def execute_graph_reactive(
             failed_node_id: The node that encountered an error.
         """
         bypassed_nids = await dispatcher.propagate_error_bypass(failed_node_id)
+        if coordination_scope is not None:
+            for bid in bypassed_nids:
+                await coordination_scope.terminate(bid, state="bypassed", reason="upstream_error")
         if hooks is None or hooks.is_empty():
             return
 
@@ -959,13 +998,35 @@ async def execute_graph_reactive(
     
     async def wait_for_tasks():
         """Wait for all node tasks to complete."""
-        await asyncio.gather(*tasks.values(), return_exceptions=True)
+        nonlocal _graph_has_errors
+        outcomes = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        if coordination_scope is not None and any(isinstance(outcome, BaseException) for outcome in outcomes):
+            _graph_has_errors = True
         all_done.set()
         # Signal queue that no more items will be added
         await output_queue.put(None)
     
     # Start task waiter
     waiter = asyncio.create_task(wait_for_tasks())
+
+    async def watch_coordination_failure():
+        nonlocal _graph_has_errors
+        try:
+            await coordination_scope.watch_failure()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            _graph_has_errors = True
+            _node_failures['__coordination__'] = _failure_record(error)
+            await output_queue.put({"type": SYSTEM_EVENT_DEBUG, "content": {
+                "event_type": "COORDINATION_TERMINAL", "error_type": type(error).__name__,
+                "error_code": getattr(error, 'code', 'coordination_failed'),
+                "error_message": "Coordination admission closed; outstanding graph tasks were cancelled.",
+            }})
+            for task in tasks.values():
+                if not task.done(): task.cancel()
+
+    coordination_monitor = asyncio.create_task(watch_coordination_failure()) if coordination_scope is not None else None
     
     # Cancellation/closing the consumer must stop every owned node task.
     try:
@@ -989,10 +1050,13 @@ async def execute_graph_reactive(
         await waiter
 
     finally:
-        for task in [waiter, *tasks.values()]:
+        owned_tasks = [waiter, *tasks.values(), *([coordination_monitor] if coordination_monitor else [])]
+        for task in owned_tasks:
             if not task.done():
                 task.cancel()
-        await asyncio.gather(waiter, *tasks.values(), return_exceptions=True)
+        await asyncio.gather(*owned_tasks, return_exceptions=True)
+        if coordination_scope is not None:
+            await coordination_scope.close(cancelled=not all_done.is_set())
 
     # === HOOK: on_graph_end / on_graph_error (AFTER all tasks complete, BEFORE return, Phase 4) ===
     # Spec requirement: on_graph_end fires for successful execution only.
@@ -1042,6 +1106,8 @@ async def execute_graph_reactive(
         }
         CallbackEmitter.emit(_graph_end_event, chat_log)
 
+    if coordination_scope is not None:
+        coordination_scope.finish_graph(succeeded=not _graph_has_errors)
     _fill_result(result, has_errors=_graph_has_errors, summary=_summary, node_errors=_node_failures)
 
     logger.info(
@@ -1089,6 +1155,8 @@ async def execute_graph_loop_reactive(
     import json
     from magic_agents.node_system import NodeLoop
     
+    require_runtime_coordination(graph)
+
     # Check for validation errors — fail fast on blocking errors before starting execution
     if hasattr(graph, '_validation_errors') and graph._validation_errors:
         # Only block on structural graph errors that make execution impossible.

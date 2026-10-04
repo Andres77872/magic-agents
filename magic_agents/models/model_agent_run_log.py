@@ -1,9 +1,10 @@
 from typing import Optional, Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ModelAgentRunLog(BaseModel):
+    coordination: Any = Field(default=None, exclude=True, repr=False)
     id_chat: Optional[int | str] = None
     id_thread: Optional[int | str] = None
     id_app: Optional[int | str] = None

@@ -7,6 +7,7 @@ import logging
 from typing import Any, Optional, TYPE_CHECKING
 
 from magic_agents.util.llm_usage import usage_detail_outputs
+from magic_agents.util.telemetry import magic_telemetry
 from magic_llm import MagicLLM
 from magic_llm.model import ModelChat
 from magic_llm.model.ModelChatStream import ChatCompletionModel, ChoiceModel, DeltaModel
@@ -93,6 +94,7 @@ class NodeLLM(Node):
         self._default_reasoning_effort = data.reasoning_effort
         self._base_extra_data = dict(data.extra_data or {})
         self._agent_config = data.agent_config
+        self.messaging = data.messaging.model_copy(deep=True) if data.messaging else None
         # Backend-injected history_messages for no-CHAT graph path
         # (playground inline graphs without CHAT nodes)
         self._history_messages = data.history_messages or []
@@ -819,7 +821,8 @@ class NodeLLM(Node):
         # to one invocation and must never bleed into the next iteration.
         from copy import deepcopy
         from magic_agents.skills import strip_ephemeral_skills_history
-        skills_active = self._prepare_skills()
+        coordination = getattr(chat_log, "coordination", None)
+        skills_active = await coordination.prepare_skills(self) if coordination is not None else self._prepare_skills()
         history_messages = strip_ephemeral_skills_history(self._history_messages)
         self.generated = ''
         self.stream = self._resolve_runtime_value(self.INPUT_HANDLER_STREAM, self._default_stream, 'bool')
@@ -881,6 +884,12 @@ class NodeLLM(Node):
                 chat_obj.add_system_message(content)
 
         client: MagicLLM = self.get_input(self.INPUT_HANDLER_CLIENT_PROVIDER, required=True)
+        coordination = getattr(chat_log, "coordination", None)
+        native_options, native_executor = {}, None
+        provider_options = {}
+        if coordination is not None:
+            coordination.validate_client(self, client)
+            provider_options["provider_attempt_control"] = coordination.attempt_control(self.node_id)
         if c := params.get(self.INPUT_HANDLER_CHAT):
             clean_messages = strip_ephemeral_skills_history(c.messages)
             chat = deepcopy(c) if self._skills_bundle is not None or clean_messages != c.messages else c
@@ -943,6 +952,8 @@ class NodeLLM(Node):
         def agent_loop_inputs(chat_obj: ModelChat) -> tuple[Any, str | None, list[dict]]:
             """Translate the assembled ModelChat without dropping its history."""
 
+            if native_options.get("continuation") is not None:
+                return "", None, []
             messages = list(chat_obj.get_messages())
             current_user_index = next(
                 (
@@ -999,10 +1010,28 @@ class NodeLLM(Node):
             # which wraps callables with safeguards (depth, timeout, semaphore)
 
         self._install_skills(client, chat, tools_schemas, tool_functions, subagent_bundle)
+        if coordination is not None:
+            if (coordination.path + (self.node_id,) == coordination.runtime.public_source
+                    and tool_functions):
+                from magic_agents.coordination.service import CoordinationError
+                raise CoordinationError('invalid_public_source', 'Public author cannot execute server-callable tools')
+            if self.node_id in coordination.roles and schema_only_tools_present:
+                raise ValueError("Messaging participants cannot execute schema-only client tools")
+            if tool_functions or self.node_id in coordination.roles:
+                native_options, native_executor = await coordination.configure_native(self, tools_schemas, tool_functions)
+
         if self._skills_bundle is not None:
             yield {'type': 'debug', 'content': {'event_type': 'SKILLS_AVAILABLE', 'node_id': self.node_id,
                 'data': {'skills': {**self._skills_bundle.safe_summary(), 'loaded_ids': []}}}}
-        agent_loop_required = bool(tool_functions) or subagent_bundle.registered_count > 0
+        agent_loop_required = (bool(tool_functions) or subagent_bundle.registered_count > 0
+                              or coordination is not None and self.node_id in coordination.roles)
+
+        def loop_options():
+            options = self._agent_loop_options(chat)
+            options.update(native_options)
+            if options.get("continuation") is not None:
+                options.pop("initial_chat", None)
+            return options
 
         # Track tool calls for the handle-tool-calls output
         final_tool_calls: list = []
@@ -1017,7 +1046,7 @@ class NodeLLM(Node):
                 user_msg, sys_msg, extra_messages = agent_loop_inputs(chat)
 
                 # Inject tool manifest into system prompt when tools exist
-                if tools_schemas or (subagent_bundle and subagent_bundle.registered_count > 0):
+                if native_options.get("continuation") is None and (tools_schemas or (subagent_bundle and subagent_bundle.registered_count > 0)):
                     manifest = self._build_tool_manifest(
                         tools_schemas=tools_schemas,
                         tool_functions=tool_functions,
@@ -1051,7 +1080,7 @@ class NodeLLM(Node):
                             tool_functions=tool_functions,
                             hooks=hook_relay,
                             extra_messages=extra_messages or None,
-                            **self._agent_loop_options(chat)
+                            **loop_options()
                         )
                     except Exception:
                         for event in self._drain_tool_call_events(hook_relay):
@@ -1075,9 +1104,9 @@ class NodeLLM(Node):
                             tools=tools_schemas,
                             tool_functions=tool_functions,
                             hooks=hook_relay,
-                            task_executor=None,
+                            task_executor=native_executor,
                             extra_messages=extra_messages or None,
-                            **self._agent_loop_options(chat)
+                            **loop_options()
                         )
                     except Exception:
                         for event in self._drain_tool_call_events(hook_relay):
@@ -1137,7 +1166,7 @@ class NodeLLM(Node):
 
                 self._warn_unsupported_engine(client)
                 intention = await client.llm.async_generate(
-                    chat, tools=tools_schemas, **self.extra_data
+                    chat, tools=tools_schemas, **provider_options, **self.extra_data
                 )
 
                 # === HOOK: on_llm_end (schema-only tools non-streaming path, Phase 0 R0.1) ===
@@ -1182,7 +1211,7 @@ class NodeLLM(Node):
                     )
                     await self._hooks.invoke("on_llm_start", _llm_ctx)
 
-                intention = await client.llm.async_generate(chat, **self.extra_data)
+                intention = await client.llm.async_generate(chat, **provider_options, **self.extra_data)
 
                 # === HOOK: on_llm_end (non-tool non-streaming path, Phase 0 R0.4) ===
                 if _llm_ctx is not None:
@@ -1209,14 +1238,7 @@ class NodeLLM(Node):
                 # before removing _emit_llm_generation fallback (P1-NEW)
                 yield self._emit_llm_generation(intention)
 
-            yield self.yield_static(ChatCompletionModel(
-                id=getattr(intention, "id", None) or uuid.uuid4().hex,
-                model=getattr(intention, "model", None) or client.llm.model,
-                choices=[ChoiceModel(
-                    delta=DeltaModel(content=intention.content or '')
-                )],
-                usage=intention.usage),
-                content_type=self.OUTPUT_HANDLE_CONTENT)
+            yield self._native_content_frame(intention, client.llm.model)
         else:
             logger.info("NodeLLM:%s streaming generation with model=%s", self.node_id, client.llm.model)
 
@@ -1227,7 +1249,7 @@ class NodeLLM(Node):
                 user_msg, sys_msg, extra_messages = agent_loop_inputs(chat)
 
                 # Inject tool manifest into system prompt when tools exist
-                if tools_schemas or (subagent_bundle and subagent_bundle.registered_count > 0):
+                if native_options.get("continuation") is None and (tools_schemas or (subagent_bundle and subagent_bundle.registered_count > 0)):
                     manifest = self._build_tool_manifest(
                         tools_schemas=tools_schemas,
                         tool_functions=tool_functions,
@@ -1263,7 +1285,7 @@ class NodeLLM(Node):
                             tool_functions=tool_functions,
                             hooks=hook_relay,
                             extra_messages=extra_messages or None,
-                            **self._agent_loop_options(chat)
+                            **loop_options()
                         ):
                             self.generated += chunk.choices[0].delta.content or ''
                             last_chunk = chunk
@@ -1309,9 +1331,9 @@ class NodeLLM(Node):
                         tools=tools_schemas,
                         tool_functions=tool_functions,
                         hooks=hook_relay,
-                        task_executor=None,
+                        task_executor=native_executor,
                         extra_messages=extra_messages or None,
-                        **self._agent_loop_options(chat)
+                        **loop_options()
                     )
                     try:
                         async for chunk in stream:
@@ -1379,7 +1401,7 @@ class NodeLLM(Node):
                 self._warn_unsupported_engine(client)
                 last_chunk = None
                 stream_tool_calls: dict[int, dict] = {}
-                async for i in client.llm.async_stream_generate(chat, tools=tools_schemas, **self.extra_data):
+                async for i in client.llm.async_stream_generate(chat, tools=tools_schemas, **provider_options, **self.extra_data):
                     self.generated += i.choices[0].delta.content or ''
                     last_chunk = i
                     self._accumulate_stream_tool_calls(stream_tool_calls, i)
@@ -1426,7 +1448,7 @@ class NodeLLM(Node):
                     await self._hooks.invoke("on_llm_start", _llm_ctx)
 
                 last_chunk = None
-                async for i in client.llm.async_stream_generate(chat, **self.extra_data):
+                async for i in client.llm.async_stream_generate(chat, **provider_options, **self.extra_data):
                     self.generated += i.choices[0].delta.content or ''
                     last_chunk = i
                     yield self.yield_static(i, content_type=self.OUTPUT_HANDLE_CONTENT)
@@ -1461,6 +1483,18 @@ class NodeLLM(Node):
         #     print(self.generated)
         #     self.generated = json.loads(self.generated)
 
+        if coordination is not None and self.node_id in coordination.roles:
+            self.generated = coordination.final_candidate(self.node_id)
+            if self.generated is None:
+                raise RuntimeError("Coordinated loop did not retain a complete final candidate")
+
+        async for item in self._final_output_frames(final_tool_calls, tools_schemas, tool_functions,
+                                                   schema_only_tools_present, client.llm.model):
+            yield item
+
+    async def _final_output_frames(self, final_tool_calls, tools_schemas, tool_functions,
+                                   schema_only_tools_present, model):
+        """One formatter shared by live native completion and durable result replay."""
         if self.json_output:
             logger.debug("NodeLLM:%s parsing JSON output", self.node_id)
 
@@ -1508,7 +1542,7 @@ class NodeLLM(Node):
                         "generated_preview": self.generated[:500] if len(self.generated) > 500 else self.generated,
                         "generated_length": len(self.generated),
                         "json_output_required": self.json_output,
-                        "model": getattr(client.llm, 'model', 'unknown') if 'client' in locals() else 'unknown'
+                        "model": model
                     }
                 )
                 return
@@ -1521,6 +1555,51 @@ class NodeLLM(Node):
             yield self.yield_static(final_tool_calls, content_type=self.OUTPUT_HANDLE_TOOL_CALLS)
         # Yield on the configured output handle
         yield self.yield_static(self.generated, content_type=self.OUTPUT_HANDLE_GENERATED)
+
+    def _native_content_frame(self, intention, model):
+        return self.yield_static(ChatCompletionModel(
+            id=getattr(intention, "id", None) or uuid.uuid4().hex,
+            model=getattr(intention, "model", None) or model,
+            choices=[ChoiceModel(delta=DeltaModel(content=intention.content or ''))],
+            usage=intention.usage), content_type=self.OUTPUT_HANDLE_CONTENT)
+
+    @magic_telemetry
+    async def replay_native_completion(self, chat_log, result, candidate):
+        """Format a committed tool-free native result; never invoke a provider loop.
+
+        The durable host must authenticate the immutable result before invoking
+        this private execution seam. Canonical text and the provider result are
+        cross-checked here; the real formatter preserves configured JSON output
+        and native content handles rather than guessing a result map.
+        """
+        from magic_llm.engine.tooling import StreamIterationSummary, accumulate_stream_chunk
+        from magic_agents.coordination.service import CoordinationError
+        from magic_llm.model import ModelChatResponse
+        if (not isinstance(candidate, str) or not isinstance(result, dict)
+                or result.get('format') != ('stream' if self.stream else 'response')):
+            raise CoordinationError('durable_restore_incompatible', 'Invalid completed native result')
+        if self.stream:
+            chunks = [ChatCompletionModel.model_validate(value) for value in result['response']]
+            summary = StreamIterationSummary()
+            for chunk in chunks:
+                if len(chunk.choices) != 1 or chunk.choices[0].delta.tool_calls:
+                    raise CoordinationError('durable_restore_incompatible', 'Unexpected child tool result')
+                accumulate_stream_chunk(summary, chunk)
+            if not chunks or summary.content != candidate or summary.finish_reason != 'stop':
+                raise CoordinationError('durable_restore_incompatible', 'Completed stream differs from canonical candidate')
+            model = chunks[-1].model
+            for chunk in chunks:
+                yield self.yield_static(chunk, content_type=self.OUTPUT_HANDLE_CONTENT)
+        else:
+            response = ModelChatResponse.model_validate(result['response'])
+            if (not response.id or len(response.choices) != 1 or response.tool_calls
+                    or response.finish_reason != 'stop' or (response.content or '') != candidate):
+                raise CoordinationError('durable_restore_incompatible', 'Completed response differs from canonical candidate')
+            model = response.model
+            yield self._native_content_frame(response, model)
+        self.generated = candidate
+        async for item in self._final_output_frames([], [], {}, False, model):
+            yield item
 
     def _emit_llm_generation(self, intention, duration_ms: Optional[float] = None) -> dict:
         """Emit a structured LLM_GENERATION debug event for execution tree persistence.

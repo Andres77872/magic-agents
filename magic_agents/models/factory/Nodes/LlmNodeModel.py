@@ -3,6 +3,7 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from magic_agents.models.factory.Nodes.BaseNodeModel import BaseNodeModel
+from magic_agents.models.coordination import MessagingConfig
 
 
 def normalize_reasoning_effort(value: Any) -> Optional[str]:
@@ -50,6 +51,7 @@ class LlmNodeModel(BaseNodeModel):
     iterate: Optional[bool] = False  # if true, rerun this LLM node on each Loop iteration
     history_messages: Optional[list[dict[str, Any]]] = None  # Backend-injected history for no-CHAT graph path
     agent_config: Optional[AgentExecutionConfig] = None
+    messaging: Optional[MessagingConfig] = None
 
     # STM windowing fields (no-CHAT fallback path parity)
     max_messages: Optional[int] = Field(

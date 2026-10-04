@@ -92,7 +92,7 @@ async def _read_response(response) -> str:
 
 
 async def evaluate_jev(state: Any, questions: dict[str, dict], connection: dict | None,
-                       *, timeout: float) -> JevResponse:
+                       *, timeout: float, dispatch_session=None) -> JevResponse:
     """Submit every independent question in one call with a bounded retry budget.
 
     Only explicit transient HTTP responses are retried. Ambiguous disconnects
@@ -112,6 +112,22 @@ async def evaluate_jev(state: Any, questions: dict[str, dict], connection: dict 
         raise JevEvaluationError('Jev base URL must resolve to a valid HTTP(S) URL without credentials, query or fragment') from None
     url = resolved_url + '/systemone'
     payload = {'state': state, 'model': 'jev-latest', 'questions': questions}
+    if dispatch_session is not None:
+        # The ordinary transport retries explicit HTTP failures. The controlled
+        # adapter submits once: unconfirmed billed failures require reconciliation.
+        from magic_agents.node_system.fetch_request import FetchRequest, send_admitted_request, admitted_http_options
+        request = FetchRequest('POST', url, {'Authorization': 'Bearer ' + api_key,
+                                           'Content-Type': 'application/json'}, json_body=payload)
+        timeout = min(300, timeout)
+        prepared = admitted_http_options(request)
+        effective = {**prepared, 'timeout_seconds': timeout,
+                     'max_request_bytes': 4 * 1024 * 1024, 'max_response_bytes': 2 * 1024 * 1024}
+        async def operation():
+            return await send_admitted_request(request, timeout=timeout, strict_json=True, prepared=prepared)
+        data = await dispatch_session.call('conditional.jev', effective, operation)
+        if not isinstance(data, dict) or not isinstance(data.get('model'), str) or 'answers' not in data:
+            raise JevEvaluationError('Jev returned an invalid response envelope')
+        return JevResponse(model=data['model'], answers=data['answers'], usage=_usage(data.get('usage')))
     # Validate before sending; stdlib json otherwise silently serializes NaN.
     try:
         json.dumps(payload, allow_nan=False)

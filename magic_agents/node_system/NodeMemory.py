@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 
 class NodeMemory(Node):
+    coordination_external_dispatch_version = 1
+
     """Memory vector insights node — multi-phase async process.
 
     Receives a user message, optionally extracts structured memories via LLM,
@@ -134,7 +136,8 @@ class NodeMemory(Node):
         # =====================================================================
         # FIRE-AND-FORGET: Background extraction + upsert (Phases 2-3)
         # =====================================================================
-        if self._instructions and (client or self._embedding_client):
+        coordination = getattr(chat_log, 'coordination', None)
+        if coordination is None and self._instructions and (client or self._embedding_client):
             background_coro = self._extract_and_upsert_background(msg_str, client, chat_log)
             if callable(self._background_task_tracker):
                 try:
@@ -163,10 +166,10 @@ class NodeMemory(Node):
                         self.node_id,
                     )
                 else:
-                    query_embedding_resp = await self._embedding_client.llm.async_embedding(msg_str)
+                    query_embedding_resp = await self._embedding(msg_str, chat_log, 'query')
 
                     if query_embedding_resp is not None and query_embedding_resp.data:
-                        matches = await self._vector_db.search(
+                        matches = await self._vector_operation(chat_log, 'search',
                             query_embedding=query_embedding_resp.data[0].embedding,
                             top_k=self._top_k,
                             filter_scope={
@@ -184,6 +187,9 @@ class NodeMemory(Node):
                         )
 
             except Exception as exc:
+                if coordination is not None:
+                    from magic_agents.coordination.dispatch import is_protected
+                    if is_protected(exc): raise
                 logger.warning(
                     "NodeMemory '%s': Vector search failed: %s",
                     self.node_id, exc,
@@ -208,7 +214,38 @@ class NodeMemory(Node):
         # =====================================================================
         # PHASE 6: Yield
         # =====================================================================
+        if coordination is not None and self._instructions and (client or self._embedding_client):
+            # Preserve future-turn memory semantics while retaining ownership:
+            # finish this invocation's extraction/upsert before yielding output.
+            await self._extract_and_upsert_background(msg_str, client, chat_log)
         yield self.yield_static(result, content_type=self.OUTPUT_HANDLE)
+
+    async def _embedding(self, text, chat_log, purpose):
+        scope = getattr(chat_log, 'coordination', None)
+        engine = self._embedding_client.llm
+        if scope is None: return await engine.async_embedding(text)
+        if getattr(engine, 'external_embedding_control_version', None) != 1:
+            from magic_agents.coordination.service import CoordinationError
+            raise CoordinationError('adapter_unsupported', 'Embedding adapter lacks physical dispatch admission')
+        session = scope.dispatch_session(self.node_id)
+        return await engine.async_embedding(text, external_dispatch=session,
+                                            external_kind='memory.embedding.' + purpose)
+
+    async def _vector_operation(self, chat_log, operation_name, **arguments):
+        scope = getattr(chat_log, 'coordination', None)
+        function = getattr(self._vector_db, operation_name)
+        if scope is None: return await function(**arguments)
+        from magic_agents.vector_storage.in_memory_vector_db import InMemoryVectorDB
+        guard = scope.capture_guard(self.node_id)
+        guard()
+        if type(self._vector_db) is InMemoryVectorDB:
+            result = await function(**arguments)
+            guard()
+            return result
+        session = scope.dispatch_session(self.node_id)
+        request = {'backend': self._detect_vector_db_backend(), 'arguments': arguments}
+        async def operation(): return await function(**arguments)
+        return await session.call('memory.vector.' + operation_name, request, operation)
 
     async def _extract_and_upsert_background(
         self,
@@ -255,9 +292,9 @@ class NodeMemory(Node):
 
                 extraction_chat.add_user_message(msg_str)
 
-                result = await client.llm.async_generate(
-                    extraction_chat, json_output=True,
-                )
+                scope = getattr(chat_log, 'coordination', None)
+                options = {'provider_attempt_control': scope.attempt_control(self.node_id)} if scope is not None else {}
+                result = await client.llm.async_generate(extraction_chat, json_output=True, **options)
                 parsed = ExtractionResult(**json.loads(result.content))
                 for mem in parsed.memories:
                     entry = MemoryEntry(
@@ -269,6 +306,9 @@ class NodeMemory(Node):
                 self._memory_entries.extend(memory_entries)
 
             except Exception as exc:
+                if getattr(chat_log, 'coordination', None) is not None:
+                    from magic_agents.coordination.dispatch import is_protected
+                    if is_protected(exc): raise
                 logger.warning(
                     "NodeMemory '%s': Background extraction failed: %s",
                     self.node_id, exc,
@@ -289,11 +329,11 @@ class NodeMemory(Node):
         try:
             for entry in memory_entries:
                 try:
-                    embedding_resp = await self._embedding_client.llm.async_embedding(entry.content)
+                    embedding_resp = await self._embedding(entry.content, chat_log, 'write')
                     if embedding_resp is not None and embedding_resp.data:
                         doc_id = str(uuid.uuid4())  # UUID4 ID
 
-                        await self._vector_db.upsert(
+                        await self._vector_operation(chat_log, 'upsert',
                             id=doc_id,
                             embedding=embedding_resp.data[0].embedding,
                             metadata={
@@ -307,11 +347,17 @@ class NodeMemory(Node):
                             },
                         )
                 except Exception as exc:
+                    if getattr(chat_log, 'coordination', None) is not None:
+                        from magic_agents.coordination.dispatch import is_protected
+                        if is_protected(exc): raise
                     logger.warning(
                         "NodeMemory '%s': Background upsert failed for entry: %s",
                         self.node_id, exc,
                     )
         except Exception as exc:
+            if getattr(chat_log, 'coordination', None) is not None:
+                from magic_agents.coordination.dispatch import is_protected
+                if is_protected(exc): raise
             logger.warning(
                 "NodeMemory '%s': Background upsert batch failed: %s",
                 self.node_id, exc,

@@ -3,6 +3,7 @@
 Tool-provider node that discovers MCP server tools and yields MCPToolBundle.
 """
 import logging
+from types import MappingProxyType
 from typing import Optional, AsyncGenerator, Dict, Any
 
 from magic_agents.models.factory.Nodes.McpNodeModel import McpNodeModel
@@ -21,6 +22,10 @@ logger = logging.getLogger(__name__)
 
 
 class NodeMcp(Node):
+    coordination_external_dispatch_version = 1
+    coordination_external_transport_profiles = frozenset({'http-stateless-bounded-v1'})
+    coordination_external_transport_versions = MappingProxyType({'mcp': '2.2.0', 'httpx2': '2.13.0', 'mcp-types': '2.2.0'})
+
     """MCP tool-provider node.
     
     Yields MCPToolBundle containing discovered tools from MCP server.
@@ -93,14 +98,14 @@ class NodeMcp(Node):
             raise ValueError("MCP node requires exactly 1 server in v1")
         
         server_config = self._config.servers[0]
+        scope = getattr(chat_log, 'coordination', None)
+        def create_session():
+            options = {'dispatch_session': scope.dispatch_session(self.node_id)} if scope is not None else {}
+            return MCPSessionManager(config=server_config, node_id=self.node_id, debug=self.debug, **options)
         
         try:
             # Step 1: Initialize session
-            self._session = MCPSessionManager(
-                config=server_config,
-                node_id=self.node_id,
-                debug=self.debug
-            )
+            self._session = create_session()
             await self._session.connect()
             
             logger.info(
@@ -146,11 +151,8 @@ class NodeMcp(Node):
                 session=self._session,
                 namespace=namespace,
                 timeout=server_config.tool_timeout,
-                session_factory=lambda: MCPSessionManager(
-                    config=server_config,
-                    node_id=self.node_id,
-                    debug=self.debug,
-                ),
+                session_factory=create_session,
+                **({'coordinated': True} if scope is not None else {}),
             )
             self._bundle = dispatcher.build_bundle(mapped_tools, self.node_id)
             
@@ -225,6 +227,8 @@ class NodeMcp(Node):
                 try:
                     await self._session.cleanup()
                 except Exception as cleanup_error:
+                    if scope is not None:
+                        raise
                     logger.warning(
                         "NodeMcp:%s cleanup error: %s",
                         self.node_id,

@@ -419,6 +419,12 @@ class FetchToolCallable:
             if not request.has_body and request.method != 'GET':
                 return json.dumps({"error": f"No body provided for {request.method} request"})
 
+            scope = getattr(self, '_dispatch_scope', None)
+            if scope is not None:
+                from magic_agents.node_system.fetch_request import coordinated_fetch
+                result = await coordinated_fetch(scope, self._source_node_id, request)
+                return result if strict or isinstance(result, str) else json.dumps(result)
+
             async with aiohttp.ClientSession() as session:
                 async with session.request(**request.aiohttp_kwargs()) as response:
                     if response.status < 200 or response.status >= 300:
@@ -485,6 +491,9 @@ class FetchToolCallable:
             )
             return json.dumps({"error": f"Network error: {message}"})
         except Exception as e:
+            if getattr(self, '_dispatch_scope', None) is not None:
+                from magic_agents.coordination.dispatch import is_protected
+                if is_protected(e): raise
             if strict:
                 raise
             message = _scrub_exception(e, secrets)
@@ -498,6 +507,8 @@ class FetchToolCallable:
 
 
 class NodeFetch(Node):
+    coordination_external_dispatch_version = 1
+
     """
     Fetch node - output handle names are configurable via JSON data.handles.
     JSON is the source of truth for all handle names.
@@ -643,6 +654,11 @@ class NodeFetch(Node):
         if self.tool_mode:
             callable_tool = self._build_tool_callable()
             callable_tool._source_node_id = self.node_id
+            scope = getattr(chat_log, 'coordination', None)
+            if scope is not None:
+                from magic_agents.coordination.dispatch import register_dispatch_callable
+                callable_tool._dispatch_scope = scope
+                register_dispatch_callable(callable_tool)
             yield self.yield_static(callable_tool, content_type=self.OUTPUT_HANDLE)
             return
 
@@ -675,7 +691,12 @@ class NodeFetch(Node):
             logger.debug("NodeFetch:%s request payload type=%s headers_keys=%s",
                          self.node_id, payload_type, list(request.headers.keys()))
         try:
-            response = await send_step_request(request)
+            scope = getattr(chat_log, 'coordination', None)
+            if scope is not None:
+                from magic_agents.node_system.fetch_request import coordinated_fetch
+                response = await coordinated_fetch(scope, self.node_id, request)
+            else:
+                response = await send_step_request(request)
         except Exception as error:
             logger.error("NodeFetch:%s %s: %s", self.node_id, type(error).__name__, error)
             raise

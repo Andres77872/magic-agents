@@ -4,11 +4,14 @@ Handles MCP session lifecycle: connect, initialize handshake, tool calls, cleanu
 Encapsulates mcp SDK to prevent dependency leakage.
 """
 import asyncio
+import copy
 import logging
 import inspect
 from pydantic import BaseModel
 from typing import Optional, Any
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 
 # MCP SDK imports isolated here
 from mcp import ClientSession
@@ -21,6 +24,16 @@ logger = logging.getLogger(__name__)
 
 # MCP protocol version we support
 MCP_PROTOCOL_VERSION = "2025-03-26"
+
+
+@dataclass(frozen=True)
+class _DiscoveryOperation:
+    session: object
+    physical: object
+    task: object
+
+
+_DISCOVERY_OPERATION = ContextVar('mcp_complete_discovery_operation', default=None)
 
 
 @asynccontextmanager
@@ -59,11 +72,14 @@ class MCPSessionManager:
         self,
         config: MCPServerConfig,
         node_id: str,
-        debug: bool = False
+        debug: bool = False,
+        dispatch_session=None,
     ):
-        self._config = config
+        self._config = config.model_copy(deep=True) if dispatch_session is not None else config
         self._node_id = node_id
         self._debug = debug
+        self._dispatch = dispatch_session
+        self._physical = None
         
         # Session state
         self._session: Optional[ClientSession] = None
@@ -132,6 +148,16 @@ class MCPSessionManager:
         return self._session_id_callback()
     
     async def connect(self) -> None:
+        if self._dispatch is not None:
+            from magic_agents.coordination.service import CoordinationError
+            self._dispatch.guard()
+            if self._config.transport != 'http':
+                raise CoordinationError('mcp_transport_unsupported', 'Coordinated MCP requires the qualified stateless HTTP profile')
+            # Each physical HTTP request owns its reservation. A logical
+            # connect must not hold the only job permit needed by its handshake.
+        return await self._connect_uncontrolled()
+
+    async def _connect_uncontrolled(self) -> None:
         """Connect to MCP server and complete initialization handshake.
         
         Steps:
@@ -166,6 +192,12 @@ class MCPSessionManager:
         except Exception as e:
             self._is_healthy = False
             self._is_initialized = False
+            if self._dispatch is not None:
+                from magic_agents.coordination.dispatch import is_protected
+                if is_protected(e):
+                    raise
+            if self._physical is not None:
+                self._physical.check()
             if isinstance(e, (MCPProtocolError, MCPTransportError)):
                 raise
             raise MCPTransportError(
@@ -204,13 +236,16 @@ class MCPSessionManager:
         headers = self._config.headers or {}
         
         # Create HTTP client context
-        self._transport_context = streamablehttp_client(
-            self._config.url,
-            headers=headers
-        )
+        if self._dispatch is not None:
+            from magic_agents.mcp.controlled_http import controlled_http_client
+            self._transport_context = controlled_http_client(self._config, self._dispatch)
+        else:
+            self._transport_context = streamablehttp_client(self._config.url, headers=headers)
         
         # Enter context and get streams
         result = await self._transport_context.__aenter__()
+        if self._dispatch is not None:
+            result, self._physical = result
         # streamablehttp returns (read_stream, write_stream, session_id_callback)
         self._read_stream = result[0]
         self._write_stream = result[1]
@@ -242,10 +277,9 @@ class MCPSessionManager:
             )
         
         # Send initialize request with empty capabilities (tool-only client)
-        init_result = await asyncio.wait_for(
-            self._session.initialize(),
-            timeout=self._config.init_timeout
-        )
+        async def initialize():
+            return await asyncio.wait_for(self._session.initialize(), timeout=self._config.init_timeout)
+        init_result = await self._physical.run(initialize, timeout=self._config.init_timeout) if self._physical is not None else await initialize()
         
         # Extract server info, capabilities, and instructions
         # SDK 1.x/2.x Pydantic models expose different Python attribute names;
@@ -293,6 +327,15 @@ class MCPSessionManager:
         arguments: dict,
         timeout: Optional[float] = None
     ) -> Any:
+        if self._dispatch is not None:
+            from magic_agents.coordination.dispatch import _encoded
+            self._physical.check()
+            arguments = copy.deepcopy(arguments)
+            _encoded(arguments, max_bytes=1024 * 1024)
+            timeout = timeout or self._config.tool_timeout
+            async def operation():
+                return await asyncio.wait_for(self._session.call_tool(name, arguments), timeout=timeout)
+            return await self._physical.run(operation, timeout=timeout)
         """Call an MCP tool via session.
         
         Args:
@@ -357,6 +400,41 @@ class MCPSessionManager:
             )
     
     async def list_tools(self, cursor: Optional[str] = None) -> Any:
+        if self._dispatch is not None:
+            if asyncio.current_task().cancelling():
+                raise asyncio.CancelledError('MCP discovery was cancelled before its next page')
+            owner = _DISCOVERY_OPERATION.get()
+            if (owner is not None and owner.session is self and owner.physical is self._physical
+                    and owner.task is asyncio.current_task()):
+                # Only the exact whole-discovery task can reuse this window.
+                # Inherited contexts in unrelated child tasks do not qualify.
+                self._physical.check()
+                return await self._list_tools_uncontrolled(cursor)
+            async def operation(): return await self._list_tools_uncontrolled(cursor)
+            return await self._physical.run(operation, timeout=self._config.discovery_timeout)
+        return await self._list_tools_uncontrolled(cursor)
+
+    async def _run_discovery(self, operation, *, timeout):
+        """Own one byte/deadline window across an entire paginated discovery."""
+        if self._dispatch is None:
+            return await operation()
+        self._physical.check()
+        async def bounded():
+            owner = _DiscoveryOperation(self, self._physical, asyncio.current_task())
+            token = _DISCOVERY_OPERATION.set(owner)
+            try:
+                return await operation()
+            finally:
+                _DISCOVERY_OPERATION.reset(token)
+        try:
+            return await self._physical.run(bounded, timeout=min(timeout, self._config.discovery_timeout))
+        except BaseException as error:
+            from magic_agents.coordination.dispatch import is_protected
+            if is_protected(error):
+                self._physical.fail(error)
+            raise
+
+    async def _list_tools_uncontrolled(self, cursor: Optional[str] = None) -> Any:
         """List tools from MCP server (paginated).
         
         Args:
@@ -400,6 +478,8 @@ class MCPSessionManager:
         For stdio: close stdin, wait for process exit
         For HTTP: close connection (DELETE session endpoint if supported)
         """
+        if self._physical is not None:
+            return await self._cleanup_controlled()
         if self._session:
             try:
                 await self._session.__aexit__(None, None, None)
@@ -432,3 +512,29 @@ class MCPSessionManager:
             self._node_id,
             self.server_key
         )
+
+    async def _cleanup_controlled(self):
+        """Exit SDK contexts in their owning task even if session exit fails."""
+        from magic_agents.mcp.controlled_http import LOCAL_UNWIND_SECONDS
+        failure = None
+        for attribute in ('_session', '_transport_context'):
+            context = getattr(self, attribute)
+            if context is not None:
+                try:
+                    # asyncio's deadline adds no AnyIO cancel scope above the
+                    # SDK's owner scope, preserving its strict LIFO exit order.
+                    async with asyncio.timeout(LOCAL_UNWIND_SECONDS):
+                        await context.__aexit__(None, None, None)
+                except BaseException as error:
+                    failure = failure or error
+                finally:
+                    setattr(self, attribute, None)
+        self._read_stream = self._write_stream = None
+        self._is_healthy = self._is_initialized = False
+        if self._physical.failure is not None:
+            raise self._physical.failure
+        if failure is not None:
+            if not isinstance(failure, Exception):
+                raise failure
+            from magic_agents.coordination.service import CoordinationError
+            raise CoordinationError('mcp_cleanup_failed', 'MCP cleanup did not complete safely') from failure

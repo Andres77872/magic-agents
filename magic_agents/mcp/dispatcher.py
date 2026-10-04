@@ -97,11 +97,13 @@ class MCPToolDispatcher:
         namespace: MCPToolNamespace,
         timeout: Optional[float] = None,
         session_factory: Optional[Callable[[], MCPSessionManager]] = None,
+        coordinated: bool = False,
     ):
         self._session = session
         self._namespace = namespace
         self._timeout = timeout or session._config.tool_timeout
         self._session_factory = session_factory
+        self._coordinated = coordinated
     
     def build_bundle(
         self,
@@ -218,6 +220,8 @@ class MCPToolDispatcher:
                     try:
                         await call_session.cleanup()
                     except Exception as cleanup_error:
+                        if self._coordinated:
+                            raise
                         logger.warning(
                             "MCPToolDispatcher tool '%s' cleanup failed: %s",
                             local_name,
@@ -233,6 +237,9 @@ class MCPToolDispatcher:
         
         # Set __name__ for magic-llm registration
         wrapper.__name__ = local_name
+        if self._coordinated:
+            from magic_agents.coordination.dispatch import register_dispatch_callable
+            register_dispatch_callable(wrapper)
         
         return wrapper
     
@@ -284,6 +291,9 @@ class MCPToolDispatcher:
             # Tool-level error - return content (already handled in serialize)
             return e.content
         except Exception as e:
+            if self._coordinated:
+                from magic_agents.coordination.dispatch import is_protected
+                if is_protected(e): raise
             # Unexpected error - return as tool error
             logger.error(
                 "MCPToolDispatcher tool '%s' unexpected error: %s",

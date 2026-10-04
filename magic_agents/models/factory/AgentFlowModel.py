@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, PrivateAttr, Field
 from magic_agents.models.factory.EdgeNodeModel import EdgeNodeModel
 from magic_agents.debug.config import DebugConfig
 from magic_agents.hooks.flow_hooks import FlowHooks
+from magic_agents.models.coordination import CoordinationPolicy
 
 
 class ContractConfig(BaseModel):
@@ -142,6 +143,7 @@ class AgentFlowModel(BaseModel):
         extra='ignore'
     )
     
+    coordination: Optional[CoordinationPolicy] = None
     type: str = "chat"
     debug: bool = False
     debug_config: Optional[Dict[str, Any]] = None

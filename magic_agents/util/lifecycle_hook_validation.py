@@ -111,6 +111,8 @@ def child_call_target_error(node, handle):
 
 def validate_lifecycle_hooks(nodes, edges):
     """Return structured graph errors; legacy observers retain their own checks."""
+    from magic_agents.hooks.messages_hook import messages_hook_bindings, MessagesHookBindingError
+    from magic_agents.hooks.target_binding import hook_target_ids
     by_id = {node.get("id"): node for node in nodes}
     enabled = {}
     errors = []
@@ -118,6 +120,11 @@ def validate_lifecycle_hooks(nodes, edges):
     def error(message, **context):
         errors.append({"error_type": "HookValidationError", "error_message": message,
                        "context": context})
+
+    try:
+        messages_hook_bindings(nodes, edges)
+    except MessagesHookBindingError as exc:
+        error(str(exc))
 
     for edge in edges:
         binding = edge.get("hooks")
@@ -127,30 +134,36 @@ def validate_lifecycle_hooks(nodes, edges):
         if node.get("type") != "hook":
             continue
         node_id, data = node.get("id"), _data(node)
-        event, target = data.get("lifecycle_event"), data.get("target_node_id")
+        if data.get('hook_mode') == 'messages':
+            continue
+        if data.get('hook_mode', 'python') != 'python' or data.get('messaging_by_target') is not None:
+            error('Invalid Hook mode or mixed Messages configuration.', node_id=node_id)
+        event = data.get("lifecycle_event")
+        try:
+            targets = hook_target_ids(data)
+        except ValueError as exc:
+            error(str(exc), node_id=node_id)
+            targets = ()
         valid_event = isinstance(event, str) and event in LIFECYCLE_EVENTS
         if event is not None and not valid_event:
             error(f"Hook '{node_id}' has an invalid lifecycle_event.", node_id=node_id, field="lifecycle_event")
         policy = data.get("failure_policy", "preserve")
         if policy not in ("preserve", "fail"):
             error(f"Hook '{node_id}' failure_policy must be preserve or fail.", node_id=node_id, field="failure_policy")
-        if target is not None:
-            if not isinstance(target, str) or not target.strip():
-                error(f"Hook '{node_id}' target_node_id must be a non-empty node ID or null.", node_id=node_id, field="target_node_id")
-            elif event is None:
-                error(f"Hook '{node_id}' needs a lifecycle_event to bind a target node.", node_id=node_id, target_node_id=target)
-            elif target not in by_id or by_id[target].get("type") not in EXECUTABLE_TYPES:
-                error(f"Hook '{node_id}' target '{target}' must reference an executable non-Hook node.", node_id=node_id, target_node_id=target)
-            if isinstance(target, str) and by_id.get(target, {}).get("type") == "loop" and valid_event and event != "onDeliver":
-                error(f"Hook '{node_id}' cannot target Loop orchestration with {event}; use onDeliver or target a node inside the Loop.",
-                      node_id=node_id, target_node_id=target, field="target_node_id")
+        if targets:
+            if event is None:
+                error(f"Hook '{node_id}' needs a lifecycle_event to bind target nodes.", node_id=node_id)
+            for target in targets:
+                if target not in by_id or by_id[target].get('type') not in EXECUTABLE_TYPES:
+                    error(f"Hook '{node_id}' target '{target}' must reference an executable non-Hook node.", node_id=node_id, target_node_id=target)
+                if by_id.get(target, {}).get('type') == 'loop' and valid_event and event != 'onDeliver':
+                    error(f"Hook '{node_id}' cannot target Loop orchestration with {event}; use onDeliver or target a node inside the Loop.", node_id=node_id, target_node_id=target)
             if enabled.get(node_id):
-                error(f"Hook '{node_id}' cannot combine node scope with an enabled connection binding.",
-                      node_id=node_id, edge_ids=[item.get("id") for item in enabled[node_id]])
+                error(f"Hook '{node_id}' cannot combine node scope with an enabled connection binding.", node_id=node_id, edge_ids=[item.get('id') for item in enabled[node_id]])
         elif event is not None and not enabled.get(node_id):
             error(f"Lifecycle Hook '{node_id}' needs a target node or an enabled connection binding.", node_id=node_id)
 
-        if target is None and valid_event:
+        if not targets and valid_event:
             for binding in enabled.get(node_id, []):
                 destination = by_id.get(binding.get("target"), {})
                 origin = by_id.get(binding.get("source"), {})

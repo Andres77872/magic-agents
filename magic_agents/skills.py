@@ -315,11 +315,43 @@ def validate_skills_topology(nodes, edges):
     return {consumer: tuple(sources) for consumer, sources in connected.items()}
 
 
-def create_request_guard(max_input_tokens=None, *, source_node_id=None, source_node_ids=()):
+def create_request_guard(max_input_tokens=None, *, source_node_id=None, source_node_ids=(), resume_state=None):
     """Conservative finite host bound, not a guarantee of a provider's capacity."""
     cap = max_input_tokens if max_input_tokens is not None else 32768
     initial_message_count = None
     loader_call_ids = set()
+    if resume_state is not None:
+        if (type(resume_state) is not dict or set(resume_state) != {'schemaVersion', 'initialMessageCount', 'loaderCallIds'}
+                or type(resume_state['schemaVersion']) is not int or resume_state['schemaVersion'] != 1
+                or type(resume_state['initialMessageCount']) is not int or resume_state['initialMessageCount'] < 0
+                or type(resume_state['loaderCallIds']) is not list
+                or len(resume_state['loaderCallIds']) > 4096
+                or any(type(value) is not str or not 1 <= len(value.encode('utf-8')) <= 256
+                       for value in resume_state['loaderCallIds'])
+                or len(set(resume_state['loaderCallIds'])) != len(resume_state['loaderCallIds'])):
+            raise ValueError('SKILLS_CHECKPOINT_INVALID: invalid request guard state')
+        initial_message_count = resume_state['initialMessageCount']
+        loader_call_ids = set(resume_state['loaderCallIds'])
+
+    def capture(messages):
+        nonlocal initial_message_count
+        if initial_message_count is None:
+            initial_message_count = len(messages)
+        if initial_message_count > len(messages):
+            raise ValueError('SKILLS_CHECKPOINT_INVALID: canonical history was shortened')
+        current = {call.get('id'): call for message in messages[initial_message_count:]
+                   for call in message.get('tool_calls') or []}
+        observed = {identifier for identifier, call in current.items()
+                    if call.get('function', {}).get('name') == SKILLS_TOOL_NAME}
+        if (not loader_call_ids.issubset(observed) or len(observed) > 4096
+                or any(type(value) is not str or not 1 <= len(value.encode('utf-8')) <= 256 for value in observed)):
+            raise ValueError('SKILLS_CHECKPOINT_INVALID: canonical loader provenance changed')
+        loader_call_ids.update(observed)
+        return {'schemaVersion': 1, 'initialMessageCount': initial_message_count,
+                'loaderCallIds': sorted(loader_call_ids)}
+
+    def checkpoint_state(messages):
+        return copy.deepcopy(capture(messages))
     def observer_projection(chat):
         projected = copy.deepcopy(chat)
         preserved = projected.messages[:initial_message_count]
@@ -351,16 +383,10 @@ def create_request_guard(max_input_tokens=None, *, source_node_id=None, source_n
         collect(options)
         return max(limits) if limits else None
     def guard(context):
-        nonlocal initial_message_count
-        if initial_message_count is None:
-            initial_message_count = len(context.chat.messages)
         # Complete guarded history never windows. Identify appended invocation
         # records by their boundary, so historical call-ID reuse cannot expose
         # a new loader result or remove an unrelated initial exchange.
-        current = {call.get('id'): call for message in context.chat.messages[initial_message_count:]
-                   for call in message.get('tool_calls') or []}
-        loader_call_ids.update(identifier for identifier, call in current.items()
-            if call.get('function', {}).get('name') == SKILLS_TOOL_NAME)
+        capture(context.chat.messages)
         context.chat.set_observer_projection(observer_projection)
         from magic_agents.hooks.invocation_control import OperationFailure
         from magic_llm.engine.tooling import normalize_openai_tools
@@ -386,4 +412,5 @@ def create_request_guard(max_input_tokens=None, *, source_node_id=None, source_n
             if wire_cost + image_count * 4096 + wire_reserve > cap:
                 raise OperationFailure('SKILLS_CONTEXT_LIMIT', 'Complete skill request exceeds the configured host input budget')
         context.chat.set_provider_payload_guard(validate_wire_payload)
+    guard.checkpoint_state = checkpoint_state
     return guard

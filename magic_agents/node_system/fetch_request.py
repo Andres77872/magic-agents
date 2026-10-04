@@ -27,6 +27,8 @@ info or response headers.
 from __future__ import annotations
 
 import asyncio
+import copy
+import math
 import http
 import itertools
 import json
@@ -715,3 +717,70 @@ async def send_step_request(request: FetchRequest) -> Any:
         raise UnexpectedError(
             request.secrets.scrub(f"Unexpected error during fetch ({kind}): {detail}"),
             context=request.context(exception_type=kind), exception_type=kind) from None
+
+
+def admitted_http_options(request: FetchRequest):
+    """Freeze and bound the actual request before host admission or transport."""
+    from magic_agents.coordination.service import CoordinationError
+    kwargs = copy.deepcopy(request.aiohttp_kwargs())
+    try:
+        # aiohttp's default JSON serializer uses ASCII escaping. Quote its
+        # physical expansion, not the smaller canonical UTF-8 representation.
+        if 'json' in kwargs:
+            body = json.dumps(kwargs.pop('json'), allow_nan=False)
+            kwargs['data'] = body
+            headers = kwargs.setdefault('headers', {})
+            if not any(key.lower() == 'content-type' for key in headers):
+                headers['Content-Type'] = 'application/json'
+        if 'data' in kwargs and not isinstance(kwargs['data'], str):
+            # No unbounded multipart/file streams in the qualified adapter.
+            raise ValueError('Controlled HTTP supports text or JSON bodies')
+        encoded = json.dumps(kwargs, ensure_ascii=True, allow_nan=False).encode('utf-8')
+        if len(encoded) > 4 * 1024 * 1024:
+            raise ValueError('Physical HTTP request byte ceiling exceeded')
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise CoordinationError('external_request_limit', 'HTTP request is not bounded supported JSON/text') from error
+    kwargs['allow_redirects'] = False
+    kwargs['auto_decompress'] = False
+    return kwargs
+
+
+async def send_admitted_request(request: FetchRequest, *, timeout: float, max_response_bytes: int = 2 * 1024 * 1024,
+                                strict_json: bool = False, prepared: dict | None = None):
+    """One controlled HTTP dispatch; no redirects or unbounded body buffering."""
+    if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 300:
+        from magic_agents.coordination.service import CoordinationError
+        raise CoordinationError('external_timeout_limit', 'Controlled HTTP requires a finite timeout <= 300 seconds')
+    kwargs = copy.deepcopy(prepared) if prepared is not None else admitted_http_options(request)
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout, connect=min(30, timeout),
+                                                                  sock_read=min(30, timeout)), trust_env=False) as session:
+        from magic_llm.util.http import disable_automatic_retries
+        disable_automatic_retries(session)
+        async with session.request(**kwargs) as response:
+            from magic_llm.util.http import read_bounded_response, HttpError
+            try:
+                body = (await read_bounded_response(response, max_response_bytes)).decode('utf-8')
+            except HttpError as error:
+                from magic_agents.coordination.service import CoordinationError
+                raise CoordinationError('external_response_limit', 'HTTP response violated its admitted transport bounds') from error
+            if not 200 <= response.status < 300:
+                raise http_error(request, response.status, response.reason, body)
+            if strict_json:
+                from magic_agents.execution.condition_evaluator_llm import _object_without_duplicates
+                return json.loads(body, object_pairs_hook=_object_without_duplicates,
+                    parse_constant=lambda _: (_ for _ in ()).throw(ValueError('Nonfinite JSON')))
+            try: return json.loads(body)
+            except json.JSONDecodeError: return body
+
+
+async def coordinated_fetch(scope, node_id, request: FetchRequest):
+    """Quote the rendered request, retaining semantic fields and private headers."""
+    session = scope.dispatch_session(node_id)
+    timeout = min(300, max(0, scope.budget.deadline - scope.budget.clock()))
+    prepared = admitted_http_options(request)
+    effective = {**copy.deepcopy(prepared), 'timeout_seconds': timeout,
+                 'max_request_bytes': 4 * 1024 * 1024, 'max_response_bytes': 2 * 1024 * 1024}
+    async def operation():
+        return await send_admitted_request(request, timeout=timeout,
+                                           max_response_bytes=effective['max_response_bytes'], prepared=prepared)
+    return await session.call('http.fetch', effective, operation)

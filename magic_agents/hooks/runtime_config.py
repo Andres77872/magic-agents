@@ -102,7 +102,7 @@ class RuntimeConfig:
         """Get count of registered global hooks."""
         return len(cls._global_hooks)
     
-    def __init__(self, graph_hooks: Optional[List[FlowHooks]] = None):
+    def __init__(self, graph_hooks: Optional[List[FlowHooks]] = None, *, coordination=None):
         """Initialize RuntimeConfig with optional graph-level hooks.
         
         Args:
@@ -110,6 +110,7 @@ class RuntimeConfig:
                         These hooks apply only when this config is used.
         """
         self._graph_hooks: List[FlowHooks] = list(graph_hooks or [])
+        self.coordination = coordination  # trusted execution-owned context, never a global hook
         
         # Persistence configuration (P1-3)
         # Default: True — no-op without sink (build_persistence_hook returns None)

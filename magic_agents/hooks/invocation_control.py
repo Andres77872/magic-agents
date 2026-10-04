@@ -59,6 +59,80 @@ def error_code(error):
     return None
 
 
+def _protected_failure(error):
+    """Execution authority failures are typed, never inferred from error text."""
+    from magic_agents.coordination.budget import BudgetError
+    from magic_agents.coordination.service import CoordinationError
+    from magic_llm.agent.control import AgentControlError
+    from magic_llm.agent.types import AgentBudgetExceeded
+    from magic_llm.engine.attempt_control import ProviderAttemptControlError
+    from magic_llm.exception.ChatException import RequestValidationError
+    return isinstance(error, (asyncio.CancelledError, PermissionError, BudgetError,
+                              CoordinationError, AgentControlError, ProviderAttemptControlError,
+                              AgentBudgetExceeded, RequestValidationError)) or (
+        isinstance(error, OperationFailure) and error_code(error) == "SKILLS_CONTEXT_LIMIT")
+
+
+def _authority_outcome(error):
+    if isinstance(error, asyncio.CancelledError):
+        return {"status": "cancelled"}
+    code = (getattr(error, "code", None) or getattr(error, "error_code", None)
+            or error_code(error) or "COORDINATION_DENIED")
+    return failure(str(code), "Invocation stopped by execution authority",
+                   details={"exception_type": type(error).__name__})
+
+
+class _InvocationAuthority:
+    """One private, fail-closed lineage across all owned lifecycle children.
+
+    A Hook may catch a child's exception. It cannot thereby undo the execution
+    authority's terminal decision or start a sibling with fresh permissions.
+    """
+    def __init__(self, scope, node_id):
+        self.scope, self.node_id, self.denial = scope, node_id, None
+        self.owner_guard = scope.capture_guard(node_id)
+
+    def protect(self, error):
+        if self.denial is None:
+            if isinstance(error, OperationFailure) and error_code(error) == "SKILLS_CONTEXT_LIMIT":
+                from magic_llm.agent.control import AgentControlError
+                error = AgentControlError("Skills request exceeds the admitted context budget", "SKILLS_CONTEXT_LIMIT")
+            self.denial = error
+        return self.denial
+
+    def check(self, node_id):
+        if self.denial is not None:
+            raise self.denial
+        try:
+            if asyncio.current_task().cancelling():
+                raise asyncio.CancelledError()
+            # Retain the initiating owner's authority even for nonactor children.
+            self.owner_guard()
+            if node_id != self.node_id:
+                self.scope.guard(node_id)
+        except BaseException as error:
+            if not isinstance(error, (Exception, asyncio.CancelledError)):
+                raise
+            if not _protected_failure(error):
+                from magic_agents.coordination.service import CoordinationError
+                error = CoordinationError("coordination_admission_failed", "Execution authority check failed")
+            raise self.protect(error)
+
+
+def _copy_run_log(chat_log):
+    """Isolate ordinary Hook data without cloning live authority, locks or clients."""
+    coordination = getattr(chat_log, "coordination", None)
+    memo = {id(coordination): coordination} if coordination is not None else None
+    return copy.deepcopy(chat_log, memo)
+
+
+def _reject_sync_tool(chat_log):
+    if getattr(chat_log, "coordination", None) is not None:
+        from magic_agents.coordination.service import CoordinationError
+        raise CoordinationError("unsupported_coordination_capability",
+                                "Synchronous child tools require outstanding-work reconciliation")
+
+
 def error_retryable(error):
     """``retryable`` of a typed node failure, or None when the failure is untyped.
 
@@ -177,14 +251,18 @@ class InvocationControl:
         self.bindings = [node for node in nodes.values()
                          if getattr(node, "lifecycle_event", None)]
         for hook in self.bindings:
-            if hook.target_node_id and (hook.target_node_id not in nodes or getattr(nodes[hook.target_node_id], "node_type", None) == "hook"):
+            if any(target not in nodes or getattr(nodes[target], "node_type", None) == "hook" for target in hook.target_node_ids):
                 raise ValueError("Lifecycle Hook target must reference an executable non-Hook node")
         self.connections = {edge.id: edge for edge in self.edges
                             if edge.source in nodes
                             and getattr(nodes[edge.source], "lifecycle_event", None)
                             and edge.sourceHandle == getattr(nodes[edge.source], "OUTPUT_HANDLE_CALL", None)}
         self.on_demand = {edge.target for edge in self.connections.values()}
-        self.hook_ids = {hook.node_id for hook in self.bindings}
+        from magic_agents.hooks.messages_hook import bind_messages_hooks
+        from magic_agents.node_system.NodeHook import NodeHook
+        bind_messages_hooks(nodes)
+        self.hook_ids = {hook.node_id for hook in self.bindings} | {
+            node.node_id for node in nodes.values() if isinstance(node, NodeHook) and node.hook_mode == 'messages'}
         self._active_graph_calls = set()
         for node in nodes.values():
             node._invocation_control = self
@@ -204,7 +282,7 @@ class InvocationControl:
                     and (edge.targetHandle or "").startswith(prefix))
 
     def controlled(self, node_id, edge=None):
-        if any(hook.target_node_id == node_id for hook in self.bindings):
+        if any(node_id in hook.target_node_ids for hook in self.bindings):
             return True
         candidates = [edge] if edge is not None else [
             item for item in self.edges if item.target == node_id
@@ -216,7 +294,7 @@ class InvocationControl:
         edge_ids = caller.get("edge_ids", [caller.get("edge_id")])
         node_hooks, edge_hooks = [], []
         for hook in self.bindings:
-            if hook.lifecycle_event == event and hook.target_node_id == node_id:
+            if hook.lifecycle_event == event and node_id in hook.target_node_ids:
                 node_hooks.append(hook)
         # Declared graph order makes fan-in deterministic. Each matching binding
         # gets its actual edge identity; no last-arriving input becomes caller.
@@ -224,7 +302,7 @@ class InvocationControl:
             if edge.id not in edge_ids or not edge.hooks or not edge.hooks.enabled:
                 continue
             hook = self.nodes.get(edge.hooks.hook_node_id)
-            if hook is None or not getattr(hook, "lifecycle_event", None) or hook.lifecycle_event != event or hook.target_node_id:
+            if hook is None or not getattr(hook, "lifecycle_event", None) or hook.lifecycle_event != event or hook.target_node_ids:
                 continue
             valid = (edge.source == node_id and edge.target == caller.get("node_id")
                      if self.tool_definition_edge(edge) else edge.target == node_id)
@@ -306,6 +384,11 @@ class InvocationControl:
             # Tool mode keeps the LLM tool contract, with typed HTTP failures.
             function = node._build_tool_callable()
             function._strict_errors = True
+            if getattr(chat_log, 'coordination', None) is not None:
+                from magic_agents.coordination.dispatch import register_dispatch_callable
+                function._dispatch_scope = chat_log.coordination
+                function._source_node_id = node.node_id
+                register_dispatch_callable(function)
             if not isinstance(content, dict):
                 raise OperationFailure("INVALID_INPUT", "Fetch operation arguments must be an object")
             return await function(**content)
@@ -314,6 +397,7 @@ class InvocationControl:
                 raise OperationFailure("INVALID_INPUT", "Tool arguments must be an object")
             if asyncio.iscoroutinefunction(tool) or asyncio.iscoroutinefunction(getattr(tool, "__call__", None)):
                 return await tool(**content)
+            _reject_sync_tool(chat_log)
             return await asyncio.to_thread(tool, **content)
         handle = target_handle or getattr(node, "INPUT_HANDLE_TEMPLATE_CONTEXT", None)
         if handle:
@@ -358,6 +442,7 @@ class InvocationControl:
             function = functions[0]
             if asyncio.iscoroutinefunction(function) or asyncio.iscoroutinefunction(getattr(function, "__call__", None)):
                 return await function(**content)
+            _reject_sync_tool(chat_log)
             return await asyncio.to_thread(function, **content)
         if raw_events is not None:
             raw_events.extend(outputs)
@@ -390,6 +475,12 @@ class InvocationControl:
                      admit_delivery=False, record_id=None):
         caller, content = snapshot(caller or {}), snapshot(content)
         state = state or {"deadline": time.monotonic() + self.timeout, "admissions": [0]}
+        scope = getattr(chat_log, "coordination", None)
+        if scope is not None and "authority" not in state:
+            owner_id = caller.get("node_id", node_id) if tool is not None else node_id
+            state["authority"] = _InvocationAuthority(scope, owner_id)
+        authority = state.get("authority")
+        child_operation = parent is not None and caller.get("edge_id") in self.connections and not delivery
         ident = record_id or uuid.uuid4().hex
         frame = {"id": ident, "root_id": parent["root_id"] if parent else ident,
                  "parent_id": parent["id"] if parent else None, "kind": "node", "node_id": node_id,
@@ -415,7 +506,7 @@ class InvocationControl:
             phase_facts[name] = fact
             selected = selected if selected is not None else self.select(node_id, caller, name)
             if delivery and name != "onDeliver":
-                selected = [hook for hook in selected if not hook.target_node_id]
+                selected = [hook for hook in selected if not hook.target_node_ids]
             for hook in selected:
                 if name == "onError" and hook.node_id in failed_hooks:
                     continue
@@ -432,9 +523,22 @@ class InvocationControl:
             return current
 
         try:
+            if authority is not None:
+                if child_operation and node_id in authority.scope.roles:
+                    authority.check(authority.node_id)
+                    from magic_agents.coordination.service import CoordinationError
+                    raise CoordinationError("unsupported_coordination_topology",
+                                            "Participant children require scheduler-owned activation routing")
+                authority.check(node_id)
             if node_id in stack or len(stack) >= 16 or state["admissions"][0] >= 100:
+                if authority is not None:
+                    from magic_agents.coordination.service import CoordinationError
+                    raise CoordinationError("invocation_limit", "Connected invocation cycle/depth/count limit reached")
                 outcome = failure("INVOCATION_LIMIT", "Connected invocation cycle/depth/count limit reached")
             elif time.monotonic() >= state["deadline"]:
+                if authority is not None:
+                    from magic_agents.coordination.service import CoordinationError
+                    raise CoordinationError("deadline_exceeded", "Invocation deadline exhausted")
                 outcome = failure("DEADLINE_EXCEEDED", "Invocation deadline exhausted")
             else:
                 state["admissions"][0] += 1
@@ -451,23 +555,48 @@ class InvocationControl:
                         outcome = snapshot(delivery_frame["outcome"])
                 else:
                     outcome = await phase(event, None, admission)
+                if authority is not None:
+                    authority.check(node_id)
                 if outcome is None:
                     frame["executed"] = True
+                    dispatch_task = None
                     try:
                         if delivery:
                             result = snapshot(frame["request"]["content"])
                         else:
-                            result = await asyncio.wait_for(self._operation(node_id, frame["request"]["content"],
-                            chat_log, tool=tool, target_handle=target_handle, raw_events=raw_events),
-                            timeout=max(0, state["deadline"] - time.monotonic()))
+                            async def operation():
+                                if authority is not None:
+                                    authority.check(node_id)
+                                child_log = _copy_run_log(chat_log) if child_operation and authority is not None else chat_log
+                                return await self._operation(node_id, frame["request"]["content"],
+                                    child_log, tool=tool, target_handle=target_handle, raw_events=raw_events)
+                            dispatch = (authority.scope.run_child_operation(node_id, ident,
+                                frame["request"]["content"], operation)
+                                if child_operation and authority is not None else operation())
+                            dispatch_task = asyncio.ensure_future(dispatch)
+                            result = await asyncio.wait_for(dispatch_task,
+                                timeout=max(0, state["deadline"] - time.monotonic()))
                         if time.monotonic() >= state["deadline"]:
                             raise asyncio.TimeoutError()
+                        if authority is not None:
+                            authority.check(node_id)
                         outcome = success(result)
                     except OperationFailure as exc:
+                        if authority is not None and _protected_failure(exc):
+                            raise authority.protect(exc)
                         outcome = snapshot(exc.outcome)
-                    except asyncio.TimeoutError:
+                    except asyncio.TimeoutError as exc:
+                        if authority is not None and _protected_failure(exc):
+                            raise authority.protect(exc)
+                        expired = (time.monotonic() >= state["deadline"] or
+                                   dispatch_task is not None and dispatch_task.cancelled())
+                        if authority is not None and expired:
+                            from magic_agents.coordination.service import CoordinationError
+                            raise CoordinationError("deadline_exceeded", "Node invocation deadline exhausted")
                         outcome = failure("NODE_TIMEOUT", "Node operation exceeded its invocation budget", retryable=True)
                     except Exception as exc:
+                        if authority is not None and _protected_failure(exc):
+                            raise authority.protect(exc)
                         from magic_agents.node_system.fetch_request import error_context
                         details = {"exception_type": type(exc).__name__}
                         context = error_context(exc)  # sanitized Fetch diagnostics
@@ -483,9 +612,14 @@ class InvocationControl:
             if outcome["status"] == "error":
                 outcome = await phase("onError", outcome, selected)
             outcome = await phase("onFinish", outcome, selected)
+            if authority is not None:
+                authority.check(node_id)
             frame["outcome"] = snapshot(outcome)
         except asyncio.CancelledError:
+            if authority is not None:
+                authority.protect(asyncio.CancelledError())
             frame["original_outcome"] = frame["original_outcome"] or {"status": "cancelled"}
+            frame["outcome"] = {"status": "cancelled"}
             outcome = {"status": "cancelled"}
             await phase("onCancel", outcome)
             # Started/interrupted finish bindings are never replayed.
@@ -494,6 +628,14 @@ class InvocationControl:
             outcome = await phase("onFinish", outcome, remaining) if not finish_started else await self._cancel_finish(
                 remaining, frame, chat_log, state, (*stack, node_id), phase_facts.get("onFinish"))
             frame["outcome"] = {"status": "cancelled"}
+            raise
+        except Exception as error:
+            if authority is not None and _protected_failure(error):
+                error = authority.protect(error)
+                frame["original_outcome"] = frame["original_outcome"] or _authority_outcome(error)
+                frame["outcome"] = _authority_outcome(error)
+                frame["protected"] = True
+                raise error
             raise
         finally:
             if frame["outcome"] is not None:
@@ -511,6 +653,8 @@ class InvocationControl:
         return {"status": "cancelled"}
 
     async def _hook(self, hook, subject, phase, outcome, fact, chat_log, state, stack):
+        authority = state.get("authority")
+        cancelling = phase == "onCancel" or outcome and outcome["status"] == "cancelled"
         frame = {"id": uuid.uuid4().hex, "root_id": subject["root_id"], "parent_id": subject["id"],
                  "kind": "hook", "node_id": hook.node_id, "caller": snapshot(subject["caller"]),
                  "event": phase, "input": snapshot(subject["request"]["content"]),
@@ -558,7 +702,7 @@ class InvocationControl:
                     parent=frame, state=child_state, stack=stack, target_handle=edge.targetHandle,
                     admit_delivery=True, record_id=child_id)
             except asyncio.CancelledError:
-                if asyncio.current_task().cancelling():
+                if authority is not None or asyncio.current_task().cancelling():
                     raise
                 return snapshot(next(child for child in frame["child"] if child["id"] == child_id))
         async def owned_call(connection, content):
@@ -587,12 +731,18 @@ class InvocationControl:
                 await asyncio.gather(*tasks, return_exceptions=True)
                 raise
         context.call_many = call_many
+        hook_task = None
         try:
+            if authority is not None and not cancelling:
+                authority.check(subject["node_id"])
             budget = hook_deadline - time.monotonic()
             if budget <= 0:
                 raise asyncio.TimeoutError()
             frame["executed"] = True
-            reply = await asyncio.wait_for(hook.invoke_control(context, copy.deepcopy(chat_log)), timeout=budget)
+            hook_task = asyncio.ensure_future(hook.invoke_control(context, _copy_run_log(chat_log)))
+            reply = await asyncio.wait_for(hook_task, timeout=budget)
+            if authority is not None and not cancelling:
+                authority.check(subject["node_id"])
             if time.monotonic() >= hook_deadline:
                 raise asyncio.TimeoutError()
             reply = {"action": "pass"} if reply is None else snapshot(reply)
@@ -630,11 +780,23 @@ class InvocationControl:
             frame["outcome"] = frame["original_outcome"] = success(reply)
             return outcome, terminal, False
         except asyncio.CancelledError:
+            if authority is not None:
+                authority.protect(asyncio.CancelledError())
             frame["outcome"] = frame["original_outcome"] = {"status": "cancelled"}
             raise
         except Exception as exc:
             subject["request"] = entry_request
             outcome = entry_outcome
+            if authority is not None:
+                if (isinstance(exc, asyncio.TimeoutError) and not _protected_failure(exc)
+                        and (time.monotonic() >= hook_deadline or hook_task is not None and hook_task.cancelled())):
+                    from magic_agents.coordination.service import CoordinationError
+                    exc = CoordinationError("deadline_exceeded", "Lifecycle callback deadline exhausted")
+                if _protected_failure(exc):
+                    exc = authority.protect(exc)
+                    frame["outcome"] = frame["original_outcome"] = _authority_outcome(exc)
+                    frame["protected"] = True
+                    raise exc
             code = "HOOK_TIMEOUT" if isinstance(exc, asyncio.TimeoutError) else "HOOK_FAILED"
             frame["outcome"] = frame["original_outcome"] = failure(code, str(exc) or code,
                 details={"exception_type": type(exc).__name__})
