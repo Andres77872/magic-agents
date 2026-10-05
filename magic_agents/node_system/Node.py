@@ -199,6 +199,9 @@ class Node(abc.ABC):
         if process_method and callable(process_method):
             cls.process = magic_telemetry(process_method)
 
+    from magic_agents.execution.recorder import recorded_node
+
+    @recorded_node
     async def __call__(
             self, chat_log: ModelAgentRunLog,
             hooks: Optional['HookRegistry'] = None,

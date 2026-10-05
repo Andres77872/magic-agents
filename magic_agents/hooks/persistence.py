@@ -343,8 +343,18 @@ class GraphPersistenceHook:
         return {"error_type": type(error).__name__, "error_message": str(error)}
 
     async def on_graph_start(self, context: HookContext) -> None:
-        self._validate_identity()
+        from magic_agents.execution.recorder import current_scope
+        core = current_scope()
+        self._core_managed_root = core is not None
+        if not self._core_managed_root:
+            self._validate_identity()
         self._reset()
+        if self._core_managed_root:
+            # The authoritative store already created these same history rows.
+            # Never copy snapshot/checkpoint/input payloads into public trace metadata.
+            identity = core.recorder.snapshot.identity
+            self._run_id, self._root_execution_id = core.run_id, core.execution_id
+            return  # mandatory recorder owns graph lifecycle rows/events
         run_meta = {
             "id_chat": self._id_chat,
             "id_thread": self._id_thread,
@@ -374,6 +384,8 @@ class GraphPersistenceHook:
         )
 
     async def on_graph_end(self, context: HookContext) -> None:
+        if getattr(self, '_core_managed_root', False):
+            return  # mandatory native boundary owns lifecycle/usage state
         if not self._run_id or not self._root_execution_id or self._terminal_status is not None:
             return
         await self._sink.record_event(
@@ -381,11 +393,14 @@ class GraphPersistenceHook:
             event_type="graph_end",
             event_payload={"duration_ms": context.duration_ms} if context.duration_ms is not None else None,
         )
-        await self._sink.complete_execution(id_execution=self._root_execution_id, status="completed")
-        await self._sink.complete_run(id_run=self._run_id, status="completed")
+        if not getattr(self, '_core_managed_root', False):
+            await self._sink.complete_execution(id_execution=self._root_execution_id, status="completed")
+            await self._sink.complete_run(id_run=self._run_id, status="completed")
         self._terminal_status = "completed"
 
     async def on_graph_error(self, context: HookContext, error: BaseException) -> None:
+        if getattr(self, '_core_managed_root', False):
+            return  # mandatory native boundary owns lifecycle/usage state
         if not self._run_id or not self._root_execution_id or self._terminal_status is not None:
             return
         status = "cancelled" if isinstance(error, (asyncio.CancelledError, GeneratorExit)) else "failed"
@@ -411,11 +426,18 @@ class GraphPersistenceHook:
             event_type="error",
             event_payload=self._error_payload(error),
         )
-        await self._sink.complete_execution(id_execution=self._root_execution_id, status=status)
-        await self._sink.complete_run(id_run=self._run_id, status=status)
+        if not getattr(self, '_core_managed_root', False):
+            await self._sink.complete_execution(id_execution=self._root_execution_id, status=status)
+            await self._sink.complete_run(id_run=self._run_id, status=status)
         self._terminal_status = status
 
     async def on_node_start(self, context: HookContext) -> None:
+        if getattr(self, '_core_managed_root', False):
+            from magic_agents.execution.recorder import current_node
+            invocation = current_node()
+            if invocation is not None:
+                self._node_execution_ids[invocation.node_id] = invocation.execution_id
+            return
         if not self._run_id:
             return
         node_id = context.node_id or context.inputs.get("node_id") or "unknown"
@@ -435,6 +457,8 @@ class GraphPersistenceHook:
         )
 
     async def on_node_end(self, context: HookContext) -> None:
+        if getattr(self, '_core_managed_root', False):
+            return  # mandatory native boundary owns lifecycle/usage state
         node_id = context.node_id or "unknown"
         execution_id = self._node_execution_ids.get(node_id)
         if not execution_id:
@@ -448,6 +472,8 @@ class GraphPersistenceHook:
         self._node_execution_ids.pop(node_id, None)
 
     async def on_node_error(self, context: HookContext, error: Exception) -> None:
+        if getattr(self, '_core_managed_root', False):
+            return  # mandatory native boundary owns lifecycle/usage state
         node_id = context.node_id or "unknown"
         execution_id = self._node_execution_ids.get(node_id)
         if not execution_id:
@@ -471,6 +497,8 @@ class GraphPersistenceHook:
         )
 
     async def on_llm_start(self, context: HookContext, llm_config: dict[str, Any] | None = None) -> None:
+        if getattr(self, '_core_managed_root', False):
+            return  # mandatory native boundary owns lifecycle/usage state
         if not self._run_id:
             return
         key = self._llm_correlation_key(context)
@@ -497,6 +525,8 @@ class GraphPersistenceHook:
             )
 
     async def on_llm_end(self, context: HookContext, response: dict[str, Any] | None = None) -> None:
+        if getattr(self, '_core_managed_root', False):
+            return  # mandatory native boundary owns lifecycle/usage state
         if not self._run_id:
             return
         data = response or context.outputs or {}
@@ -558,6 +588,8 @@ class GraphPersistenceHook:
             )
 
     async def on_tool_start(self, context: HookContext) -> None:
+        if getattr(self, '_core_managed_root', False):
+            return  # mandatory native boundary owns lifecycle/usage state
         if not self._run_id:
             return
         async with self._tool_lock:
@@ -598,6 +630,8 @@ class GraphPersistenceHook:
             )
 
     async def on_tool_end(self, context: HookContext) -> None:
+        if getattr(self, '_core_managed_root', False):
+            return  # mandatory native boundary owns lifecycle/usage state
         async with self._tool_lock:
             execution_id = self._resolve_tool_execution_id(context)
             if not execution_id:

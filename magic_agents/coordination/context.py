@@ -23,9 +23,6 @@ from magic_agents.coordination.budget import BudgetError, UsageBound, WorkgroupB
 from magic_agents.coordination.control import ActorLoopControl, BudgetAttemptControl
 from magic_agents.coordination.service import CoordinationError, CoordinationService, _json, LIFECYCLE_CHECKPOINT_KEY
 from magic_agents.models.coordination import CoordinationLimits
-from magic_agents.coordination.publication import (
-    PublicationCandidate, PublicationDisposition, PublicationWarning, freeze_author_output,
-)
 
 
 @dataclass(frozen=True)
@@ -49,9 +46,6 @@ class CoordinationRuntime:
     def __init__(self, *, server_limits: CoordinationLimits, authorize: Callable,
                  estimate: Callable, usage: Callable, authorize_attempt: Callable,
                  tool_estimate: Callable | None = None, tool_usage: Callable | None = None,
-                 public_source: tuple[str, ...] | None = None,
-                 activity_adapters: dict | None = None,
-                 allowed_activity_tools: dict[tuple[str, ...], frozenset[str]] | None = None,
                  authorize_skills: Callable | None = None,
                  authorize_external: Callable | None = None, external_estimate: Callable | None = None,
                  external_usage: Callable | None = None, invocation=False):
@@ -66,84 +60,20 @@ class CoordinationRuntime:
         self.tool_estimate, self.tool_usage = tool_estimate, tool_usage
         self.budget = WorkgroupBudget(self.server_limits, invocation=invocation)
         self.scopes: list[CoordinationScope] = []
-        if public_source is not None and (not isinstance(public_source, tuple) or not public_source
-                or len(public_source) > 64 or any(not isinstance(part, str) or not part
-                    or len(part.encode('utf-8')) > 256 for part in public_source)):
-            raise CoordinationError('invalid_public_source', 'Host public source must be a bounded nonempty path tuple')
-        self.public_source = public_source
         self.workgroup_id = f'group-{self.budget.id}'
         self.epoch_id = f'epoch-{uuid4().hex}'
         self._root = None
-        self._publication = None
-        self.activity_adapters = dict(activity_adapters or {})
-        self.allowed_activity_tools = {tuple(path): frozenset(names)
-                                       for path, names in (allowed_activity_tools or {}).items()}
-
-    def _validate_public_source(self, graph):
-        if self.public_source is None: return
-        from magic_agents.node_system.NodeLLM import NodeLLM
-        from magic_agents.node_system.NodeTool import NodeTool
-        current = graph
-        for part in self.public_source[:-1]:
-            node = current.nodes.get(part)
-            current = getattr(node, 'inner_graph', None)
-            if current is None or getattr(node, 'tool_mode', False):
-                raise CoordinationError('invalid_public_source', 'Public source requires an unambiguous ordinary graph path')
-        source = current.nodes.get(self.public_source[-1])
-        messaging = getattr(source, 'messaging', None)
-        if not isinstance(source, NodeLLM) or (messaging is not None and messaging.enabled):
-            raise CoordinationError('invalid_public_source', 'Public source must be a nonparticipant LLM author')
-        if source._response is not None:
-            raise CoordinationError('invalid_public_source', 'Cached output cannot satisfy a new author invocation')
-        def schema_only(value):
-            return value is None or isinstance(value, dict) or (isinstance(value, (list, tuple)) and all(schema_only(item) for item in value))
-        if any(not schema_only(value) for handle, value in source.inputs.items() if handle.startswith(source.INPUT_TOOL_PREFIX)):
-            raise CoordinationError('invalid_public_source', 'Author tool inputs must be client schemas')
-        if any(not isinstance(current.nodes.get(edge.source), NodeTool) for edge in current.edges
-               if edge.target == source.node_id and (edge.targetHandle or '').startswith(source.INPUT_TOOL_PREFIX)):
-            raise CoordinationError('invalid_public_source', 'Author tool edges must originate from schema-only providers')
 
     def enter_graph(self, graph, *, parent=None, path=()):
         self.authorize()
         if parent is None:
             if self._root is not None:
                 raise CoordinationError('runtime_already_used', 'An admitted runtime owns one root graph invocation')
-            self._validate_public_source(graph)
         scope_type = getattr(self, "scope_type", CoordinationScope)
         scope = scope_type(self, graph, parent=parent, path=path)
         self.scopes.append(scope)
         if parent is None: self._root = scope
         return scope
-
-    def publication_snapshot(self, source_node_path):
-        """Fresh authority checks with stable, already frozen effective bytes."""
-        self.authorize()
-        self.budget._open()
-        if self.public_source is None or tuple(source_node_path) != self.public_source:
-            raise CoordinationError('invalid_public_source', 'Source differs from host admission')
-        if self._root is None or not self._root.finished or not self._root.succeeded:
-            raise CoordinationError('graph_not_complete', 'Publication requires successful root graph completion')
-        if any(not scope.finished or not scope.succeeded for scope in self.scopes):
-            raise CoordinationError('graph_not_complete', 'Nested work has not completed successfully')
-        sources = [scope for scope in self.scopes if scope.path == self.public_source[:-1]]
-        if len(sources) != 1 or sources[0].author_output is None:
-            raise CoordinationError('author_not_complete', 'Exactly one completed author invocation is required')
-        warnings = []
-        for scope in self.scopes:
-            if scope.service is None: continue
-            disposition = scope.publication_disposition()
-            warnings.extend(PublicationWarning(item['code'], item['message'])
-                            for item in disposition.get('warnings', ()))
-        if len(warnings) > 32:
-            warnings = warnings[:31] + [PublicationWarning('additional_participant_failures',
-                f'{len(warnings) - 31} additional participant failures were included in sealed results.')]
-        if self._publication is None:
-            source = sources[0]
-            text, actions = source.author_output
-            self._publication = PublicationCandidate(self.public_source, source.scope_id, self.workgroup_id,
-                self.epoch_id, 1, text, actions, PublicationDisposition(
-                    'sealed_partial' if warnings else 'sealed_success', tuple(warnings)))
-        return self._publication
 
 
 @dataclass
@@ -159,13 +89,11 @@ class CoordinationScope:
         self._inherited_owners = tuple(_OWNERS.get())
         self.budget = parent.budget if parent else runtime.budget
         self.service = None
-        self.activities = None
         self.roles = {}
         self.bindings = {}
         self.skills = {}
         self.finished = self.succeeded = False
         self.completed_nodes = set()
-        self.author_output = None
         self.child_operations = {}
         self.scope_id = f'scope-{uuid4().hex}'
         self.run_id = None
@@ -181,16 +109,10 @@ class CoordinationScope:
                     members[config.role] = (self.path + (nid,), config)
             self.service = CoordinationService(policy, members, server_limits=runtime.server_limits,
                                                authorize=runtime.authorize, budget=self.budget,
-                                               inherit_limits=self._has_active_ancestor(),
-                                               background_capable=bool(runtime.activity_adapters))
+                                               inherit_limits=self._has_active_ancestor())
             self.budget = self.service.budget
             self.service.epoch_id = runtime.epoch_id
             self.scope_id = self.service.scope_id
-            if policy.delivery_mode == 'background_jobs':
-                from magic_agents.coordination.activities import ActivityManager
-                self.activities = ActivityManager(self.service, runtime.activity_adapters,
-                    allowed_tools_by_role={role: runtime.allowed_activity_tools.get(path, frozenset())
-                                           for role, (path, _) in members.items()})
         for node_id, node in graph.nodes.items():
             if (getattr(node, '_skills_source_node_ids', ()) or getattr(node, '_skills_source_node_id', None)
                     or getattr(node, 'INPUT_HANDLER_SKILLS', None) in getattr(node, 'inputs', {})):
@@ -261,14 +183,54 @@ class CoordinationScope:
         return False
 
     def record_completed(self, node):
-        if self.path + (node.node_id,) == self.runtime.public_source:
-            if self.author_output is not None:
-                raise CoordinationError('ambiguous_public_source', 'An author may complete only once per publication epoch')
-            self.author_output = freeze_author_output(node)
         self.completed_nodes.add(node.node_id)
 
     def finish_graph(self, *, succeeded):
         self.finished, self.succeeded = True, bool(succeeded)
+
+    async def preserve_on_interruption(self):
+        return False
+
+    async def persist_transition(self):
+        return None
+
+    async def checkpoint_child_operation(self, entry, *, phase):
+        if phase == 'dispatched': return
+        self.child_operations[entry['operation_id']] = copy.deepcopy(entry)
+        await self.persist_transition()
+
+    def child_operation_result(self, entry):
+        if 'result' not in entry:
+            raise CoordinationError('invalid_lifecycle_checkpoint', 'Child result requires its original execution store')
+        return copy.deepcopy(entry['result'])
+
+    def _child_frame_references(self, journal, children):
+        """Detach stored child outcomes; live Hook callback values stay unchanged."""
+        result = copy.deepcopy(journal)
+        by_id = {entry['operation_id']: entry for entry in children if 'resultRef' in entry}
+        for frame in result.get('frames', ()):
+            entry = by_id.get(frame.get('id'))
+            if entry is None: continue
+            retained = self.child_operation_result(entry)
+            for key in ('outcome', 'original_outcome'):
+                outcome = frame.get(key)
+                if (isinstance(outcome, dict) and outcome.get('status') == 'success'
+                        and 'content' in outcome and outcome['content'] == retained):
+                    frame[key] = {name: value for name, value in outcome.items() if name != 'content'}
+                    frame[key]['resultRef'] = copy.deepcopy(entry['resultRef'])
+        return result
+
+    def _validate_child_frame_references(self, journal, children):
+        by_id = {entry['operation_id']: entry for entry in children}
+        for frame in journal.get('frames', ()):
+            for key in ('outcome', 'original_outcome'):
+                outcome = frame.get(key)
+                if not isinstance(outcome, dict) or 'resultRef' not in outcome: continue
+                entry = by_id.get(frame.get('id'))
+                if (entry is None or outcome.get('status') != 'success' or 'content' in outcome
+                        or outcome['resultRef'] != entry.get('resultRef')):
+                    raise CoordinationError('invalid_lifecycle_checkpoint', 'Child frame result reference changed')
+                self.child_operation_result(entry)
 
     async def run_child_operation(self, node_id, operation_id, content, operation):
         """Admit one Hook child effect without cloning its budget authority.
@@ -294,7 +256,7 @@ class CoordinationScope:
                 raise CoordinationError('operation_owner_mismatch', 'Child operation belongs to another initiating actor')
             if prior['digest'] != digest:
                 raise CoordinationError('idempotency_conflict', 'Child operation identity has different arguments')
-            if prior['state'] == 'completed': return copy.deepcopy(prior['result'])
+            if prior['state'] == 'completed': return self.child_operation_result(prior)
             raise CoordinationError('operation_unresolved', 'Child operation must reconcile before another dispatch')
         guard()
         if len(self.child_operations) >= 100:
@@ -321,7 +283,8 @@ class CoordinationScope:
         if owners:
             entry['ownerActorId'] = owners[-1].caller.actor_id
             entry['ownerActivationId'] = owners[-1].caller.activation_id
-        self.child_operations[operation_id] = entry
+        await self.checkpoint_child_operation(entry, phase='prepared')
+        await self.checkpoint_child_operation(entry, phase='dispatched')
         actual, uncertain = None, True
         try:
             if invocation_local:
@@ -341,6 +304,7 @@ class CoordinationScope:
             guard()
         except BaseException:
             entry['state'] = 'unknown'
+            await self.checkpoint_child_operation(entry, phase='unknown')
             raise
         finally:
             if not provider_owned and not dispatch_owned and not invocation_local:
@@ -348,8 +312,10 @@ class CoordinationScope:
                     await self.budget.settle(identity, actual, uncertain=uncertain)
                 except BaseException:
                     entry['state'] = 'unknown'
+                    await self.checkpoint_child_operation(entry, phase='unknown')
                     raise
         entry.update(state='completed', result=detached)
+        await self.checkpoint_child_operation(entry, phase='succeeded')
         return copy.deepcopy(detached)
 
     def _owners(self):
@@ -408,15 +374,17 @@ class CoordinationScope:
         restored = {}
         for entry in lifecycle['childOperations']:
             if (not isinstance(entry, dict) or entry.get('state') != 'completed'
-                    or set(entry) != {'state','node_id','operation_id','digest','ownerActorId','ownerActivationId','result'}
+                    or set(entry) not in ({'state','node_id','operation_id','digest','ownerActorId','ownerActivationId','result'},
+                                          {'state','node_id','operation_id','digest','ownerActorId','ownerActivationId','resultRef'})
                     or entry.get('ownerActorId') != binding.caller.actor_id
                     or not isinstance(entry.get('ownerActivationId'), str) or not entry['ownerActivationId']
                     or entry.get('node_id') not in self.graph.nodes or entry['node_id'] in self.roles
                     or not isinstance(entry.get('operation_id'), str)
-                    or not 1 <= len(entry['operation_id']) <= 256 or 'result' not in entry
+                    or not 1 <= len(entry['operation_id']) <= 256
                     or not isinstance(entry.get('digest'), str)
                     or re.fullmatch(r'[a-f0-9]{64}', entry['digest']) is None):
                 raise CoordinationError('invalid_lifecycle_checkpoint', 'Child effect journal is invalid')
+            self.child_operation_result(entry)
             prior = self.child_operations.get(entry['operation_id'])
             if prior is not None and prior != entry:
                 raise CoordinationError('invalid_lifecycle_checkpoint', 'Completed child effect identity changed')
@@ -425,6 +393,7 @@ class CoordinationScope:
             restored[entry['operation_id']] = copy.deepcopy(entry)
         if len(set(self.child_operations) | set(restored)) > 100:
             raise CoordinationError('invocation_limit', 'Restored child operation journal exceeds the invocation bound')
+        self._validate_child_frame_references(lifecycle['invocation'], lifecycle['childOperations'])
         self.child_operations.update(restored)
         return snapshot
 
@@ -538,11 +507,6 @@ class CoordinationScope:
             schemas.extend(copy.deepcopy(tools.tools))
             functions.update(tools.tool_functions)
             tools.configure_executor(executor)
-            if self.activities is not None:
-                activities = self.activities.bind(binding.caller, existing_names=[name for name in names if name])
-                schemas.extend(copy.deepcopy(activities.tools))
-                functions.update(activities.tool_functions)
-                activities.configure_executor(executor)
             binding.control = ActorLoopControl(binding.caller)
             retained = await self.service.retained_checkpoint(binding.caller)
             if retained is not None:
@@ -598,13 +562,6 @@ class CoordinationScope:
                 except TimeoutError:
                     continue
 
-    def publication_disposition(self):
-        if self.service is None or self.service._state != 'sealed':
-            raise CoordinationError('epoch_open', 'Publication requires a sealed group')
-        warnings = [{'code': item['failure']['reason'], 'message': f'Participant {role} ended as {item["failure"]["state"]}.'}
-                    for role, item in self.service._publication.items() if 'failure' in item]
-        return {'kind': 'sealed_partial', 'warnings': warnings} if warnings else {'kind': 'sealed_success'}
-
     async def run_node(self, node, chat_log, *, hooks=None, observer=None):
         """A node task retains all activation episodes until its group seals."""
         node_id = node.node_id
@@ -613,9 +570,18 @@ class CoordinationScope:
                 async for item in source: yield item
             return
         caller = await self.service.activate(self.roles[node_id])
+        if caller is None and self.service._state != 'sealed':
+            caller = await self.service.wait_for_activation(self.roles[node_id])
         try:
             while caller is not None:
                 self.bindings[node_id] = _Binding(caller)
+                retained = await self.service.retained_checkpoint(caller)
+                if retained is not None:
+                    from magic_agents.coordination.skills import split_checkpoint
+                    loop, _ = split_checkpoint(self._canonical_checkpoint(node_id, retained))
+                    control = ActorLoopControl(caller)
+                    control._last_checkpoint = loop.detached()
+                    self.bindings[node_id].control = control
                 node._response = None
                 node._last_invocation_record = None
                 node.outputs.clear()
@@ -649,6 +615,7 @@ class CoordinationScope:
                             pending.extend(frame.get('child', ()))
                         journal = {key: value for key, value in record.items() if key != 'child'}
                         journal['frames'] = frames
+                        journal = self._child_frame_references(journal, children)
                         await self.service.checkpoint_lifecycle(caller, node_id=node_id, output=node.outputs,
                             invocation=journal, child_operations=children)
                     elif self.final_candidate(node_id) is None:
@@ -675,7 +642,8 @@ class CoordinationScope:
                         ChoiceModel(delta=DeltaModel(content=text), finish_reason='stop')]),
                         content_type=node.OUTPUT_HANDLE_CONTENT)
         except asyncio.CancelledError:
-            await self.service.cancel()
+            if not await self.preserve_on_interruption():
+                await self.service.cancel()
             raise
         except Exception as error:
             reason = getattr(error, 'code', None) or getattr(error, 'error_code', None) or type(error).__name__
@@ -691,8 +659,7 @@ class CoordinationScope:
                 sealed = await self.service.seal()
                 node.outputs.clear()
                 # A failed participant contributes explicit failure data, never
-                # a stale successful asset list. The public adapter separately
-                # carries the group's sealed_partial disposition and warnings.
+                # a stale successful output.
                 yield node.yield_static({'coordinationFailure': sealed[self.roles[node_id]]['failure']},
                                         content_type=node.OUTPUT_HANDLE_GENERATED)
                 return
@@ -701,7 +668,7 @@ class CoordinationScope:
             self.bindings.pop(node_id, None)
 
     async def close(self, *, cancelled=False):
-        if self.activities is not None:
-            await self.activities.close(cancelled=cancelled)
-        if cancelled:
+        if cancelled and not await self.preserve_on_interruption():
             await self.budget.cancel()
+        elif not cancelled:
+            await self.persist_transition()

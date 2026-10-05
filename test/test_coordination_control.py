@@ -88,7 +88,7 @@ async def test_real_loop_consumes_mail_and_resumes_retained_canonical_state_on_w
 async def test_failed_input_checkpoint_stops_before_provider_dispatch(monkeypatch):
     s = service(); a, b = await actors(s)
     await s.send(a, "images", "must be acknowledged", key="1", expect_reply=False)
-    async def fail(*args): raise CoordinationError("checkpoint_unavailable", "Mandatory state store failed")
+    async def fail(*args, **kwargs): raise CoordinationError("checkpoint_unavailable", "Mandatory state store failed")
     monkeypatch.setattr(s, "checkpoint", fail)
     provider = Provider(["never"])
     loop = AsyncAgentLoop(SimpleNamespace(llm=provider), control=ActorLoopControl(b), provider_attempt_control=admission(s), builtin_todo_tools=False)

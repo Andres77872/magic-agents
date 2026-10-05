@@ -1011,10 +1011,6 @@ class NodeLLM(Node):
 
         self._install_skills(client, chat, tools_schemas, tool_functions, subagent_bundle)
         if coordination is not None:
-            if (coordination.path + (self.node_id,) == coordination.runtime.public_source
-                    and tool_functions):
-                from magic_agents.coordination.service import CoordinationError
-                raise CoordinationError('invalid_public_source', 'Public author cannot execute server-callable tools')
             if self.node_id in coordination.roles and schema_only_tools_present:
                 raise ValueError("Messaging participants cannot execute schema-only client tools")
             if tool_functions or self.node_id in coordination.roles:
@@ -1025,6 +1021,9 @@ class NodeLLM(Node):
                 'data': {'skills': {**self._skills_bundle.safe_summary(), 'loaded_ids': []}}}}
         agent_loop_required = (bool(tool_functions) or subagent_bundle.registered_count > 0
                               or coordination is not None and self.node_id in coordination.roles)
+        from magic_agents.execution.llm_storage import configure_core_llm, core_generate, core_stream
+        native_executor = configure_core_llm(native_options, provider_options, tool_functions,
+            native_executor, agent_loop=agent_loop_required)
 
         def loop_options():
             options = self._agent_loop_options(chat)
@@ -1165,7 +1164,7 @@ class NodeLLM(Node):
                     await self._hooks.invoke("on_llm_start", _llm_ctx)
 
                 self._warn_unsupported_engine(client)
-                intention = await client.llm.async_generate(
+                intention = await core_generate(client.llm.async_generate,
                     chat, tools=tools_schemas, **provider_options, **self.extra_data
                 )
 
@@ -1211,7 +1210,7 @@ class NodeLLM(Node):
                     )
                     await self._hooks.invoke("on_llm_start", _llm_ctx)
 
-                intention = await client.llm.async_generate(chat, **provider_options, **self.extra_data)
+                intention = await core_generate(client.llm.async_generate, chat, **provider_options, **self.extra_data)
 
                 # === HOOK: on_llm_end (non-tool non-streaming path, Phase 0 R0.4) ===
                 if _llm_ctx is not None:
@@ -1401,11 +1400,12 @@ class NodeLLM(Node):
                 self._warn_unsupported_engine(client)
                 last_chunk = None
                 stream_tool_calls: dict[int, dict] = {}
-                async for i in client.llm.async_stream_generate(chat, tools=tools_schemas, **provider_options, **self.extra_data):
-                    self.generated += i.choices[0].delta.content or ''
-                    last_chunk = i
-                    self._accumulate_stream_tool_calls(stream_tool_calls, i)
-                    yield self.yield_static(i, content_type=self.OUTPUT_HANDLE_CONTENT)
+                async with aclosing(core_stream(client.llm.async_stream_generate, chat, tools=tools_schemas, **provider_options, **self.extra_data)) as native_source:
+                    async for i in native_source:
+                        self.generated += i.choices[0].delta.content or ''
+                        last_chunk = i
+                        self._accumulate_stream_tool_calls(stream_tool_calls, i)
+                        yield self.yield_static(i, content_type=self.OUTPUT_HANDLE_CONTENT)
                 if last_chunk:
                     # === HOOK: on_llm_end (schema-only tools streaming path, Phase 0 R0.2) ===
                     if _llm_ctx is not None:
@@ -1448,10 +1448,11 @@ class NodeLLM(Node):
                     await self._hooks.invoke("on_llm_start", _llm_ctx)
 
                 last_chunk = None
-                async for i in client.llm.async_stream_generate(chat, **provider_options, **self.extra_data):
-                    self.generated += i.choices[0].delta.content or ''
-                    last_chunk = i
-                    yield self.yield_static(i, content_type=self.OUTPUT_HANDLE_CONTENT)
+                async with aclosing(core_stream(client.llm.async_stream_generate, chat, **provider_options, **self.extra_data)) as native_source:
+                    async for i in native_source:
+                        self.generated += i.choices[0].delta.content or ''
+                        last_chunk = i
+                        yield self.yield_static(i, content_type=self.OUTPUT_HANDLE_CONTENT)
                 if last_chunk:
                     final_tool_calls = getattr(last_chunk.choices[0].delta, 'tool_calls', []) or []
                     # Phase 0: emit LLM_GENERATION for execution tree persistence
@@ -1494,7 +1495,7 @@ class NodeLLM(Node):
 
     async def _final_output_frames(self, final_tool_calls, tools_schemas, tool_functions,
                                    schema_only_tools_present, model):
-        """One formatter shared by live native completion and durable result replay."""
+        """Format the completed native response on its configured output handles."""
         if self.json_output:
             logger.debug("NodeLLM:%s parsing JSON output", self.node_id)
 
@@ -1562,44 +1563,6 @@ class NodeLLM(Node):
             model=getattr(intention, "model", None) or model,
             choices=[ChoiceModel(delta=DeltaModel(content=intention.content or ''))],
             usage=intention.usage), content_type=self.OUTPUT_HANDLE_CONTENT)
-
-    @magic_telemetry
-    async def replay_native_completion(self, chat_log, result, candidate):
-        """Format a committed tool-free native result; never invoke a provider loop.
-
-        The durable host must authenticate the immutable result before invoking
-        this private execution seam. Canonical text and the provider result are
-        cross-checked here; the real formatter preserves configured JSON output
-        and native content handles rather than guessing a result map.
-        """
-        from magic_llm.engine.tooling import StreamIterationSummary, accumulate_stream_chunk
-        from magic_agents.coordination.service import CoordinationError
-        from magic_llm.model import ModelChatResponse
-        if (not isinstance(candidate, str) or not isinstance(result, dict)
-                or result.get('format') != ('stream' if self.stream else 'response')):
-            raise CoordinationError('durable_restore_incompatible', 'Invalid completed native result')
-        if self.stream:
-            chunks = [ChatCompletionModel.model_validate(value) for value in result['response']]
-            summary = StreamIterationSummary()
-            for chunk in chunks:
-                if len(chunk.choices) != 1 or chunk.choices[0].delta.tool_calls:
-                    raise CoordinationError('durable_restore_incompatible', 'Unexpected child tool result')
-                accumulate_stream_chunk(summary, chunk)
-            if not chunks or summary.content != candidate or summary.finish_reason != 'stop':
-                raise CoordinationError('durable_restore_incompatible', 'Completed stream differs from canonical candidate')
-            model = chunks[-1].model
-            for chunk in chunks:
-                yield self.yield_static(chunk, content_type=self.OUTPUT_HANDLE_CONTENT)
-        else:
-            response = ModelChatResponse.model_validate(result['response'])
-            if (not response.id or len(response.choices) != 1 or response.tool_calls
-                    or response.finish_reason != 'stop' or (response.content or '') != candidate):
-                raise CoordinationError('durable_restore_incompatible', 'Completed response differs from canonical candidate')
-            model = response.model
-            yield self._native_content_frame(response, model)
-        self.generated = candidate
-        async for item in self._final_output_frames([], [], {}, False, model):
-            yield item
 
     def _emit_llm_generation(self, intention, duration_ms: Optional[float] = None) -> dict:
         """Emit a structured LLM_GENERATION debug event for execution tree persistence.

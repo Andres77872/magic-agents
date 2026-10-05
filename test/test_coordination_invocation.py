@@ -114,7 +114,7 @@ def test_inner_only_policy_creates_one_invocation_without_author_or_cost():
     child = SimpleNamespace(coordination=CoordinationPolicy.model_validate(definition()['coordination']), nodes={})
     root = SimpleNamespace(coordination=None, nodes={'inner': SimpleNamespace(inner_graph=child)})
     runtime = invocation_runtime(root)
-    assert runtime.public_source is None and runtime.budget.invocation
+    assert runtime.budget.invocation
     assert runtime.server_limits.max_cost is None and runtime.server_limits.max_image_jobs is None
 
 
@@ -188,7 +188,7 @@ async def test_python_hook_timeout_does_not_join_sync_callback():
         try: release.wait(1)
         finally: finished.set()
         return {'action': 'pass'}
-    task = asyncio.create_task(NodeHook._execute_hook_function(
+    task = asyncio.create_task(NodeHook._execute_function(
         object.__new__(NodeHook), callback, None, SimpleNamespace(coordination=local_scope())))
     try:
         for _ in range(100):
@@ -231,3 +231,74 @@ async def test_local_hook_child_keeps_journal_charge_and_deadline_without_pricin
         await scope.run_child_operation('parser', 'second', 'wait', waiting)
     assert scope.child_operations['second']['state'] == 'unknown'
     assert (await scope.budget.snapshot())['spent']['tool_calls'] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('engine', ['in_memory', 'db_persistence'])
+async def test_native_child_result_is_one_common_effect_with_verified_references(engine):
+    from magic_agents.execution.recorder import CoreRecorder, CoreScope, _scope
+    from magic_agents.execution.storage import CoordinationScopeConfig, canonical_bytes, ExecutionStorageError
+    from magic_agents.models.factory.Nodes import ParserNodeModel
+    from magic_agents.node_system.NodeParser import NodeParser
+    from magic_agents.hooks.invocation_control import InvocationControl
+    from test.test_execution_recorder import Store, config
+
+    store = Store()
+    snapshot = config(store).execution_snapshot.model_copy(update={
+        'coordination_scopes': (CoordinationScopeConfig(node_path=(), messaging_engine=engine),)})
+    recorder = CoreRecorder(store, snapshot)
+    await recorder.start()
+    raw = definition()
+    next(node for node in raw['nodes'] if node['id'] == 'messages')['data']['messaging_engine'] = engine
+    graph = build(raw, message='unused')
+    graph.nodes['child'] = NodeParser(ParserNodeModel(text='Only retained child result'),
+        node_id='child', node_type='parser')
+    core = CoreScope(recorder, graph, (), snapshot.identity.run_id,
+                     snapshot.identity.root_execution_id, 'child-test-scope', True)
+    token = _scope.set(core)
+    try:
+        await core.record('graph_start', {'status': 'running'}, status='running')
+        runtime = invocation_runtime(graph)
+        scope = runtime.enter_graph(graph)
+        scope.bind_execution(run_id=core.run_id)
+        control = InvocationControl(graph.nodes, [])
+        calls = []
+        async def child():
+            calls.append(True)
+            return await control._operation('child', 'input', SimpleNamespace(coordination=scope), target_handle='content')
+        result = await scope.run_child_operation('child', 'same-child', 'input', child)
+        entry = scope.child_operations['same-child']
+        assert 'result' not in entry and entry['resultRef']['result_digest']
+        assert calls == [True]
+        assert await scope.run_child_operation('child', 'same-child', 'input', child) == result
+        assert calls == [True]
+        with pytest.raises(CoordinationError, match='different arguments'):
+            await scope.run_child_operation('child', 'same-child', 'changed', child)
+        effects = [item for item in recorder.state.effects if item.kind == 'hook_child']
+        assert len(effects) == 1 and effects[0].status == 'succeeded' and effects[0].result == result
+        phases = [transition.state.effects[0].status for transition in store.transitions if transition.state.effects]
+        assert phases == ['prepared', 'dispatched', 'succeeded']
+        assert canonical_bytes(recorder.state.model_dump(mode='json')).count(b'Only retained child result') == 1
+        frame = {'id': 'same-child', 'outcome': {'status': 'success', 'content': result},
+                 'original_outcome': {'status': 'success', 'content': result}}
+        journal = scope._child_frame_references({'frames': [frame]}, [entry])
+        assert b'Only retained child result' not in canonical_bytes(journal)
+        assert frame['outcome']['content'] == result  # Live callbacks are untouched.
+        scope._validate_child_frame_references(journal, [entry])
+        altered = copy.deepcopy(entry)
+        altered['resultRef']['result_digest'] = '0' * 64
+        with pytest.raises(ExecutionStorageError): scope.child_operation_result(altered)
+        legacy = {key: value for key, value in entry.items() if key != 'resultRef'}
+        legacy['result'] = result
+        assert scope.child_operation_result(legacy) == result
+        # Lost acknowledgement after completion reuses the persisted result.
+        scope.child_operations.clear()
+        retained = recorder.state
+        db_rows = retained.coordinator_state[0].state['child_operations'] if engine == 'db_persistence' else None
+        rows = db_rows if db_rows is not None else retained.checkpoint['coordination_ledger']['scopes'][0]['child_operations']
+        scope.child_operations = copy.deepcopy(rows)
+        assert await scope.run_child_operation('child', 'same-child', 'input', child) == result
+        assert calls == [True]
+    finally:
+        _scope.reset(token)
+        await recorder.close()

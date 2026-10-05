@@ -196,6 +196,7 @@ class CoordinationTools:
         invoke.__name__ = name
         invoke.__doc__ = _SPECS[name][1]
         invoke._disable_dedup = True
+        invoke._native_coordination_local = True
         invoke._require_complete_output = True
         invoke._coordination_binding = (id(self._caller.service), self._caller.actor_id)
         return invoke
@@ -233,6 +234,10 @@ class CoordinationTools:
 
     async def _dispatch(self, name, args):
         service, caller = self._caller.service, self._caller
+        if service._volatile_state_lost:
+            request_id = getattr(args, 'requestId', None) or getattr(getattr(args, 'options', None), 'requestId', None)
+            if request_id and request_id not in service._requests:
+                raise CoordinationError('coordination_state_lost', 'Volatile messaging state was lost during interruption')
         if name == 'listAgents':
             return await service.list_agents(caller)
         if name == 'inspectAgent':

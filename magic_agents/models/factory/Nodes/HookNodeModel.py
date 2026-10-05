@@ -39,6 +39,7 @@ class HookNodeModel(BaseNodeModel):
             Supports: hook_context, user_output, debug_output, feedback_output.
     """
     hook_mode: Literal['python', 'messages'] = 'python'
+    messaging_engine: Literal['in_memory', 'db_persistence'] = 'in_memory'
     messaging_by_target: Optional[dict[str, MessagingConfig]] = None
 
     function_template: str = Field(
@@ -66,7 +67,7 @@ class HookNodeModel(BaseNodeModel):
             if (self.messaging_by_target is None or set(self.messaging_by_target) != set(targets)
                     or self.function_template.strip() or self.lifecycle_event is not None):
                 raise ValueError('Messages mode requires messaging and cannot also run Python or a lifecycle callback')
-        elif self.messaging_by_target is not None:
+        elif self.messaging_by_target is not None or 'messaging_engine' in self.model_fields_set:
             raise ValueError('Messaging configuration requires hook_mode messages')
         return self
 

@@ -98,7 +98,7 @@ async def test_replayed_mutation_does_not_emit_new_acceptance_or_charge_again():
 @pytest.mark.asyncio
 async def test_actual_scheduler_binds_run_before_first_actor_event():
     from test.test_coordination_graph import runtime, node, graph, collect
-    rt = runtime(public_source=('author',))
+    rt = runtime()
     async def peer(*args): return {'content': 'PRIVATE peer output'}
     async def author(*args): return {'content': 'Public output'}
     a, _ = node('research', peer, peer='images')
@@ -121,7 +121,7 @@ async def test_actual_nested_scheduler_preserves_distinct_run_bindings(monkeypat
     def remember(*args, **kwargs):
         result = create(*args, **kwargs); captured.append(result); return result
     monkeypatch.setattr(graphs, 'runtime', remember)
-    await graphs.test_two_real_inner_scopes_share_lineage_and_publish_the_exact_nested_author()
+    await graphs.test_two_real_inner_scopes_share_budget_and_preserve_distinct_outputs()
     rt = captured[0]
     assert len({scope.run_id for scope in rt.scopes}) == 3
     frames = rt.events.read()

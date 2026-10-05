@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from anyio import CancelScope
+from contextlib import aclosing
 import logging
 import os
 import time
@@ -24,6 +25,7 @@ DEFAULT_TOTAL_TIMEOUT_MS = 300000
 
 from magic_llm.model.ModelChatStream import ChatCompletionModel
 
+from magic_agents.execution.recorder import recorded_graph, current_scope, CoreLoopCursor
 from magic_agents.execution.event_dispatcher import GraphEventDispatcher, NodeState
 from magic_agents.execution.conditional_routing import ConditionalRouting
 from magic_agents.models.factory.AgentFlowModel import AgentFlowModel
@@ -383,6 +385,7 @@ def _wire_hooks_to_registry(
             registry.register_global(hook)
 
 
+@recorded_graph
 async def execute_graph_reactive(
     graph: AgentFlowModel,
     id_chat: Optional[Union[int, str]] = None,
@@ -535,7 +538,7 @@ async def execute_graph_reactive(
     CallbackEmitter.emit(_graph_start_event, chat_log)
     
     # Generate execution ID for traceability (used by hooks and debug feedback)
-    _execution_id = uuid.uuid4().hex
+    _execution_id = current_scope().execution_id if current_scope() is not None else uuid.uuid4().hex
 
     # Phase 4: Set execution identity on registry so Node.__call__ and
     # HookRelay can access real execution_id/run_id for HookContext construction.
@@ -784,41 +787,46 @@ async def execute_graph_reactive(
 
             source = (coordination_scope.run_node(node, chat_log, hooks=hooks, observer=_node_observer)
                       if coordination_scope is not None else node(chat_log, hooks=hooks, observer=_node_observer))
-            async for item in source:
-                item_type = item.get("type", "")
+            async with aclosing(source) as source:
+                async for item in source:
+                    item_type = item.get("type", "")
                 
-                # Check if this is a streaming content event (for immediate output)
-                # Nodes can use any handle name for streaming - check the output handle configuration
-                is_streaming = False
-                if hasattr(node, 'OUTPUT_HANDLE_CONTENT'):
-                    is_streaming = item_type == node.OUTPUT_HANDLE_CONTENT
-                elif item_type == SYSTEM_EVENT_STREAMING:
-                    is_streaming = True
+                    # Check if this is a streaming content event (for immediate output)
+                    # Nodes can use any handle name for streaming - check the output handle configuration
+                    is_streaming = False
+                    if hasattr(node, 'OUTPUT_HANDLE_CONTENT'):
+                        is_streaming = item_type == node.OUTPUT_HANDLE_CONTENT
+                    elif item_type == SYSTEM_EVENT_STREAMING:
+                        is_streaming = True
                 
-                if is_streaming:
-                    # Queue streaming content for immediate output
-                    await output_queue.put({
-                        "type": SYSTEM_EVENT_STREAMING,
-                        "content": item["content"]["content"],
-                        "source_node": node_id,
-                        "source_node_path": item.get("source_node_path", [node_id]),
-                    })
-                elif item_type in (SYSTEM_EVENT_DEBUG, SYSTEM_EVENT_DEBUG_SUMMARY, "loop_progress"):
-                    # Queue debug info (legacy path — Node may still yield debug events
-                    # for backward compatibility; these are forwarded through the queue)
-                    await output_queue.put(item)
-                elif ConditionalSignalTypes.is_system_signal(item_type):
-                    # Track BYPASS_ALL for post-loop handling
-                    if item_type == ConditionalSignalTypes.BYPASS_ALL:
-                        bypass_all_signaled = True
-                    logger.debug("Node %s emitted system signal: %s", node_id, item_type)
-                else:
-                    # Handle-specific output (conditional routing, etc.)
-                    node.outputs[item_type] = item["content"]
-                    # Track conditional selection (only non-system signals)
-                    if isinstance(node, ConditionalRouting) and conditional_selected_handle is None:
-                        if item_type not in (SYSTEM_EVENT_DEBUG, SYSTEM_EVENT_DEBUG_SUMMARY):
-                            conditional_selected_handle = item_type
+                    if is_streaming:
+                        # Queue streaming content for immediate output
+                        core = current_scope()
+                        chunk = item["content"]["content"]
+                        if core is not None:
+                            chunk = core.mark_output(node_id, chunk)
+                        await output_queue.put({
+                            "type": SYSTEM_EVENT_STREAMING,
+                            "content": chunk,
+                            "source_node": node_id,
+                            "source_node_path": item.get("source_node_path", [node_id]),
+                        })
+                    elif item_type in (SYSTEM_EVENT_DEBUG, SYSTEM_EVENT_DEBUG_SUMMARY, "loop_progress"):
+                        # Queue debug info (legacy path — Node may still yield debug events
+                        # for backward compatibility; these are forwarded through the queue)
+                        await output_queue.put(item)
+                    elif ConditionalSignalTypes.is_system_signal(item_type):
+                        # Track BYPASS_ALL for post-loop handling
+                        if item_type == ConditionalSignalTypes.BYPASS_ALL:
+                            bypass_all_signaled = True
+                        logger.debug("Node %s emitted system signal: %s", node_id, item_type)
+                    else:
+                        # Handle-specific output (conditional routing, etc.)
+                        node.outputs[item_type] = item["content"]
+                        # Track conditional selection (only non-system signals)
+                        if isinstance(node, ConditionalRouting) and conditional_selected_handle is None:
+                            if item_type not in (SYSTEM_EVENT_DEBUG, SYSTEM_EVENT_DEBUG_SUMMARY):
+                                conditional_selected_handle = item_type
             
             # Mark completed
             dispatcher.set_state(node_id, NodeState.ERROR if bypass_all_signaled else NodeState.COMPLETED)
@@ -1141,6 +1149,7 @@ async def execute_graph_reactive(
     logger.info("Finished reactive execution")
 
 
+@recorded_graph
 async def execute_graph_loop_reactive(
     graph: AgentFlowModel,
     id_chat: Optional[Union[int, str]] = None,
@@ -1212,7 +1221,7 @@ async def execute_graph_loop_reactive(
     )
     
     # Generate execution ID for hooks traceability
-    _execution_id = uuid.uuid4().hex
+    _execution_id = current_scope().execution_id if current_scope() is not None else uuid.uuid4().hex
 
     # ``execute_graph_reactive`` wires before delegating and intentionally does
     # not pass runtime_config here.  The public direct-loop wrapper does pass it,
@@ -1363,6 +1372,7 @@ async def execute_graph_loop_reactive(
         if observer_registry.is_active
         else None
     )
+    _core_loop = CoreLoopCursor(current_scope(), loop_node) if current_scope() is not None else None
     _loop_started_at: Optional[datetime] = None
     _loop_lifecycle_finished = False
 
@@ -1371,7 +1381,12 @@ async def execute_graph_loop_reactive(
         if _loop_started_at is not None:
             return
 
-        _loop_started_at = datetime.now(UTC)
+        retained_start = _core_loop.value['started_at'] if _core_loop is not None else None
+        _loop_started_at = datetime.fromisoformat(retained_start) if retained_start else datetime.now(UTC)
+        if _core_loop is not None:
+            await _core_loop.start()
+            if retained_start is None:
+                await _core_loop.save(started_at=_loop_started_at.isoformat())
         safe_inputs = loop_node._safe_copy_dict(loop_node.inputs)
 
         if hooks is not None and not hooks.is_empty():
@@ -1386,7 +1401,13 @@ async def execute_graph_loop_reactive(
                 start_time=_loop_started_at,
                 parent_run_id=parent_run_id,
             )
-            await hooks.invoke("on_node_start", _loop_hook_context)
+            if _core_loop is None or _core_loop.value['lifecycle'] == 'new':
+                if _core_loop is not None:
+                    await _core_loop.before_lifecycle('start')
+                await hooks.invoke("on_node_start", _loop_hook_context)
+
+        if _core_loop is not None and _core_loop.value['lifecycle'] != 'new':
+            return
 
         if _loop_observer is not None:
             await _loop_observer.on_node_start(
@@ -1395,12 +1416,16 @@ async def execute_graph_loop_reactive(
                 node_class=type(loop_node).__name__,
                 inputs=safe_inputs,
             )
+        if _core_loop is not None:
+            await _core_loop.after_lifecycle('start')
 
     async def end_loop_lifecycle() -> None:
         nonlocal _loop_lifecycle_finished
-        if _loop_lifecycle_finished:
+        if _loop_lifecycle_finished or (_core_loop is not None and _core_loop.value['lifecycle'] == 'ended'):
             return
         await start_loop_lifecycle()
+        if _core_loop is not None:
+            await _core_loop.before_lifecycle('end')
 
         ended_at = datetime.now(UTC)
         duration_ms = (ended_at - _loop_started_at).total_seconds() * 1000
@@ -1425,6 +1450,8 @@ async def execute_graph_loop_reactive(
             await hooks.invoke("on_node_end", _loop_hook_context)
 
         _loop_lifecycle_finished = True
+        if _core_loop is not None:
+            await _core_loop.after_lifecycle('end')
 
     async def error_loop_lifecycle(error: Exception) -> None:
         nonlocal _loop_lifecycle_finished
@@ -1602,32 +1629,37 @@ async def execute_graph_loop_reactive(
                 dispatcher.set_state(node_id, NodeState.EXECUTING)
             bypass_all_signaled = False
             try:
-                async for item in node(chat_log, hooks=hooks, observer=_node_obs):
-                    item_type = item.get("type", "")
+                async with aclosing(node(chat_log, hooks=hooks, observer=_node_obs)) as node_source:
+                    async for item in node_source:
+                        item_type = item.get("type", "")
 
-                    # Check if this is streaming content
-                    is_streaming = False
-                    if hasattr(node, 'OUTPUT_HANDLE_CONTENT'):
-                        is_streaming = item_type == node.OUTPUT_HANDLE_CONTENT
-                    elif item_type == SYSTEM_EVENT_STREAMING:
-                        is_streaming = True
+                        # Check if this is streaming content
+                        is_streaming = False
+                        if hasattr(node, 'OUTPUT_HANDLE_CONTENT'):
+                            is_streaming = item_type == node.OUTPUT_HANDLE_CONTENT
+                        elif item_type == SYSTEM_EVENT_STREAMING:
+                            is_streaming = True
 
-                    if is_streaming:
-                        yield {
-                            "type": SYSTEM_EVENT_STREAMING,
-                            "content": item["content"]["content"],
-                            "source_node": node_id,
-                            "source_node_path": item.get("source_node_path", [node_id]),
-                        }
-                    elif item_type in (SYSTEM_EVENT_DEBUG, SYSTEM_EVENT_DEBUG_SUMMARY, "loop_progress"):
-                        yield item
-                    elif ConditionalSignalTypes.is_system_signal(item_type):
-                        if item_type == ConditionalSignalTypes.BYPASS_ALL:
-                            bypass_all_signaled = True
-                        logger.debug("Loop node %s emitted system signal: %s", node_id, item_type)
-                    else:
-                        # All other outputs stored using their handle name
-                        node.outputs[item_type] = item["content"]
+                        if is_streaming:
+                            chunk = item["content"]["content"]
+                            core = current_scope()
+                            if core is not None:
+                                chunk = core.mark_output(node_id, chunk)
+                            yield {
+                                "type": SYSTEM_EVENT_STREAMING,
+                                "content": chunk,
+                                "source_node": node_id,
+                                "source_node_path": item.get("source_node_path", [node_id]),
+                            }
+                        elif item_type in (SYSTEM_EVENT_DEBUG, SYSTEM_EVENT_DEBUG_SUMMARY, "loop_progress"):
+                            yield item
+                        elif ConditionalSignalTypes.is_system_signal(item_type):
+                            if item_type == ConditionalSignalTypes.BYPASS_ALL:
+                                bypass_all_signaled = True
+                            logger.debug("Loop node %s emitted system signal: %s", node_id, item_type)
+                        else:
+                            # All other outputs stored using their handle name
+                            node.outputs[item_type] = item["content"]
             except Exception as exc:
                 mark_failed(node_id)
                 node_failures[node_id] = _failure_record(exc)
@@ -2152,8 +2184,11 @@ async def execute_graph_loop_reactive(
         
         loop_agg = []
         start_time = time.time()
+        next_iteration = 0
+        if _core_loop is not None:
+            loop_agg, start_time, next_iteration = await _core_loop.prepare(items, max_iterations)
         total_items = len(items)
-        item_edges_traversed = False
+        item_edges_traversed = next_iteration > 0
 
         # Data edges whose value is produced during an iteration (by the loop
         # item or by another iteration node). Their values never carry over to
@@ -2199,6 +2234,8 @@ async def execute_graph_loop_reactive(
             return False
 
         for idx, item in enumerate(items):
+            if idx < next_iteration:
+                continue
             # Check iteration limit
             if idx >= max_iterations:
                 logger.warning("Loop reached max iterations limit: %d", max_iterations)
@@ -2215,6 +2252,8 @@ async def execute_graph_loop_reactive(
                 }
                 break
             
+            if _core_loop is not None:
+                await _core_loop.iteration(idx)
             # Emit progress event
             elapsed_ms = (time.time() - start_time) * 1000
             yield emit_loop_progress(loop_id, idx, total_items, item, elapsed_ms)
@@ -2469,6 +2508,8 @@ async def execute_graph_loop_reactive(
             
             logger.debug("Iteration %d feedback: %s", idx, str(fb)[:100] if fb else "None")
             loop_agg.append(fb)
+            if _core_loop is not None:
+                await _core_loop.completed_iteration(idx, loop_agg)
             
             # Phase 0: emit ITERATION_END debug event for execution tree persistence
             iteration_duration_ms = (time.time() - iteration_start) * 1000
@@ -2505,6 +2546,8 @@ async def execute_graph_loop_reactive(
         loop_node.outputs[loop_node.OUTPUT_HANDLE_END] = loop_node.prep(loop_agg)
         mark_completed(loop_id)
         await end_loop_lifecycle()
+        if _core_loop is not None:
+            await _core_loop.post()
 
         async for hook_output in execute_traversed_edge_hooks(
             loop_id,
@@ -2520,6 +2563,9 @@ async def execute_graph_loop_reactive(
             if target_node:
                 target_node._response = None
                 target_node.outputs.clear()
+
+    if _core_loop is not None:
+        await _core_loop.post()
 
     # Process end edges and ALL downstream nodes using topological order
     # Find all nodes reachable from the loop's handle_end output

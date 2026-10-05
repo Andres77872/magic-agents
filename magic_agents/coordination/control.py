@@ -24,7 +24,7 @@ class ActorLoopControl:
 
     async def checkpoint(self, checkpoint: AgentLoopCheckpoint, boundary: str):
         try:
-            await self.caller.service.checkpoint(self.caller, checkpoint.model_dump(mode="json"), checkpoint.consumed_message_ids)
+            await self.caller.service.checkpoint(self.caller, checkpoint.model_dump(mode="json"), checkpoint.consumed_message_ids, boundary=boundary)
         except CoordinationError as exc:
             raise AgentControlError(str(exc), exc.code) from exc
         self._last_checkpoint = checkpoint.detached()

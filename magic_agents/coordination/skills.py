@@ -138,7 +138,7 @@ class SkillsActorLoopControl(ActorLoopControl):
 
     async def checkpoint(self, checkpoint, boundary):
         try:
-            await self.caller.service.checkpoint(self.caller, self._snapshot(checkpoint), checkpoint.consumed_message_ids)
+            await self.caller.service.checkpoint(self.caller, self._snapshot(checkpoint), checkpoint.consumed_message_ids, boundary=boundary)
         except CoordinationError as exc:
             raise AgentControlError(str(exc), exc.code) from exc
         self._last_checkpoint = checkpoint.detached()

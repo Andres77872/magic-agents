@@ -63,8 +63,10 @@ def validate_coordination_definition(definition: dict[str, Any], *, path: tuple[
     edges = graph.get("edges", [])
     if not isinstance(raw_nodes, list) or not isinstance(edges, list):
         return [CoordinationDiagnostic("invalid_coordination_config", "Authored graph nodes and edges must be lists", path)]
-    from magic_agents.hooks.messages_hook import effective_messages_nodes, MessagesHookBindingError
+    from magic_agents.hooks.messages_hook import effective_messages_nodes, messages_scope_engine, MessagesHookBindingError
     try:
+        if policy is not None and policy.enabled:
+            messages_scope_engine(raw_nodes, edges)
         raw_nodes = effective_messages_nodes(raw_nodes, edges)
     except MessagesHookBindingError as exc:
         return [CoordinationDiagnostic('invalid_coordination_config', str(exc), path)]

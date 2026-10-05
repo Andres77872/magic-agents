@@ -41,6 +41,26 @@ def messages_hook_bindings(nodes, edges):
     return bindings
 
 
+def messages_scope_engine(nodes, edges):
+    """Resolve enabled participant bindings; callers own scope-enabled checks."""
+    bindings = messages_hook_bindings(nodes, edges)
+    by_id = {node.get('id'): node for node in nodes}
+    engines = set()
+    for node in nodes:
+        if node.get('type') != 'llm':
+            continue
+        binding = bindings.get(node['id'])
+        if binding is not None:
+            hook_id, config = binding
+            if config.enabled:
+                engines.add((by_id[hook_id].get('data') or {}).get('messaging_engine', 'in_memory'))
+        elif ((node.get('data') or {}).get('messaging') or {}).get('enabled') is True:
+            engines.add('in_memory')
+    if len(engines) > 1:
+        raise MessagesHookBindingError('Enabled participants in one scope must use the same messaging engine')
+    return next(iter(engines), 'in_memory')
+
+
 def effective_messages_nodes(nodes, edges):
     """Private compiler view; never persist this view as authored graph data."""
     bindings = messages_hook_bindings(nodes, edges)

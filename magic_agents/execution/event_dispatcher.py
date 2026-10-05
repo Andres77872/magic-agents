@@ -298,6 +298,13 @@ class GraphEventDispatcher:
         tracker = self._trackers[target_node_id]
         node = self.nodes.get(target_node_id)
         
+        from magic_agents.execution.recorder import current_scope
+        core = current_scope()
+        if core is not None:
+            await core.record('delivery', {'edge_id': edge_id or target_node_id + ':' + handle,
+                'target_node_id': target_node_id, 'handle': handle,
+                'value': core.recorder.encode(content)})
+
         # Record each edge before assembling variadic tool inputs. Assigning
         # directly by handle would silently replace another tool on that slot.
         await tracker.receive_input(handle, content, edge_id=edge_id)

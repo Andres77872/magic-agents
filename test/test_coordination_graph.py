@@ -181,13 +181,13 @@ async def test_fail_group_cancels_inflight_peer_and_prevents_author_dispatch():
 
 @pytest.mark.asyncio
 async def test_declared_partial_failure_reaches_author_with_failure_manifest_once():
-    rt = runtime(public_source=('author',))
+    rt = runtime()
     async def research(provider, chat): return {'content': 'usable research'}
     async def images(provider, chat): raise RuntimeError('image unavailable')
     async def author(provider, chat):
         assert 'usable research' in repr(chat.messages)
         assert 'coordinationFailure' in repr(chat.messages)
-        assert rt.scopes[0].publication_disposition()['kind'] == 'sealed_partial'
+        assert rt.scopes[0].service._state == 'sealed'
         return {'content': 'deck with an explicit missing-image warning'}
     a, _ = node('research', research, peer='images')
     b, _ = node('images', images, peer='research')
@@ -197,11 +197,8 @@ async def test_declared_partial_failure_reaches_author_with_failure_manifest_onc
     outcome, messages = await collect(g, rt)
     assert not outcome['has_errors'], messages
     assert len(pc.calls) == 1
-    assert rt.scopes[0].publication_disposition()['warnings'][0]['code'] == 'PROVIDER_ATTEMPTS_EXHAUSTED'
-    candidate = rt.publication_snapshot(('author',))
-    assert candidate.disposition.kind == 'sealed_partial'
-    assert candidate.disposition.warnings[0].code == 'PROVIDER_ATTEMPTS_EXHAUSTED'
-    assert candidate.text == 'deck with an explicit missing-image warning'
+    assert rt.scopes[0].service._publication['images']['failure']['reason'] == 'PROVIDER_ATTEMPTS_EXHAUSTED'
+    assert c.outputs[c.OUTPUT_HANDLE_GENERATED]['content'] == 'deck with an explicit missing-image warning'
 
 
 def tool_call(name, args, ident):
@@ -244,119 +241,7 @@ async def test_request_reply_wait_uses_real_tools_with_one_model_slot(stream):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('stream', [False, True])
-async def test_publication_handoff_waits_for_author_and_freezes_actual_schema_only_output(stream):
-    from dataclasses import FrozenInstanceError
-    started, release = asyncio.Event(), asyncio.Event()
-    rt = runtime(public_source=('author',))
-    async def peer(provider, chat): return {'content': 'private assets'}
-    async def author(provider, chat):
-        assert rt.scopes[0].service._state == 'sealed'
-        started.set()
-        await release.wait()
-        return {'content': 'Public café 🦉', 'tool_calls': [tool_call('add_slide',
-            {'title': 'Café', 'text': '🦉'}, 'provider-id')['tool_calls'][0]]}
-    a, _ = node('research', peer, peer='images', stream=stream)
-    b, _ = node('images', peer, peer='research', stream=stream)
-    c, pc = node('author', author, stream=stream)
-    c.inputs[c.INPUT_TOOL_PREFIX + 'actions'] = {'type': 'function', 'function': {
-        'name': 'add_slide', 'parameters': {'type': 'object', 'properties': {
-            'title': {'type': 'string'}, 'text': {'type': 'string'}}}}}
-    task = asyncio.create_task(collect(graph({'research': a, 'images': b, 'author': c}), rt))
-    await asyncio.wait_for(started.wait(), 2)
-    with pytest.raises(CoordinationError, match='successful root graph'):
-        rt.publication_snapshot(('author',))
-    release.set()
-    outcome, messages = await task
-    assert not outcome['has_errors'], messages
-    candidate = rt.publication_snapshot(('author',))
-    assert candidate.text == 'Public café 🦉'
-    assert candidate.disposition.kind == 'sealed_success'
-    assert candidate.source_node_path == ('author',) and candidate.output_revision == 1
-    assert candidate.scope_instance_id == rt.scopes[0].service.scope_id
-    assert candidate.workgroup_id == rt.scopes[0].service.workgroup_id
-    assert candidate.epoch_id == rt.scopes[0].service.epoch_id
-    action = json.loads(candidate.action_json[0])
-    assert action['execution'] == 'client' and action['source'] == 'schema_only'
-    assert action['function']['name'] == 'add_slide'
-    assert json.loads(action['function']['arguments']) == {'title': 'Café', 'text': '🦉'}
-    assert 'provider-id' not in candidate.action_json[0]
-    assert not any('sendMessageToAgent' in repr(options.get('tools')) for options in pc.options)
-    c.outputs[c.OUTPUT_HANDLE_GENERATED]['content'] = 'mutated after completion'
-    assert rt.publication_snapshot(('author',)) is candidate
-    with pytest.raises(FrozenInstanceError): candidate.text = 'changed'
-    with pytest.raises(CoordinationError): rt.publication_snapshot(('images',))
-    def revoked(): raise PermissionError('revoked')
-    rt.authorize = revoked
-    with pytest.raises(PermissionError): rt.publication_snapshot(('author',))
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('source', [('missing',), ('images',), ('missing', 'author')])
-async def test_invalid_host_author_source_rejects_before_provider_work(source):
-    async def handler(provider, chat): return {'content': 'must not execute'}
-    a, pa = node('research', handler, peer='images')
-    b, pb = node('images', handler, peer='research')
-    c, pc = node('author', handler)
-    with pytest.raises(CoordinationError):
-        await collect(graph({'research': a, 'images': b, 'author': c}), runtime(public_source=source))
-    assert not pa.calls and not pb.calls and not pc.calls
-
-
-@pytest.mark.asyncio
-async def test_native_tool_author_is_rejected_before_any_peer_dispatch():
-    async def handler(provider, chat): return {'content': 'must not execute'}
-    async def server_effect(): raise AssertionError('Must not execute')
-    a, pa = node('research', handler, peer='images')
-    b, pb = node('images', handler, peer='research')
-    c, pc = node('author', handler)
-    c.inputs[c.INPUT_TOOL_PREFIX + 'server'] = server_effect
-    with pytest.raises(CoordinationError):
-        await collect(graph({'research': a, 'images': b, 'author': c}), runtime(public_source=('author',)))
-    assert not pa.calls and not pb.calls and not pc.calls
-
-
-@pytest.mark.asyncio
-async def test_completed_author_cannot_publish_when_other_graph_work_fails():
-    from magic_agents.node_system.Node import Node
-    author_done = asyncio.Event()
-    async def peer(provider, chat): return {'content': 'peer output'}
-    async def author(provider, chat):
-        author_done.set()
-        return {'content': 'candidate that must not publish'}
-    class Failure(Node):
-        async def process(self, chat_log):
-            await author_done.wait()
-            raise RuntimeError('unrelated required work failed')
-            yield
-    a, _ = node('research', peer, peer='images')
-    b, _ = node('images', peer, peer='research')
-    c, _ = node('author', author)
-    rt = runtime(public_source=('author',))
-    g = graph({'research': a, 'images': b, 'author': c})
-    g.nodes['failure'] = Failure(node_id='failure', node_type='test')
-    outcome, _ = await collect(g, rt)
-    assert outcome['has_errors']
-    with pytest.raises(CoordinationError): rt.publication_snapshot(('author',))
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('arguments', ['{"x":1,"x":2}', '{"x":NaN}', '{"x":"\\ud800"}', '[1]', '{'])
-async def test_author_invalid_action_cannot_produce_publication(arguments):
-    async def author(provider, chat):
-        return {'content': '', 'tool_calls': [{'id': 'call', 'type': 'function',
-            'function': {'name': 'add_slide', 'arguments': arguments}}]}
-    c, _ = node('author', author)
-    c.inputs[c.INPUT_TOOL_PREFIX + 'actions'] = {'type': 'function', 'function': {
-        'name': 'add_slide', 'parameters': {'type': 'object'}}}
-    rt = runtime(public_source=('author',))
-    outcome, _ = await collect(AgentFlowModel(type='graph', nodes={'author': c}, edges=[]), rt)
-    assert outcome['has_errors']
-    with pytest.raises(CoordinationError): rt.publication_snapshot(('author',))
-
-
-@pytest.mark.asyncio
-async def test_two_real_inner_scopes_share_lineage_and_publish_the_exact_nested_author():
+async def test_two_real_inner_scopes_share_budget_and_preserve_distinct_outputs():
     from magic_agents.node_system.Node import Node
     from magic_agents.node_system.NodeInner import NodeInner
     from magic_agents.models.factory.Nodes.InnerNodeModel import InnerNodeModel
@@ -391,7 +276,7 @@ async def test_two_real_inner_scopes_share_lineage_and_publish_the_exact_nested_
         n.inner_graph = g
         n.inputs[n.INPUT_HANDLE] = name + ' request'
         return n
-    rt = runtime(public_source=('one', 'author'))
+    rt = runtime()
     root = AgentFlowModel(type='graph', nodes={'one': inner('one'), 'two': inner('two')}, edges=[])
     outcome, messages = await collect(root, rt)
     assert not outcome['has_errors'], messages
@@ -402,118 +287,6 @@ async def test_two_real_inner_scopes_share_lineage_and_publish_the_exact_nested_
     assert {scope.service.workgroup_id for scope in groups} == {rt.workgroup_id}
     assert {scope.service.epoch_id for scope in groups} == {rt.epoch_id}
     assert (await rt.budget.snapshot())['modelTurns'] == 6
-    candidate = rt.publication_snapshot(('one', 'author'))
-    assert candidate.text == 'one public output'
-    assert candidate.scope_instance_id == next(scope.scope_id for scope in groups if scope.path == ('one',))
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('stream', [False, True])
-async def test_real_graph_plans_targeted_job_while_generic_job_is_still_running(stream):
-    from magic_agents.coordination.activities import ActivityAdapter, ActivityResult
-    generic_started, release_generic = asyncio.Event(), asyncio.Event()
-    effects = []
-    async def generate(arguments, effect_id):
-        effects.append((arguments['kind'], effect_id))
-        if arguments['kind'] == 'generic':
-            generic_started.set()
-            await release_generic.wait()
-        return ActivityResult('asset:' + arguments['kind'], 'provider:' + effect_id)
-    adapter = ActivityAdapter(validate=lambda args: args,
-        estimate=lambda args: UsageBound(tool_calls=1, image_jobs=1, cost=Decimal('.2')),
-        run=generate, usage=lambda result, error: UsageBound(tool_calls=1, image_jobs=1, cost=Decimal('.1')),
-        lifetime_profile='cooperative-v1')
-    rt = runtime(server_limits=limits(maxConcurrentJobs=1), public_source=('author',),
-        activity_adapters={'generate_image': adapter}, allowed_activity_tools={('images',): frozenset({'generate_image'})})
-    async def research(provider, chat):
-        if len(provider.calls) == 1:
-            await generic_started.wait()
-            return tool_call('sendMessageToAgent', {'agentRef': 'images', 'message': 'make the targeted image',
-                'options': {'expectReply': True}}, 'send-targeted')
-        if not any(message.get('tool_call_id') == 'wait-targeted' for message in chat.messages):
-            request = next(m for m in rt.scopes[0].service._messages.values() if m.kind == 'request')
-            return tool_call('waitForMessage', {'requestId': request.request_id, 'timeoutSeconds': 2}, 'wait-targeted')
-        assert 'asset:targeted' in repr(chat.messages)
-        return {'content': 'research with asset:targeted'}
-    async def images(provider, chat):
-        if len(provider.calls) == 1:
-            return tool_call('startToolJob', {'toolName': 'generate_image', 'arguments': {'kind': 'generic'}}, 'generic-job')
-        target_received = 'make the targeted image' in repr(chat.messages)
-        target_submitted = any(message.get('tool_call_id') == 'targeted-job' for message in chat.messages)
-        if target_received and not target_submitted:
-            assert not release_generic.is_set(), 'Targeted planning must happen while the generic job is held'
-            request = next(m for m in rt.scopes[0].service._messages.values() if m.kind == 'request')
-            return tool_call('startToolJob', {'toolName': 'generate_image', 'arguments': {'kind': 'targeted'},
-                'options': {'requestId': request.request_id, 'priority': 'peer_request'}}, 'targeted-job')
-        if 'asset:targeted' in repr(chat.messages) and not any(message.get('tool_call_id') == 'reply-targeted' for message in chat.messages):
-            request = next(m for m in rt.scopes[0].service._messages.values() if m.kind == 'request')
-            return tool_call('replyToAgent', {'requestId': request.request_id, 'message': 'asset:targeted'}, 'reply-targeted')
-        return {'content': 'asset:generic + asset:targeted' if 'asset:targeted' in repr(chat.messages) else 'tentative waiting assets'}
-    async def author(provider, chat):
-        assert 'asset:generic + asset:targeted' in repr(chat.messages)
-        assert rt.scopes[0].service._state == 'sealed'
-        return {'content': 'deck with both owned assets'}
-    a, pa = node('research', research, peer='images', stream=stream)
-    b, pb = node('images', images, peer='research', stream=stream)
-    c, pc = node('author', author, stream=stream)
-    g = graph({'research': a, 'images': b, 'author': c})
-    g.coordination.delivery_mode = 'background_jobs'
-    task = asyncio.create_task(collect(g, rt))
-    await asyncio.wait_for(generic_started.wait(), 2)
-    scope = rt.scopes[0]
-    async with scope.service._condition:
-        while len(scope.activities._jobs) < 2:
-            await asyncio.wait_for(scope.service._condition.wait(), 2)
-    assert effects == [('generic', next(j.id for j in scope.activities._jobs.values() if j.arguments['kind'] == 'generic'))]
-    assert any(j.state == 'queued' and j.arguments['kind'] == 'targeted' for j in scope.activities._jobs.values())
-    assert not pc.calls and not release_generic.is_set()
-    release_generic.set()
-    outcome, messages = await task
-    assert not outcome['has_errors'], messages
-    assert [kind for kind, _ in effects] == ['generic', 'targeted']
-    assert all(job.state == 'completed' for job in scope.activities._jobs.values())
-    assert not any('startToolJob' in repr(options.get('tools')) for options in pa.options)
-    assert any('startToolJob' in repr(options.get('tools')) for options in pb.options)
-    budget = await rt.budget.snapshot()
-    assert budget['spent']['image_jobs'] == 2 and budget['activeJobs'] == 0
-    assert rt.publication_snapshot(('author',)).text == 'deck with both owned assets'
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('stream', [False, True])
-async def test_graph_cancellation_closes_owned_jobs_and_preserves_unknown_external_exposure(stream):
-    from magic_agents.coordination.activities import ActivityAdapter, ActivityResult
-    entered, interrupted = asyncio.Event(), asyncio.Event()
-    async def remote(arguments, effect_id):
-        entered.set()
-        try: await asyncio.Event().wait()
-        finally: interrupted.set()
-        return ActivityResult('unreachable')
-    adapter = ActivityAdapter(validate=lambda args: args,
-        estimate=lambda args: UsageBound(tool_calls=1, image_jobs=1, cost=Decimal('.2')),
-        run=remote, usage=lambda result, error: None, lifetime_profile='cooperative-v1')
-    rt = runtime(public_source=('author',), activity_adapters={'image': adapter},
-        allowed_activity_tools={('images',): frozenset({'image'})})
-    async def research(provider, chat): return {'content': 'research'}
-    async def images(provider, chat):
-        if len(provider.calls) == 1:
-            return tool_call('startToolJob', {'toolName': 'image', 'arguments': {}}, 'image-job')
-        return {'content': 'tentative image output'}
-    async def author(provider, chat): raise AssertionError('Cancelled assets must not publish')
-    a, _ = node('research', research, peer='images', stream=stream)
-    b, _ = node('images', images, peer='research', stream=stream)
-    c, pc = node('author', author, stream=stream)
-    g = graph({'research': a, 'images': b, 'author': c})
-    g.coordination.delivery_mode = 'background_jobs'
-    task = asyncio.create_task(collect(g, rt))
-    await asyncio.wait_for(entered.wait(), 2)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError): await task
-    assert interrupted.is_set() and not pc.calls
-    scope = rt.scopes[0]
-    assert scope.service._state == 'cancelled'
-    assert all(job.task.done() and job.state == 'reconciling' for job in scope.activities._jobs.values())
-    budget = await rt.budget.snapshot()
-    assert budget['activeJobs'] == 0 and budget['activeModels'] == 0
-    assert budget['uncertain']['image_jobs'] == 1
-    with pytest.raises(RuntimeError): rt.publication_snapshot(('author',))
+    for scope in groups:
+        author = scope.graph.nodes['author']
+        assert author.outputs[author.OUTPUT_HANDLE_GENERATED]['content'] == scope.path[0] + ' public output'

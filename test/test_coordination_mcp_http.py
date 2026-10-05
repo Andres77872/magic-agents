@@ -193,7 +193,7 @@ async def test_actual_actor_native_mcp_tool_inherits_original_owner_and_single_s
     final, final_provider = node('author', author, stream=stream)
     mcp_node = NodeMcp(McpNodeModel(servers=[MCPServerConfig(transport='http', url='https://example.invalid/mcp')]),
                        node_id='mcp', node_type='mcp')
-    rt = runtime(server_limits=limits(maxConcurrentJobs=1), public_source=('author',),
+    rt = runtime(server_limits=limits(maxConcurrentJobs=1),
         authorize_external=lambda *args: None,
         external_estimate=lambda *args: UsageBound(tool_calls=1, cost=Decimal('.1')),
         external_usage=lambda *args: UsageBound(tool_calls=1, cost=Decimal('.01')))

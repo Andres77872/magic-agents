@@ -6,6 +6,8 @@ This mode accounts invocation limits; it does not claim financial/job accounting
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import functools
 import inspect
 import json
@@ -76,6 +78,96 @@ class InvocationDispatch:
 
 
 class InvocationScope(CoordinationScope):
+    def __init__(self, runtime, graph, *, parent=None, path=()):
+        super().__init__(runtime, graph, parent=parent, path=path)
+        from magic_agents.execution.recorder import current_scope
+        core = current_scope()
+        if runtime.persistence is not None and (core is None
+                or core.recorder is not runtime.persistence.core.recorder
+                or core.graph is not graph or tuple(path) != core.path):
+            raise CoordinationError('coordination_core_scope_mismatch',
+                'Persistent messaging requires its exact native graph scope and recorder')
+        engines = {getattr(node, '_messaging_engine', 'in_memory') for node in graph.nodes.values()
+                   if getattr(getattr(node, 'messaging', None), 'enabled', False)}
+        engine = next(iter(engines), 'in_memory') if self.service is not None else 'in_memory'
+        self._core_scope, self.messaging_engine = core, engine
+        if runtime.persistence is not None:
+            runtime.persistence.register(self, core, engine)
+        elif engine == 'db_persistence':
+            raise CoordinationError('coordination_storage_unavailable', 'DB messaging requires native execution storage')
+
+    async def preserve_on_interruption(self):
+        if self._core_scope is None: return False
+        # Explicit Stop is committed by the native root store. Transport loss
+        # preserves operational state for later manual continuation.
+        return not await self._core_scope.recorder.user_stopped()
+
+    async def persist_transition(self):
+        if self.runtime.persistence is not None:
+            async with self.budget.condition: pass
+
+    def _child_effect_identity(self, entry):
+        from magic_agents.execution.storage import canonical_bytes
+        return hashlib.sha256(canonical_bytes(['hook_child', self._core_scope.instance_id,
+            entry['node_id'], entry['operation_id'], entry.get('ownerActorId'),
+            entry.get('ownerActivationId')])).hexdigest()
+
+    def _retained_child_effect(self, entry):
+        from magic_agents.execution.storage import ExecutionStorageError, canonical_bytes
+        ref = entry.get('resultRef')
+        expected = self._child_effect_identity(entry)
+        effect = next((item for item in self._core_scope.recorder.state.effects
+                       if item.effect_id == expected and item.attempt_id == expected), None)
+        if (not isinstance(ref, dict) or set(ref) != {'version','effect_id','attempt_id','request_digest','result_digest'}
+                or type(ref['version']) is not int or ref['version'] != 1 or ref['effect_id'] != expected or ref['attempt_id'] != expected
+                or ref['request_digest'] != entry['digest'] or effect is None or effect.kind != 'hook_child'
+                or effect.request_digest != entry['digest'] or effect.result_digest != ref['result_digest']
+                or effect.status == 'succeeded' and effect.result_digest != hashlib.sha256(canonical_bytes(effect.result)).hexdigest()
+                or effect.cause.node_path != (*self.path, entry['node_id'])
+                or effect.cause.actor_id != entry.get('ownerActorId')
+                or effect.cause.activation_id != entry.get('ownerActivationId')
+                or (entry['state'] == 'completed') != (effect.status == 'succeeded')):
+            raise ExecutionStorageError('execution_child_conflict', 'Retained child effect binding changed')
+        return effect
+
+    def child_operation_result(self, entry):
+        if 'resultRef' not in entry: return super().child_operation_result(entry)
+        return copy.deepcopy(self._retained_child_effect(entry).result)
+
+    async def checkpoint_child_operation(self, entry, *, phase):
+        if self.runtime.persistence is None:
+            return await super().checkpoint_child_operation(entry, phase=phase)
+        from magic_agents.execution.recorder import current_node
+        from magic_agents.execution.storage import EffectRecord, ExecutionStorageError, canonical_bytes
+        persistence, core = self.runtime.persistence, self._core_scope
+        identity = self._child_effect_identity(entry)
+        async with self.budget.condition:
+            previous = self.child_operations.get(entry['operation_id'])
+            if phase == 'prepared':
+                if previous is not None:
+                    raise ExecutionStorageError('execution_child_conflict', 'Child effect already exists')
+                active = current_node()
+                cause = (active.cause if active is not None else core.recorder.snapshot.cause).model_copy(update={
+                    'run_id': core.run_id, 'execution_id': active.execution_id if active is not None else core.execution_id,
+                    'node_path': (*self.path, entry['node_id']),
+                    'actor_id': entry.get('ownerActorId'), 'activation_id': entry.get('ownerActivationId')})
+                effect = EffectRecord(effect_id=identity, attempt_id=identity, kind='hook_child',
+                    status='prepared', request_digest=entry['digest'], cause=cause)
+            else:
+                if previous is None:
+                    raise ExecutionStorageError('execution_child_conflict', 'Child effect has no prepared intent')
+                effect = self._retained_child_effect(previous)
+                effect = effect.model_copy(update={'status': phase})
+            stored = copy.deepcopy(entry)
+            if phase == 'succeeded':
+                value = stored.pop('result')
+                effect = effect.model_copy(update={'result': value,
+                    'result_digest': hashlib.sha256(canonical_bytes(value)).hexdigest()})
+            stored['resultRef'] = {'version': 1, 'effect_id': identity, 'attempt_id': identity,
+                'request_digest': effect.request_digest, 'result_digest': effect.result_digest}
+            self.child_operations[entry['operation_id']] = stored
+            persistence.pending_child_effects[(identity, identity)] = effect
+
     def dispatch_session(self, node_id):
         return InvocationDispatch(self, node_id)
 
@@ -116,6 +208,12 @@ class InvocationRuntime(CoordinationRuntime):
         super().__init__(server_limits=limits, authorize=_nothing, estimate=_estimate,
                          usage=_usage, authorize_attempt=self._authorize_attempt,
                          authorize_skills=_nothing, invocation=True)
+        from magic_agents.execution.recorder import current_scope
+        core = current_scope()
+        self.persistence = None
+        if core is not None:
+            from magic_agents.coordination.persistence import CoordinatorPersistence
+            self.persistence = CoordinatorPersistence(self, core)
 
     def _authorize_attempt(self, path, attempt):
         scope = next(scope for scope in self.scopes if scope.path == path[:-1])
@@ -129,6 +227,16 @@ def invocation_runtime(graph):
     def collect(current):
         policy = getattr(current, 'coordination', None)
         if policy is not None and policy.enabled:
+            engines = {getattr(node, '_messaging_engine', 'in_memory')
+                       for node in current.nodes.values()
+                       if getattr(getattr(node, 'messaging', None), 'enabled', False)}
+            if len(engines) > 1:
+                raise CoordinationError('mixed_messaging_engines',
+                    'Enabled participants in one scope must use the same messaging engine')
+            from magic_agents.execution.recorder import current_scope
+            if engines - {'in_memory', 'db_persistence'} or ('db_persistence' in engines and current_scope() is None):
+                raise CoordinationError('coordination_storage_unavailable',
+                    'DB messaging requires an integrated core execution storage adapter')
             if policy.lifetime != 'attached' or policy.delivery_mode != 'safe_boundary':
                 raise CoordinationError('unsupported_capability', 'Normal graph messaging lasts only for the current invocation')
             if policy.limits.max_cost is not None or policy.limits.max_image_jobs is not None:

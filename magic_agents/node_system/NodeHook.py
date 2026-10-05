@@ -80,6 +80,7 @@ class NodeHook(Node):
         super().__init__(node_id=node_id, debug=debug, **kwargs)
         self._function_template = data.function_template
         self.hook_mode = data.hook_mode
+        self.messaging_engine = data.messaging_engine
         self._messaging_by_target = {key: value.model_copy(deep=True)
                                     for key, value in (data.messaging_by_target or {}).items()}
         self._timeout_seconds = (
@@ -119,6 +120,7 @@ class NodeHook(Node):
             raise MessagesHookBindingError('An LLM accepts one Messages Hook and cannot also declare inline messaging')
         target.messaging = self._messaging_by_target[target.node_id].model_copy(deep=True)
         target._messages_hook_id = self.node_id
+        target._messaging_engine = self.messaging_engine
 
     async def process(
         self, chat_log

@@ -172,6 +172,10 @@ class CoordinationService:
         self._publication = None
         self._checkpoint_bytes = checkpoint_bytes
         self.events = None
+        self._checkpoint_boundaries = {}
+        self._retained_waits = {}
+        self._restored_actors = set()
+        self._volatile_state_lost = False
         if type(checkpoint_bytes) is not int or checkpoint_bytes < 1:
             raise CoordinationError("invalid_config", "Checkpoint byte ceiling must be positive")
 
@@ -425,6 +429,9 @@ class CoordinationService:
         if actor.state not in ("not_started", "queued") or actor.owner_token is not None:
             raise CoordinationError("activation_conflict", "Actor already has an activation owner")
         actor.activation_id, actor.owner_token = _id("activation"), object()
+        # Prior output is not a candidate for this activation. Finish replaces
+        # it; failures already clear it, and inspection exposes revision only.
+        actor.output = None
         self._state_change(actor, 'running')
         self._event('activation_started', actor)
         self._condition.notify_all()
@@ -446,8 +453,17 @@ class CoordinationService:
 
     async def activate(self, role: str) -> ActorCaller:
         async with self._condition:
-            self.authorize(); self._open()
+            self.authorize(); self._expire()
             actor = self._actors[self._roles[role]]
+            if actor.id in self._restored_actors:
+                self._restored_actors.remove(actor.id)
+                if self._state == 'sealed' or actor.state in ({'quiescent'} | _TERMINAL): return None
+                self._open()
+                if actor.state in {'running', 'awaiting_reply', 'awaiting_tools'} and actor.activation_id:
+                    actor.owner_token = object()
+                    self._state_change(actor, 'running')
+                    return ActorCaller(self, actor.id, actor.activation_id, actor.owner_token)
+            self._open()
             return self._activate(actor)
 
     async def send(self, caller: ActorCaller, target: str, message: str, payload=None, *, key: str,
@@ -597,7 +613,7 @@ class CoordinationService:
             actor.offered.update(item.id for item in batch)
             return [self._view(item) for item in batch]
 
-    async def checkpoint(self, caller: ActorCaller, snapshot: dict, consumed_ids: list[str]):
+    async def checkpoint(self, caller: ActorCaller, snapshot: dict, consumed_ids: list[str], *, boundary='tool_results'):
         async with self._condition:
             self._open(); actor = self._owner(caller)
             snapshot = copy.deepcopy(snapshot)
@@ -619,7 +635,9 @@ class CoordinationService:
                     raise CoordinationError("checkpoint_capacity_exceeded", "Canonical state can no longer fit the actor checkpoint") from exc
                 raise
             actor.checkpoint = json.loads(encoded)
+            self._checkpoint_boundaries[actor.id] = boundary
             for mid in consumed_ids:
+                if self._volatile_state_lost and mid not in self._messages: continue
                 item = self._messages[mid]
                 if item.state == "accepted": item.state = "consumed" if item.kind == "request" and item.request_id else "resolved"
                 if mid not in actor.consumed:
@@ -665,6 +683,7 @@ class CoordinationService:
                     raise CoordinationError('checkpoint_capacity_exceeded', 'Lifecycle state exceeds canonical checkpoint capacity') from error
                 raise
             actor.checkpoint = json.loads(encoded)
+            self._checkpoint_boundaries[actor.id] = 'candidate'
             self._condition.notify_all()
 
     async def finish(self, caller: ActorCaller, output):
@@ -769,6 +788,20 @@ class CoordinationService:
                 except TimeoutError:
                     continue
 
+    def _wait_deadline(self, caller, name, arguments, end):
+        from magic_llm.agent.tool_executor import CURRENT_TOOL_CALL
+        call = CURRENT_TOOL_CALL.get()
+        identity = getattr(call, 'id', None)
+        if identity is None: return end
+        key = caller.actor_id + ':' + identity
+        digest = hashlib.sha256(_json({'name': name, 'arguments': arguments}, max_bytes=8192)).hexdigest()
+        prior = self._retained_waits.get(key)
+        if prior is not None:
+            if prior['digest'] != digest: raise CoordinationError('idempotency_conflict', 'Wait identity changed arguments')
+            return min(end, prior['deadline'])
+        self._retained_waits[key] = {'digest': digest, 'deadline': end}
+        return end
+
     async def wait_agent(self, caller: ActorCaller, target: str, *, until: str, timeout: float,
                          activation_id: str | None = None, request_id: str | None = None):
         if until == "request_resolved":
@@ -787,6 +820,7 @@ class CoordinationService:
         end = min(self.clock() + timeout, self.deadline)
         async with self._condition:
             source = self._owner(caller); recipient = self._target(source, target)
+            end = self._wait_deadline(caller, 'wait_agent', [target, until, timeout, activation_id, request_id], end)
             if activation_id != recipient.activation_id and activation_id not in recipient.activations:
                 raise CoordinationError("unknown_activation", "Target activation is unknown")
             with self._waiting(source, 'awaiting_reply', request_id):
@@ -846,6 +880,7 @@ class CoordinationService:
             if request_id and (original is None or original.sender != actor.id):
                 raise CoordinationError("unknown_request", "Caller does not own this request")
             if original: end = min(end, original.expires)
+            end = self._wait_deadline(caller, 'wait_message', [request_id, after_sequence, timeout], end)
             with self._waiting(actor, 'awaiting_reply', request_id):
                 while True:
                     self._access(caller); self._expire()
