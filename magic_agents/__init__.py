@@ -1,3 +1,3 @@
-__version__ = '0.0.60'
+__version__ = '0.0.61'
 
 from magic_agents.agt_flow import run_agent
