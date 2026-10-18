@@ -111,7 +111,7 @@ class NodeClientLLM(Node):
             self._current_model = model
             logger.info("NodeClientLLM:%s client initialized", self.node_id)
         except Exception as e:
-            self.init_error = str(e)
+            self.init_error = "Provider client initialization failed."
             self.init_error_type = type(e).__name__
             logger.error("NodeClientLLM:%s failed to initialize client: %s", self.node_id, self.init_error)
 

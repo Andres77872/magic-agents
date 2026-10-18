@@ -56,6 +56,12 @@ def error_code(error):
     if isinstance(outcome, dict) and isinstance(outcome.get("error"), dict):
         code = outcome["error"].get("code")
         return code if isinstance(code, str) else None
+    # Keep safe provider classifications when a failed LLM crosses an Inner
+    # Flow boundary. Its exception cause and provider body are not portable.
+    from magic_llm.engine.attempt_control import ProviderAttemptControlError
+    from magic_llm.util.provider_errors import provider_error_detail
+    if isinstance(error, ProviderAttemptControlError):
+        return provider_error_detail(error)['code']
     return None
 
 

@@ -258,7 +258,26 @@ class CoreRecorder:
                 transition = ExecutionTransition(operation_id=uuid.uuid4().hex,
                     expected_version=self.lease.version, state=next_state, events=(event,), cause=cause, visible_output=output)
                 phase = 'commit'
-                receipt = await self.store.commit(self.lease, transition)
+                # Cancellation may arrive after SQL has committed but before
+                # its receipt reaches this task. Join that same operation and
+                # apply its acknowledgement while still holding the lock;
+                # cleanup and sibling nodes must see the committed version.
+                commit = asyncio.create_task(self.store.commit(self.lease, transition),
+                                             name='native_execution_commit')
+                cancellation = None
+                try:
+                    await asyncio.shield(commit)
+                except asyncio.CancelledError as error:
+                    cancellation = error
+                    with CancelScope(shield=True):
+                        while not commit.done():
+                            try:
+                                await asyncio.shield(commit)
+                            except asyncio.CancelledError:
+                                continue
+                            except BaseException:
+                                break
+                receipt = commit.result()
                 phase = 'receipt'
                 if (receipt.operation_id != transition.operation_id or
                         receipt.content_digest != transition.content_digest or
@@ -266,6 +285,8 @@ class CoreRecorder:
                     raise ExecutionStorageError('execution_receipt_invalid', 'Storage receipt does not match the committed transition')
                 self.lease = self.lease.model_copy(update={'version': receipt.version})
                 self.state = next_state
+                if cancellation is not None:
+                    raise cancellation
                 return next_state.output_cursor
         except Exception as error:
             if await self.externally_cancelled(error):
