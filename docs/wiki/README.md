@@ -22,8 +22,8 @@ This section explains how Magic Agents is built and how it executes.
 - [../nodes/README.md](../nodes/README.md)
 - [../hooks/README.md](../hooks/README.md)
 - [../JSON_CONTRACT.md](../JSON_CONTRACT.md)
-- [../issues/README.md](../issues/README.md)
-- [../../examples/json/INDEX.md](../../examples/json/INDEX.md)
+- [../external/README.md](../external/README.md)
+- [../../tests/fixtures/graphs/](../../tests/fixtures/graphs/) — complete graph JSON used by the tests
 
 ## Compatibility notes
 

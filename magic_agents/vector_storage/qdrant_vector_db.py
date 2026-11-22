@@ -8,7 +8,7 @@ Requires qdrant-client >= 1.10.0 (optional [qdrant] extra).
 """
 
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Awaitable, Callable, Optional
 
 try:
@@ -260,7 +260,7 @@ class QdrantVectorDB:
                 created_at=(
                     datetime.fromisoformat(payload["created_at"])
                     if "created_at" in payload
-                    else datetime.now()
+                    else datetime.now(UTC)
                 ),
                 source_id=payload.get("doc_id"),  # NEW: populate from stored doc_id
             ))

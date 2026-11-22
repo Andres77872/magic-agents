@@ -41,19 +41,20 @@ flowchart LR
 | `send_message` | `content`, `handle_message_output` |
 | `loop` | `handle_item`, `handle_end` |
 | `conditional` | dynamic output handle chosen by the condition |
-| `inner` | `handle_content_stream`, `handle_execution_content`, `handle_execution_extras` |
+| `inner` | `handle_content_stream`, `handle_execution_content`, `handle_execution_extras` (tool mode: `handle-tool-definition`) |
 | `end` | `handle_end_output` |
 | `void` | no user-facing outputs |
 | `python_exec` | tool mode: `handle-tool-definition`; node mode: `handle-python_exec-result` |
 | `mcp` | `handle-tool-definition` |
 | `node_tool` | `handle-tool-definition` |
+| `skills` | `handle-skills` |
 | `hook` | `handle-user-output`, `handle-debug-output`, `handle-feedback-output` |
 | `codex` | `handle_user_message` |
 | `memory` | `handle_memory_output` |
 
 ## Legacy handle migration
 
-**⚠️ Clean-break policy**: Legacy handle `handle_generated_end` is no longer emitted by any node. Graphs using this handle will fail validation.
+**⚠️ Clean-break policy**: Legacy handle `handle_generated_end` is no longer emitted by any node. An edge that still uses it gets a `LegacyHandleRejected` diagnostic; that diagnostic does not block the run, but the edge never receives a value, so its target waits and then times out or is bypassed.
 
 Previous versions emitted `handle_generated_end` from:
 - `llm` → now emits `handle_generated_content`
@@ -87,8 +88,8 @@ Example:
 Tool-capable nodes routed into an `llm` use special handle assignment.
 
 - `fetch` in `tool_mode` uses its configured output handle
-- `python_exec` in tool mode, `mcp`, and `node_tool` use `handle-tool-definition`
-- `python_exec` with `data.code` is node mode; it emits `handle-python_exec-result` and is skipped by automatic LLM tool-handle assignment
+- `python_exec` in tool mode, `inner` in `tool_mode`, `mcp`, and `node_tool` use `handle-tool-definition` (`inner` honours `data.handles.tool`)
+- `python_exec` is node mode when `tool_mode` is `false`, or when it has `data.code` and `tool_mode` is not `true`; node mode emits `handle-python_exec-result` and is skipped by automatic LLM tool-handle assignment. `data.code` with `tool_mode: true` is a fixed tool
 - `build()` can auto-fill missing `targetHandle` values as `handle-tool-definition-0`, `handle-tool-definition-1`, and so on
 
 That auto-fill behavior is specific to tool-capable nodes routed into `llm`; it is not a generic missing-handle rule for the whole graph.
@@ -107,7 +108,7 @@ See [VALIDATION.md](VALIDATION.md) for the exact enforcement nuances and current
 
 `handle-void` is a special internal sink handle.
 
-During build, edges targeting `handle-void` are rewritten to the injected internal `void` node.
+During build, edges targeting `handle-void` are rewritten to the injected internal `void` node. An edge with no `targetHandle` (after tool-handle backfilling) defaults to `handle-void`, so it is silently routed to the sink and its target receives nothing.
 
 ## Edge-level hooks
 
@@ -130,6 +131,6 @@ Those are executor/control signals, not user-defined branch handles.
 
 - be explicit with `sourceHandle` and `targetHandle`
 - document custom handles in shared graph specs
-- use canonical handles only — legacy handles are rejected at validation
+- use canonical handles only — legacy handles get a `LegacyHandleRejected` diagnostic and never deliver
 
 See [VALIDATION.md](VALIDATION.md) for what the build catches and [JSON_CONTRACT.md](../JSON_CONTRACT.md) for the complete contract.

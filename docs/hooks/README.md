@@ -32,8 +32,9 @@ await execute_graph_reactive(graph, hooks=registry)
 
 ```json
 {
+  "id": "my-hook-node",
   "type": "hook",
-  "function_template": "def my_hook(ctx, log): emit.user('hook fired!')"
+  "data": {"function_template": "def my_hook(ctx, log): emit.user('hook fired!')"}
 }
 ```
 
@@ -45,11 +46,11 @@ Add `EdgeHookConfig` to an edge: `"hooks": { "hook_node_id": "my-hook-node", "en
 |-----------|--------|-------|
 | FlowHooks Protocol (12 methods) | ✅ Implemented | ~30 unit |
 | HookContext + HookContextFactory | ✅ Implemented | ~50 tests |
-| HookRegistry (3-tier dispatch) | ✅ Implemented | 453 lines |
+| HookRegistry (3-tier dispatch) | ✅ Implemented | `tests/hooks/test_hook_registry.py`, `tests/hooks/lifecycle/` |
 | RuntimeConfig (global/graph) | ✅ Implemented | e2e + integration |
 | HookRelay (magic-llm bridge) | ✅ Implemented | ~200 unit + ~400 integration |
 | CallbackEmitter (module-level debug bridge) | ✅ Implemented | graph boundary events only |
-| EdgeHookConfig | ✅ Implemented | 674 lines integration |
+| EdgeHookConfig | ✅ Implemented | `tests/hooks/edge/` |
 | NodeHook (Python template) | ✅ Implemented (Phase 1 only) | via edge + e2e |
 | EmitInterface | ✅ Implemented | ~100 unit |
 | Contracts (TypedDict schemas) | ✅ Implemented | doc-only, NOT runtime-enforced |

@@ -1,0 +1,260 @@
+"""
+Unit tests for the centralized test-support environment loader.
+
+Tests cover:
+- _parse_dotenv() parsing behavior (basic, comments, blanks, quotes, edge cases)
+- _is_placeholder_value() detection logic
+- _resolve_api_keys() priority ordering (real env > .env.test > empty)
+- skip_if_no_api_keys() skip behavior
+"""
+
+import pytest
+
+# Import non-fixture helpers from a normal module, never from conftest.
+from tests.support import (
+    _parse_dotenv,
+    _is_placeholder_value,
+    _resolve_api_keys,
+    skip_if_no_api_keys,
+)
+
+
+# ─── _parse_dotenv() Tests ──────────────────────────────────────────────────
+
+class TestParseDotenv:
+    """Tests for the simple .env file parser."""
+
+    def test_parse_dotenv_basic(self, tmp_path):
+        """Parses simple KEY=VALUE lines."""
+        env_file = tmp_path / ".env.test"
+        env_file.write_text("OPENAI_API_KEY=sk-test123\nSERPER_API_KEY=abc456\n")
+
+        result = _parse_dotenv(env_file)
+
+        assert result["OPENAI_API_KEY"] == "sk-test123"
+        assert result["SERPER_API_KEY"] == "abc456"
+
+    def test_parse_dotenv_skips_comments(self, tmp_path):
+        """Lines starting with # are ignored."""
+        env_file = tmp_path / ".env.test"
+        env_file.write_text(
+            "# This is a comment\n"
+            "OPENAI_API_KEY=sk-test123\n"
+            "# Another comment\n"
+            "SERPER_API_KEY=abc456\n"
+        )
+
+        result = _parse_dotenv(env_file)
+
+        assert len(result) == 2
+        assert result["OPENAI_API_KEY"] == "sk-test123"
+        assert result["SERPER_API_KEY"] == "abc456"
+
+    def test_parse_dotenv_skips_blank_lines(self, tmp_path):
+        """Empty lines are ignored."""
+        env_file = tmp_path / ".env.test"
+        env_file.write_text("\n\nOPENAI_API_KEY=sk-test123\n\n\nSERPER_API_KEY=abc456\n\n")
+
+        result = _parse_dotenv(env_file)
+
+        assert len(result) == 2
+
+    def test_parse_dotenv_handles_double_quotes(self, tmp_path):
+        """KEY=\"value with spaces\" strips surrounding double quotes."""
+        env_file = tmp_path / ".env.test"
+        env_file.write_text('OPENAI_API_KEY="sk-test with spaces"\n')
+
+        result = _parse_dotenv(env_file)
+
+        assert result["OPENAI_API_KEY"] == "sk-test with spaces"
+
+    def test_parse_dotenv_handles_single_quotes(self, tmp_path):
+        """KEY='value with spaces' strips surrounding single quotes."""
+        env_file = tmp_path / ".env.test"
+        env_file.write_text("OPENAI_API_KEY='sk-test with spaces'\n")
+
+        result = _parse_dotenv(env_file)
+
+        assert result["OPENAI_API_KEY"] == "sk-test with spaces"
+
+    def test_parse_dotenv_handles_equals_in_value(self, tmp_path):
+        """Values containing = are preserved (splits on first = only)."""
+        env_file = tmp_path / ".env.test"
+        env_file.write_text("API_KEY=sk-test=with=equals\n")
+
+        result = _parse_dotenv(env_file)
+
+        assert result["API_KEY"] == "sk-test=with=equals"
+
+    def test_parse_dotenv_missing_file_returns_empty(self, tmp_path):
+        """Non-existent file returns empty dict without error."""
+        missing_file = tmp_path / ".env.nonexistent"
+
+        result = _parse_dotenv(missing_file)
+
+        assert result == {}
+
+    def test_parse_dotenv_skips_lines_without_equals(self, tmp_path):
+        """Lines without = are silently skipped."""
+        env_file = tmp_path / ".env.test"
+        env_file.write_text("OPENAI_API_KEY=sk-test123\nINVALID_LINE_NO_EQUALS\nSERPER=abc\n")
+
+        result = _parse_dotenv(env_file)
+
+        assert len(result) == 2
+        assert "INVALID_LINE_NO_EQUALS" not in result
+
+    def test_parse_dotenv_strips_whitespace_around_key(self, tmp_path):
+        """Whitespace around key and value is stripped."""
+        env_file = tmp_path / ".env.test"
+        env_file.write_text("  OPENAI_API_KEY  =  sk-test123  \n")
+
+        result = _parse_dotenv(env_file)
+
+        assert result["OPENAI_API_KEY"] == "sk-test123"
+
+
+# ─── _is_placeholder_value() Tests ─────────────────────────────────────────
+
+class TestIsPlaceholderValue:
+    """Tests for placeholder value detection."""
+
+    @pytest.mark.parametrize("value", [
+        "",
+        "your-openai-key-here",
+        "your-serper-key-here",
+        "placeholder-key",
+        "xxx-not-a-real-key",
+        "changeme",
+        "insert-your-key-here",
+        "short",
+        "abc",
+    ])
+    def test_detects_placeholder(self, value):
+        """Values matching placeholder patterns return True."""
+        assert _is_placeholder_value(value) is True
+
+    @pytest.mark.parametrize("value", [
+        "sk-proj-GLxkCWDabc123def456ghi789jkl012mno345pqr678stu",
+        "sk-abc123def456ghi789jkl012mno345pqr678stuvwx",
+        "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        "some-reasonably-long-value-that-is-not-a-fake",
+    ])
+    def test_accepts_real_key(self, value):
+        """Values that look like real keys return False."""
+        assert _is_placeholder_value(value) is False
+
+
+# ─── _resolve_api_keys() Tests ─────────────────────────────────────────────
+
+class TestResolveApiKeys:
+    """Tests for the priority-based API key resolution."""
+
+    def test_prefers_real_env_over_dotenv_test(self, monkeypatch):
+        """Real environment variables take priority over .env.test values."""
+        monkeypatch.setattr(
+            "tests.support.env._load_env_test",
+            lambda: {"OPENAI_API_KEY": "dotenv-test-value"},
+        )
+        monkeypatch.setenv("OPENAI_API_KEY", "real-env-key")
+        monkeypatch.delenv("SERPER_API_KEY", raising=False)
+
+        result = _resolve_api_keys()
+
+        assert result.get("openai_key") == "real-env-key"
+
+    def test_returns_empty_when_no_env_and_no_dotenv(self, monkeypatch):
+        """When no env vars and no .env.test, returns empty dict."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("SERPER_API_KEY", raising=False)
+        monkeypatch.setattr("tests.support.env._load_env_test", lambda: {})
+
+        result = _resolve_api_keys()
+
+        assert result == {}
+
+    def test_includes_serper_key_when_available(self, monkeypatch):
+        """Serper key is included when set in environment."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setenv("SERPER_API_KEY", "real-serper-key")
+
+        result = _resolve_api_keys()
+
+        assert result.get("serper_key") == "real-serper-key"
+
+    def test_includes_both_keys_when_both_set(self, monkeypatch):
+        """Both keys are included when both env vars are set."""
+        monkeypatch.setenv("OPENAI_API_KEY", "real-openai-key")
+        monkeypatch.setenv("SERPER_API_KEY", "real-serper-key")
+
+        result = _resolve_api_keys()
+
+        assert result.get("openai_key") == "real-openai-key"
+        assert result.get("serper_key") == "real-serper-key"
+
+    @pytest.mark.parametrize(
+        ("environment_name", "resolved_name"),
+        [
+            ("OPENAI_API_KEY", "openai_key"),
+            ("SERPER_API_KEY", "serper_key"),
+        ],
+    )
+    def test_explicit_empty_env_suppresses_dotenv_fallback(
+        self,
+        monkeypatch,
+        environment_name,
+        resolved_name,
+    ):
+        """Credential-free empty exports must override developer-local keys."""
+        monkeypatch.setattr(
+            "tests.support.env._load_env_test",
+            lambda: {environment_name: "real-looking-dotenv-secret-1234567890"},
+        )
+        monkeypatch.setenv(environment_name, "")
+
+        result = _resolve_api_keys()
+
+        assert resolved_name not in result
+
+
+# ─── skip_if_no_api_keys() Tests ────────────────────────────────────────────
+
+class TestSkipIfNoApiKeys:
+    """Tests for the skip helper."""
+
+    def test_skips_on_placeholder_value(self):
+        """Placeholder value triggers pytest.skip."""
+        placeholder_keys = {"openai_key": "your-openai-key-here"}
+
+        with pytest.raises(pytest.skip.Exception):
+            skip_if_no_api_keys(placeholder_keys)
+
+    def test_skips_on_empty_key(self):
+        """Empty key triggers pytest.skip."""
+        empty_keys = {"openai_key": ""}
+
+        with pytest.raises(pytest.skip.Exception):
+            skip_if_no_api_keys(empty_keys)
+
+    def test_skips_on_missing_key(self):
+        """Missing openai_key triggers pytest.skip."""
+        no_keys = {}
+
+        with pytest.raises(pytest.skip.Exception):
+            skip_if_no_api_keys(no_keys)
+
+    def test_does_not_skip_on_real_key(self):
+        """Real-looking key does not trigger skip."""
+        real_keys = {"openai_key": "sk-proj-GLxkCWDabc123def456ghi789jkl012mno345pqr678stu"}
+
+        # Should not raise
+        result = skip_if_no_api_keys(real_keys)
+        assert result == real_keys
+
+    def test_resolves_fresh_when_no_keys_passed(self, monkeypatch):
+        """When no keys passed, resolves fresh from env."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-real-key-12345678901234567890")
+
+        # Should not skip because we set a real-looking key
+        result = skip_if_no_api_keys(None)
+        assert "openai_key" in result

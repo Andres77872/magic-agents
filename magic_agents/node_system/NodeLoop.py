@@ -28,8 +28,16 @@ class NodeLoop(Node):
     DEFAULT_OUTPUT_HANDLE_ITEM = 'handle_item'
     DEFAULT_OUTPUT_HANDLE_END = 'handle_end'
 
-    def __init__(self, handles: Optional[dict] = None, **kwargs):
+    def __init__(self, handles: Optional[dict] = None, max_iterations: Optional[int] = None, **kwargs):
         super().__init__(**kwargs)
+        # Authored iteration cap; the executor falls back to its default (100) when unset.
+        if max_iterations is not None and (
+            isinstance(max_iterations, bool) or not isinstance(max_iterations, int) or max_iterations < 1
+        ):
+            raise ValueError(
+                f"Loop node '{self.node_id}': max_iterations must be a positive integer, got {max_iterations!r}"
+            )
+        self.max_iterations = max_iterations
         # Allow JSON to override handle names
         handles = handles or {}
         self.INPUT_HANDLE_LIST = handles.get('input_list', handles.get('list', self.DEFAULT_INPUT_HANDLE_LIST))

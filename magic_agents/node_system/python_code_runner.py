@@ -21,6 +21,7 @@ import time
 import threading
 from multiprocessing.connection import Connection
 from typing import Any, Callable
+from magic_agents.util.aio import wait_for
 
 logger = logging.getLogger(__name__)
 
@@ -275,7 +276,7 @@ class CodeRunner:
             else builtins.__dict__
         )
         run_func = _compile_run_function(code, namespace_builtins)
-        result = await asyncio.wait_for(
+        result = await wait_for(
             asyncio.to_thread(run_func, handler),
             timeout=self._timeout,
         )

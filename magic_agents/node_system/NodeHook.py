@@ -28,6 +28,7 @@ from magic_agents.models.factory.Nodes.HookNodeModel import (
     DEFAULT_OUTPUT_FEEDBACK,
 )
 from magic_agents.node_system.Node import Node
+from magic_agents.util.aio import wait_for
 
 logger = logging.getLogger(__name__)
 
@@ -184,7 +185,7 @@ class NodeHook(Node):
         # Execute with timeout (Phase 1 safety)
         try:
             # The compiled hook function may be async or sync
-            result = await asyncio.wait_for(
+            result = await wait_for(
                 self._execute_function(hook_function, hook_context, chat_log),
                 timeout=timeout_seconds,
             )

@@ -187,8 +187,17 @@ input map (its template context), so another step Fetch's
 
 ## Gotchas
 
-- step mode has no HTTP timeout of its own; a slow endpoint holds the node
-  until aiohttp's default (300 s total)
+- uncoordinated step mode has no HTTP timeout of its own; a slow endpoint
+  holds the node until aiohttp's default (300 s total). Under coordination,
+  requests use the controlled transport: a finite timeout of at most 300 s, no
+  redirects and a bounded response body
+- the uncoordinated transport follows redirects. aiohttp drops
+  `Authorization` on a cross-origin redirect, but other headers (for example
+  `X-Api-Key: {{env.KEY}}`) are sent to the redirect target; use URLs that do
+  not redirect across origins when headers carry secrets
+- successful response bodies are passed on unmodified (see above): a server
+  that echoes the request back puts the resolved env values into the output,
+  and in tool mode into the model's context
 - inserted URL values are not encoded: `?q={{ handle_fetch_input }}` with
   `a&b=1` sends two parameters; write `{{ handle_fetch_input | urlencode }}`
 

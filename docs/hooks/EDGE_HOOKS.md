@@ -7,8 +7,8 @@
 `EdgeHookConfig` attaches a `NodeHook` node to an edge. When output propagates through that edge, the dispatcher builds an edge `HookContext` and delivers it to the configured hook node first. The executor waits for the Hook callback before forwarding the original payload to the target.
 
 **Files**:
-- Model: `magic_agents/models/factory/EdgeNodeModel.py:24-52`
-- Dispatch: `magic_agents/execution/event_dispatcher.py:245-275`
+- Model: `magic_agents/models/factory/EdgeNodeModel.py`
+- Dispatch: `magic_agents/execution/event_dispatcher.py`
 
 **Status**: ✅ Implemented.
 
@@ -66,7 +66,7 @@ each iteration.
 
 ## Edge Hook Context Payload
 
-`context.inputs` contains (`contracts.py:130-140`):
+`context.inputs` contains (`contracts.py`):
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -80,7 +80,7 @@ each iteration.
 
 **Status**: ⚠️ Deprecated.
 
-`hook_type` at `EdgeNodeModel.py:40-43` is marked with `deprecated=True`. The field still exists but emits a warning on non-default value (`EdgeNodeModel.py:54-62`). Edge hook dispatch is determined **solely by `hook_node_id`**.
+`hook_type` at `EdgeNodeModel.py` is marked with `deprecated=True`. The field still exists but emits a warning on non-default value (`EdgeNodeModel.py`). Edge hook dispatch is determined **solely by `hook_node_id`**.
 
 ```python
 if self.hook_type is not None and self.hook_type != "on_edge_traversed":

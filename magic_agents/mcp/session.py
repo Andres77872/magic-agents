@@ -12,6 +12,7 @@ from typing import Optional, Any
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from urllib.parse import urlsplit, urlunsplit
 
 # MCP SDK imports isolated here
 from mcp import ClientSession
@@ -19,6 +20,19 @@ from mcp.client.stdio import stdio_client, StdioServerParameters
 
 from magic_agents.models.factory.Nodes.McpNodeModel import MCPServerConfig
 from magic_agents.mcp.errors import MCPProtocolError, MCPTransportError
+from magic_agents.util.aio import wait_for
+
+
+def display_url(url: Any) -> str:
+    """Return ``scheme://host[:port]/path`` without credentials or query."""
+    try:
+        parts = urlsplit(str(url or ""))
+        host = parts.hostname or ""
+        if parts.port is not None:
+            host = f"{host}:{parts.port}"
+        return urlunsplit((parts.scheme, host, parts.path, "", ""))
+    except ValueError:
+        return "<invalid url>"
 
 logger = logging.getLogger(__name__)
 
@@ -101,11 +115,15 @@ class MCPSessionManager:
         
     @property
     def server_key(self) -> str:
-        """Unique identifier for this server connection."""
+        """Display identifier for this server connection.
+
+        It appears in debug events, error messages and the LLM system prompt, so
+        the HTTP form drops user info, query and fragment: ``{{env.*}}`` is
+        resolved in the URL and commonly carries a token there.
+        """
         if self._config.transport == "stdio":
             return f"stdio:{self._config.command}"
-        else:
-            return f"http:{self._config.url}"
+        return f"http:{display_url(self._config.url)}"
     
     @property
     def is_healthy(self) -> bool:
@@ -200,8 +218,14 @@ class MCPSessionManager:
                 self._physical.check()
             if isinstance(e, (MCPProtocolError, MCPTransportError)):
                 raise
+            message = str(e)
+            if isinstance(e, TimeoutError):
+                # str(TimeoutError()) is empty; say what timed out.
+                message = f"MCP connection timed out (init_timeout={self._config.init_timeout}s)"
+            elif not message:
+                message = type(e).__name__
             raise MCPTransportError(
-                message=str(e),
+                message=message,
                 server=self.server_key,
                 transport_type=self._config.transport
             )
@@ -259,7 +283,7 @@ class MCPSessionManager:
             logger.debug(
                 "MCPSessionManager:%s connected to HTTP endpoint: %s",
                 self._node_id,
-                self._config.url
+                display_url(self._config.url)
             )
     
     async def _initialize_handshake(self) -> None:
@@ -278,7 +302,7 @@ class MCPSessionManager:
         
         # Send initialize request with empty capabilities (tool-only client)
         async def initialize():
-            return await asyncio.wait_for(self._session.initialize(), timeout=self._config.init_timeout)
+            return await wait_for(self._session.initialize(), timeout=self._config.init_timeout)
         init_result = await self._physical.run(initialize, timeout=self._config.init_timeout) if self._physical is not None else await initialize()
         
         # Extract server info, capabilities, and instructions
@@ -334,7 +358,7 @@ class MCPSessionManager:
             _encoded(arguments, max_bytes=1024 * 1024)
             timeout = timeout or self._config.tool_timeout
             async def operation():
-                return await asyncio.wait_for(self._session.call_tool(name, arguments), timeout=timeout)
+                return await wait_for(self._session.call_tool(name, arguments), timeout=timeout)
             return await self._physical.run(operation, timeout=timeout)
         """Call an MCP tool via session.
         
@@ -360,7 +384,7 @@ class MCPSessionManager:
         timeout_val = timeout or self._config.tool_timeout
         
         try:
-            result = await asyncio.wait_for(
+            result = await wait_for(
                 self._session.call_tool(name, arguments),
                 timeout=timeout_val
             )
@@ -459,7 +483,7 @@ class MCPSessionManager:
                 request = self._session.list_tools(params=PaginatedRequestParams(cursor=cursor) if cursor else None)
             else:
                 request = self._session.list_tools(cursor=cursor)
-            result = await asyncio.wait_for(
+            result = await wait_for(
                 request,
                 timeout=self._config.discovery_timeout
             )

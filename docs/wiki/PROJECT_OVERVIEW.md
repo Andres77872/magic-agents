@@ -49,9 +49,9 @@ See [EXECUTION_MODEL.md](EXECUTION_MODEL.md).
 
 ## Built-in node surface
 
-The current runtime accepts 20 built-in node types:
+The current runtime accepts 21 built-in node types:
 
-`user_input`, `text`, `constant`, `parser`, `fetch`, `client`, `llm`, `chat`, `send_message`, `loop`, `conditional`, `inner`, `end`, `void`, `hook`, `python_exec`, `mcp`, `memory`, `codex`, `node_tool`
+`user_input`, `text`, `constant`, `parser`, `fetch`, `client`, `llm`, `chat`, `send_message`, `loop`, `conditional`, `inner`, `end`, `void`, `hook`, `python_exec`, `mcp`, `memory`, `codex`, `node_tool`, `skills`
 
 See [NODE_REFERENCE.md](NODE_REFERENCE.md) and [../nodes/README.md](../nodes/README.md).
 
@@ -65,4 +65,4 @@ See [NODE_REFERENCE.md](NODE_REFERENCE.md) and [../nodes/README.md](../nodes/REA
 - graph-level `timeout` defaults to 60 seconds for input waiting
 - contract validation defaults to `warn`; stricter runtime enforcement is only partially implemented today
 
-Documented open gaps live in [../issues/README.md](../issues/README.md).
+Problems whose root cause is in another repository are tracked in [../external/README.md](../external/README.md).

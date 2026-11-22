@@ -20,6 +20,7 @@ from uuid import uuid4
 from magic_agents.models.coordination import CoordinationLimits, CoordinationPolicy, MessagingConfig
 from magic_agents.coordination.budget import BudgetError, UsageBound, WorkgroupBudget, inherited_limits
 from magic_llm.agent.control import InboxMessage
+from magic_agents.util.aio import wait_for
 
 _INPUT_COUNT = 32
 _INPUT_BYTES = 65536
@@ -722,7 +723,7 @@ class CoordinationService:
                     if self._pending(actor): return "continue"
                     if not actor.requests and not actor.activities: return "candidate_ready"
                     deadline = min([self.deadline, *(self._messages[self._requests[r]].expires for r in actor.requests)])
-                    try: await asyncio.wait_for(self._condition.wait(), timeout=max(0, deadline - self.clock()))
+                    try: await wait_for(self._condition.wait(), timeout=max(0, deadline - self.clock()))
                     except TimeoutError: continue
 
     async def guard(self, caller: ActorCaller):
@@ -784,7 +785,7 @@ class CoordinationService:
                 if self._try_seal() is not None:
                     return None
                 try:
-                    await asyncio.wait_for(self._condition.wait(), timeout=max(0, self.deadline - self.clock()))
+                    await wait_for(self._condition.wait(), timeout=max(0, self.deadline - self.clock()))
                 except TimeoutError:
                     continue
 
@@ -835,7 +836,7 @@ class CoordinationService:
                     if self._pending(source): return {"ok": True, "outcome": "inbox_ready"}
                     remaining = end - self.clock()
                     if remaining <= 0: return {"ok": True, "outcome": "timeout"}
-                    try: await asyncio.wait_for(self._condition.wait(), timeout=remaining)
+                    try: await wait_for(self._condition.wait(), timeout=remaining)
                     except TimeoutError: continue
 
     async def seal(self):
@@ -896,7 +897,7 @@ class CoordinationService:
                         return {"ok": True, "outcome": "inbox_ready" if request_id else "message", "message": self._view(pending[0]), "nextSequence": pending[0].sequence}
                     remaining = end - self.clock()
                     if remaining <= 0: return {"ok": True, "outcome": "timeout", "requestId": request_id}
-                    try: await asyncio.wait_for(self._condition.wait(), timeout=remaining)
+                    try: await wait_for(self._condition.wait(), timeout=remaining)
                     except TimeoutError: continue
 
     async def cancel(self):

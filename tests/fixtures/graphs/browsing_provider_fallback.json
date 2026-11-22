@@ -1,0 +1,194 @@
+{
+  "nodes": [
+    {
+      "id": "input",
+      "type": "user_input",
+      "position": {
+        "x": 70,
+        "y": 0
+      },
+      "data": {}
+    },
+    {
+      "id": "tavily",
+      "type": "fetch",
+      "position": {
+        "x": 0,
+        "y": 340
+      },
+      "data": {
+        "tool_mode": true,
+        "tool_name": "search_web",
+        "tool_description": "Search the web for a query. Returns source links and excerpts. Supports automatic provider fallback.",
+        "method": "POST",
+        "url": "https://api.tavily.com/search",
+        "headers": {
+          "Authorization": "Bearer {{env.TAVILY_API_KEY}}",
+          "Content-Type": "application/json"
+        },
+        "json_data": {
+          "query": "{{query}}",
+          "max_results": 5
+        }
+      }
+    },
+    {
+      "id": "exa",
+      "type": "fetch",
+      "position": {
+        "x": 560,
+        "y": 1270
+      },
+      "data": {
+        "tool_mode": true,
+        "tool_name": "search_exa",
+        "tool_description": "Search the web with Exa for a query. Returns source links and search results.",
+        "method": "POST",
+        "url": "https://api.exa.ai/search",
+        "headers": {
+          "x-api-key": "{{env.EXA_API_KEY}}",
+          "Content-Type": "application/json"
+        },
+        "json_data": {
+          "query": "{{query}}",
+          "numResults": 5
+        }
+      }
+    },
+    {
+      "id": "serper",
+      "type": "fetch",
+      "position": {
+        "x": 560,
+        "y": 1890
+      },
+      "data": {
+        "tool_mode": true,
+        "tool_name": "search_serper",
+        "tool_description": "Search Google through Serper for a query. Returns organic results with titles, links and snippets.",
+        "method": "POST",
+        "url": "https://google.serper.dev/search",
+        "headers": {
+          "X-API-KEY": "{{env.SERPER_API_KEY}}",
+          "Content-Type": "application/json"
+        },
+        "json_data": {
+          "q": "{{query}}",
+          "num": 5
+        }
+      }
+    },
+    {
+      "id": "recover-tavily",
+      "type": "hook",
+      "position": {
+        "x": 0,
+        "y": 1540
+      },
+      "data": {
+        "lifecycle_event": "onError",
+        "failure_policy": "preserve",
+        "function_template": "async def recover(context, chat_log):\n    error = context.outcome.get(\"error\", {})\n    if error.get(\"code\") == \"HTTP_ERROR\":\n        return {\"action\": \"redirect\", \"connection\": \"recover-tavily.handle-child-call->exa.handle_fetch_input\", \"content\": context.request[\"content\"]}\n    return None\n"
+      }
+    },
+    {
+      "id": "recover-exa",
+      "type": "hook",
+      "position": {
+        "x": 0,
+        "y": 2270
+      },
+      "data": {
+        "lifecycle_event": "onError",
+        "target_node_id": "exa",
+        "failure_policy": "preserve",
+        "function_template": "async def recover(context, chat_log):\n    error = context.outcome.get(\"error\", {})\n    if error.get(\"code\") == \"HTTP_ERROR\":\n        return {\"action\": \"redirect\", \"connection\": \"recover-exa.handle-child-call->serper.handle_fetch_input\", \"content\": context.request[\"content\"]}\n    return None\n"
+      }
+    },
+    {
+      "id": "client",
+      "type": "client",
+      "position": {
+        "x": 0,
+        "y": 960
+      },
+      "data": {
+        "engine": "openai",
+        "model": "gpt-6.1-sol",
+        "endpoint": "responses",
+        "api_info": {
+          "api_key": "{{env.OPENAI_API_KEY}}"
+        }
+      }
+    },
+    {
+      "id": "llm",
+      "type": "llm",
+      "position": {
+        "x": 560,
+        "y": 490
+      },
+      "data": {
+        "stream": true,
+        "truncation_strategy": "tail"
+      }
+    },
+    {
+      "id": "end",
+      "type": "end",
+      "position": {
+        "x": 1120,
+        "y": 1380
+      },
+      "data": {}
+    }
+  ],
+  "edges": [
+    {
+      "id": "input.handle_user_message->llm.handle_user_message",
+      "source": "input",
+      "sourceHandle": "handle_user_message",
+      "target": "llm",
+      "targetHandle": "handle_user_message"
+    },
+    {
+      "id": "client.handle-client-provider->llm.handle-client-provider",
+      "source": "client",
+      "sourceHandle": "handle-client-provider",
+      "target": "llm",
+      "targetHandle": "handle-client-provider"
+    },
+    {
+      "id": "tavily.handle_fetch_output->llm.handle-tool-definition-0",
+      "source": "tavily",
+      "sourceHandle": "handle_fetch_output",
+      "target": "llm",
+      "targetHandle": "handle-tool-definition-0",
+      "hooks": {
+        "hook_node_id": "recover-tavily",
+        "enabled": true
+      }
+    },
+    {
+      "id": "recover-tavily.handle-child-call->exa.handle_fetch_input",
+      "source": "recover-tavily",
+      "sourceHandle": "handle-child-call",
+      "target": "exa",
+      "targetHandle": "handle_fetch_input"
+    },
+    {
+      "id": "recover-exa.handle-child-call->serper.handle_fetch_input",
+      "source": "recover-exa",
+      "sourceHandle": "handle-child-call",
+      "target": "serper",
+      "targetHandle": "handle_fetch_input"
+    },
+    {
+      "id": "llm.handle_generated_content->end.handle_flow_input",
+      "source": "llm",
+      "sourceHandle": "handle_generated_content",
+      "target": "end",
+      "targetHandle": "handle_flow_input"
+    }
+  ]
+}

@@ -10,7 +10,7 @@ Documents deprecations and recommended migration paths for consumers of the hook
 
 **Status**: ⚠️ Deprecated since Phase 4.
 
-**Evidence**: `flow_hooks.py:167-183` — `__post_init__` emits `DeprecationWarning` when `type(self) is HookContext`.
+**Evidence**: `flow_hooks.py` — `__post_init__` emits `DeprecationWarning` when `type(self) is HookContext`.
 
 ### Before (deprecated)
 
@@ -38,8 +38,8 @@ ctx = HookContextFactory.build_node_context(
 ```
 
 The factory:
-- Suppresses the deprecation warning (`context_factory.py:39-47`)
-- Provides per-event-type validation (`context_factory.py:52-58`)
+- Suppresses the deprecation warning (`context_factory.py`)
+- Provides per-event-type validation (`context_factory.py`)
 - Absorbs unknown kwargs into `inputs` for forward compatibility
 
 ---
@@ -48,7 +48,7 @@ The factory:
 
 **Status**: ⚠️ Deprecated.
 
-**Evidence**: `EdgeNodeModel.py:40-43` — `hook_type` field marked `deprecated=True`. Warning emitted at `EdgeNodeModel.py:54-62`.
+**Evidence**: `EdgeNodeModel.py` — `hook_type` field marked `deprecated=True`. Warning emitted at `EdgeNodeModel.py`.
 
 ### Before (deprecated)
 
@@ -70,7 +70,7 @@ Edge hook dispatch is determined **solely by `hook_node_id`**. The `hook_type` f
 
 **Status**: ⚠️ Deprecated.
 
-**Evidence**: `flow_hooks.py:232-246` — class docstring says "[DEPRECATED]".
+**Evidence**: `flow_hooks.py` — class docstring says "[DEPRECATED]".
 
 ### Before (deprecated)
 
@@ -94,7 +94,7 @@ ctx = HookContextFactory.build_llm_context(
 # Additional fields go into metadata or are factory parameters
 ```
 
-LLM-specific fields (`model`, `streaming`, `iteration`) are now first-class factory parameters (`context_factory.py:298-303`). Node-specific fields go into `HookContext.metadata`.
+LLM-specific fields (`model`, `streaming`, `iteration`) are now first-class factory parameters (`context_factory.py`). Node-specific fields go into `HookContext.metadata`.
 
 ---
 
@@ -102,7 +102,7 @@ LLM-specific fields (`model`, `streaming`, `iteration`) are now first-class fact
 
 **Status**: ⚠️ Deprecated.
 
-**Evidence**: `flow_hooks.py:248-258` — class docstring says "[DEPRECATED]".
+**Evidence**: `flow_hooks.py` — class docstring says "[DEPRECATED]".
 
 ### Before
 
@@ -122,11 +122,13 @@ ctx = HookContextFactory.build_node_context(
     node_id="mcp-node",
     node_type="MCP",
     node_class="NodeMcp",
-    metadata={
-        "session_id": "sess-1",
-        "tools_discovered": 5,
-    },
 )
+# build_node_context() has no metadata parameter: an unknown keyword would
+# land in ctx.inputs. Set metadata on the context instead.
+ctx.metadata = {
+    "session_id": "sess-1",
+    "tools_discovered": 5,
+}
 ```
 
 ---
@@ -135,7 +137,7 @@ ctx = HookContextFactory.build_node_context(
 
 **Status**: ⚠️ Deprecated.
 
-**Evidence**: `flow_hooks.py:260-271` — class docstring says "[DEPRECATED]".
+**Evidence**: `flow_hooks.py` — class docstring says "[DEPRECATED]".
 
 ### Before
 
@@ -155,11 +157,13 @@ ctx = HookContextFactory.build_node_context(
     node_id="loop-node",
     node_type="LOOP",
     node_class="NodeLoop",
-    metadata={
-        "items_count": 10,
-        "item_index": 3,
-    },
 )
+# build_node_context() has no metadata parameter: an unknown keyword would
+# land in ctx.inputs. Set metadata on the context instead.
+ctx.metadata = {
+    "items_count": 10,
+    "item_index": 3,
+}
 ```
 
 ---

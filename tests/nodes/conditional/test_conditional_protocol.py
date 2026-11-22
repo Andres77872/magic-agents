@@ -1,0 +1,56 @@
+"""
+Protocol conformance tests for ConditionalRouting.
+
+Tests verify that NodeConditional properly implements the ConditionalRouting
+protocol and that the protocol correctly identifies conditional-like nodes.
+"""
+
+import pytest
+
+from magic_agents.models.model_agent_run_log import ModelAgentRunLog
+from magic_agents.node_system import NodeConditional
+from magic_agents.execution.conditional_routing import ConditionalRouting
+
+
+class TestConditionalRoutingProtocol:
+    """Test ConditionalRouting protocol conformance."""
+
+    @pytest.mark.asyncio
+    async def test_node_conditional_implements_protocol_after_execution(self):
+        """NodeConditional implements ConditionalRouting after process() sets selected_handle."""
+        cond = NodeConditional(
+            node_id="cond-test",
+            node_type="conditional",
+            condition="{{ 'handle_yes' if value else 'handle_no' }}",
+        )
+        cond.inputs = {"handle_input": '{"value": true}'}
+
+        # Before execution: selected_handle not set, protocol check fails
+        assert not isinstance(cond, ConditionalRouting), \
+            "Protocol check should fail before selected_handle is set"
+
+        # Execute with the real runtime log; no event-loop or chat-log mock is needed.
+        async for _ in cond(ModelAgentRunLog()):
+            pass
+
+        # After execution: selected_handle is set, protocol check passes
+        assert isinstance(cond, ConditionalRouting), \
+            "NodeConditional should implement ConditionalRouting after execution"
+        assert cond.selected_handle == "handle_yes"
+
+    def test_non_conditional_node_does_not_implement_protocol(self):
+        """Non-conditional nodes do not implement ConditionalRouting."""
+        from magic_agents.node_system.Node import Node
+
+        # Create a simple non-conditional node
+        class SimpleNode(Node):
+            async def process(self, chat_log):
+                yield self.yield_static("hello")
+
+        simple_node = SimpleNode(node_id="simple-test", node_type="simple")
+
+        assert not isinstance(simple_node, ConditionalRouting), \
+            "SimpleNode should not implement ConditionalRouting"
+        assert not hasattr(simple_node, 'condition_template'), \
+            "SimpleNode should not have condition_template"
+

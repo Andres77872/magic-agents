@@ -14,7 +14,6 @@ Start with:
 - [docs/nodes/README.md](docs/nodes/README.md)
 - [docs/hooks/README.md](docs/hooks/README.md)
 - [docs/JSON_CONTRACT.md](docs/JSON_CONTRACT.md)
-- [docs/issues/README.md](docs/issues/README.md)
 
 ## Installation
 
@@ -43,7 +42,7 @@ printf '%s\n' '-e ../magic-llm[test]' | uv pip install --overrides - -r requirem
 
 `uv` resolves all dependencies while keeping both checkouts editable. Don't install either package by its bare name from public PyPI; those names belong to unrelated projects.
 
-Optional extras: `pdf` for PDF attachments, `redis` for their Redis cache, and `qdrant` for persistent memory. For example, `python -m pip install -e ".[pdf,redis]"` adds PDF parsing and Redis caching to an Agents checkout. Text and Markdown attachments work without them.
+Optional extras: `pdf` parses PDF chat attachments, `redis` caches those parsed PDFs, and `qdrant` stores `memory` node vectors. For example, `python -m pip install -e ".[pdf,redis]"` adds PDF parsing and Redis caching to an Agents checkout. Text and Markdown attachments work without them; see [docs/chat-file-attachments.md](docs/chat-file-attachments.md).
 
 ## Quickstart
 
@@ -91,27 +90,31 @@ This example uses the OpenAI client configuration, so set `OPENAI_API_KEY` befor
 
 ## Built-in nodes
 
-The current runtime supports 20 built-in node types:
+The runtime supports these built-in node types:
 
-`user_input`, `text`, `constant`, `parser`, `fetch`, `client`, `llm`, `chat`, `send_message`, `loop`, `conditional`, `inner`, `end`, `void`, `hook`, `python_exec`, `mcp`, `memory`, `codex`, `node_tool`
+`user_input`, `text`, `constant`, `parser`, `fetch`, `client`, `llm`, `chat`, `send_message`, `loop`, `conditional`, `inner`, `end`, `void`, `hook`, `python_exec`, `mcp`, `memory`, `codex`, `node_tool`, `skills`
 
 Use the docs for current per-node behavior and routing details: [docs/nodes/README.md](docs/nodes/README.md) for per-node pages and [docs/wiki/NODE_REFERENCE.md](docs/wiki/NODE_REFERENCE.md) for the wiki-level node index.
-
-## Examples
-
-- [examples/json/INDEX.md](examples/json/INDEX.md)
-- [examples/conditional/INDEX.md](examples/conditional/INDEX.md)
-- [examples/loop/INDEX.md](examples/loop/INDEX.md)
 
 ## Testing
 
 Install the test tools with `python -m pip install -r requirements.txt`. If working on both repos, use the local override above instead. For a focused installation check without provider calls:
 
 ```sh
-env MAGIC_AGENTS_API_KEY_FILE= OPENAI_API_KEY= OPENROUTER_API_KEY= SERPER_API_KEY= JINA_API_KEY= \
+env OPENAI_API_KEY= OPENROUTER_API_KEY= SERPER_API_KEY= JINA_API_KEY= \
   python -m pytest --strict-config --strict-markers --timeout=30 \
-    test/test_package_dependencies.py test/test_coordination_mcp_http.py test/test_coordination_mcp_discovery.py \
-    test/test_chat_file_attachments.py
+    tests/graph/test_package_dependencies.py tests/coordination/test_mcp_http.py \
+    tests/coordination/test_mcp_discovery.py tests/nodes/chat/test_chat_file_attachments.py
 ```
 
-Install the `pdf` extra to include the real PDF parser case. When running the broader `test/` suite, exclude live tests with `-m 'not needs_api and not credential_gated'`.
+Install the `pdf` extra to include the real PDF parser case. The whole suite (`tests/`) runs without credentials; `setup.cfg` deselects the live-provider tests by default:
+
+```sh
+env OPENAI_API_KEY= OPENROUTER_API_KEY= SERPER_API_KEY= JINA_API_KEY= \
+  python -m pytest --strict-config --strict-markers tests/ --timeout=30 \
+    -m 'not needs_api and not credential_gated'
+```
+
+The opt-in live smoke tests call real providers and skip without real keys: `python -m pytest tests/live -m needs_api`.
+
+CI runs that command on Python 3.11, 3.12 and 3.13 (`.github/workflows/ci.yml`). Contributor notes are in [docs/wiki/DEVELOPMENT.md](docs/wiki/DEVELOPMENT.md). Problems whose root cause is in `magic-llm` or another dependency are listed in [docs/external/](docs/external/README.md).

@@ -376,6 +376,17 @@ class NodePythonExec(Node):
         ):
             self._refresh_executor(runtime_safety_mode, runtime_timeout, runtime_max_output_chars)
 
+        # Handler calls run through a CodeRunner with the same resolved
+        # safety_mode / timeout / max_output_chars as the legacy executor.
+        runner_config = (runtime_safety_mode, runtime_timeout, runtime_max_output_chars)
+        if self._code_runner is None or getattr(self, '_tool_runner_config', None) != runner_config:
+            self._code_runner = CodeRunner(
+                safety_mode=runtime_safety_mode,
+                timeout=runtime_timeout,
+                max_output_chars=runtime_max_output_chars,
+            )
+            self._tool_runner_config = runner_config
+
         # Wrap executor with dual-param tool schema for backward compat
         wrapped_tool = PythonExecToolWrapper(
             executor=self.executor,

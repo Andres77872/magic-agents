@@ -90,6 +90,7 @@ class DebugContext:
             redact=config.redact_sensitive,
             min_severity=config.min_severity,
             max_length=config.max_payload_length,
+            additional_redact_keys=config.additional_redact_keys,
         )
         
         self._emitters = EmitterRegistry()

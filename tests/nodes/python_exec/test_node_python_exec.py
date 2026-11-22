@@ -1,0 +1,284 @@
+"""
+Unit tests for NodePythonExec dual-mode helpers.
+
+Tests cover:
+- _has_code() with various code field values
+- _build_handler_dict() with various input configurations
+"""
+import json
+import pytest
+
+from magic_agents.models.factory.Nodes import PythonExecNodeModel
+from magic_agents.node_system.NodePythonExec import NodePythonExec
+
+
+class TestNodePythonExecHasCode:
+    """Tests for NodePythonExec._has_code()."""
+
+    def test_has_code_none(self):
+        """_has_code() returns False when code is None."""
+        node = NodePythonExec(
+            data=PythonExecNodeModel(safety_mode='subprocess', timeout=30.0, max_output_chars=8000),
+            node_id='py-1',
+            debug=False,
+        )
+        assert node._has_code() is False
+
+    def test_has_code_with_code(self):
+        """_has_code() returns True when code is a non-empty string."""
+        node = NodePythonExec(
+            data=PythonExecNodeModel(
+                safety_mode='subprocess',
+                timeout=30.0,
+                max_output_chars=8000,
+                code="def run(handler): return handler",
+            ),
+            node_id='py-1',
+            debug=False,
+        )
+        assert node._has_code() is True
+
+    def test_has_code_empty_string(self):
+        """_has_code() returns False when code is empty string."""
+        node = NodePythonExec(
+            data=PythonExecNodeModel(
+                safety_mode='subprocess',
+                timeout=30.0,
+                max_output_chars=8000,
+                code="",
+            ),
+            node_id='py-1',
+            debug=False,
+        )
+        assert node._has_code() is False
+
+
+class TestNodePythonExecBuildHandlerDict:
+    """Tests for NodePythonExec._build_handler_dict()."""
+
+    def _make_node(self, code=None, handles=None):
+        """Create a NodePythonExec with its real local executor/configuration."""
+        return NodePythonExec(
+            data=PythonExecNodeModel(
+                safety_mode='subprocess',
+                timeout=30.0,
+                max_output_chars=8000,
+                code=code,
+            ),
+            handles=handles,
+            node_id='py-1',
+            debug=False,
+        )
+
+    def test_build_handler_excludes_config_handles(self):
+        """_build_handler_dict() excludes config handles (safety_mode, timeout, max_output_chars)."""
+        node = self._make_node(code="def run(h): return h")
+        node.inputs.update({
+            'handle-python_exec-safety_mode': 'subprocess',
+            'handle-python_exec-timeout': 30.0,
+            'handle-python_exec-max_output_chars': 8000,
+            'user_query': 'hello',
+            'threshold': 0.5,
+        })
+        handler = node._build_handler_dict()
+        assert handler == {'user_query': 'hello', 'threshold': 0.5}
+
+    def test_build_handler_only_config_inputs(self):
+        """_build_handler_dict() returns empty dict when only config handles present."""
+        node = self._make_node(code="def run(h): return h")
+        node.inputs.update({
+            'handle-python_exec-safety_mode': 'subprocess',
+            'handle-python_exec-timeout': 30.0,
+            'handle-python_exec-max_output_chars': 8000,
+        })
+        handler = node._build_handler_dict()
+        assert handler == {}
+
+    def test_build_handler_custom_handle_names(self):
+        """_build_handler_dict() uses custom handle names when configured."""
+        node = self._make_node(
+            code="def run(h): return h",
+            handles={
+                'safety_mode': 'custom_safety',
+                'timeout': 'custom_tmo',
+                'max_output_chars': 'custom_max',
+            },
+        )
+        node.inputs.update({
+            'custom_safety': 'in_process',
+            'custom_tmo': 10.0,
+            'custom_max': 4000,
+            'data_points': [1, 2, 3],
+        })
+        handler = node._build_handler_dict()
+        assert handler == {'data_points': [1, 2, 3]}
+
+    def test_build_handler_excludes_code_key(self):
+        """_build_handler_dict() excludes 'code' key if it appears in inputs."""
+        node = self._make_node(code="def run(h): return h")
+        node.inputs.update({
+            'handle-python_exec-safety_mode': 'subprocess',
+            'code': 'some injected code',
+            'valid_input': 42,
+        })
+        handler = node._build_handler_dict()
+        assert handler == {'valid_input': 42}
+
+    def test_build_handler_empty_inputs(self):
+        """_build_handler_dict() with empty inputs returns empty dict."""
+        node = self._make_node(code="def run(h): return h")
+        node.inputs = {}
+        handler = node._build_handler_dict()
+        assert handler == {}
+
+
+class TestNodePythonExecDualModeOutputHandle:
+    """Tests for NodePythonExec output handle configuration."""
+
+    def test_node_mode_default_output_handle(self):
+        """Node mode default output handle is 'handle-python_exec-result'."""
+        node = NodePythonExec(
+            data=PythonExecNodeModel(
+                safety_mode='subprocess',
+                timeout=30.0,
+                max_output_chars=8000,
+                code="def run(handler): return handler",
+            ),
+            node_id='py-1',
+            debug=False,
+        )
+        assert node.OUTPUT_HANDLE_CODE_RESULT == 'handle-python_exec-result'
+
+    def test_node_mode_custom_output_handle(self):
+        """Node mode respects configured handles.output for output handle."""
+        node = NodePythonExec(
+            data=PythonExecNodeModel(
+                safety_mode='subprocess',
+                timeout=30.0,
+                max_output_chars=8000,
+                code="def run(handler): return handler",
+            ),
+            handles={'output': 'my-custom-handle'},
+            node_id='py-1',
+            debug=False,
+        )
+        assert node.OUTPUT_HANDLE_CODE_RESULT == 'my-custom-handle'
+
+    def test_tool_mode_default_output_handle(self):
+        """Tool mode default output handle is 'handle-tool-definition'."""
+        node = NodePythonExec(
+            data=PythonExecNodeModel(),
+            node_id='py-1',
+            debug=False,
+        )
+        assert node.OUTPUT_HANDLE == 'handle-tool-definition'
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Task 4.1: PythonExecToolWrapper custom tool_name behavior
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestPythonExecToolWrapperToolName:
+    """Tests for PythonExecToolWrapper custom tool_name."""
+
+    def test_custom_tool_name_returns_analyze(self):
+        """PythonExecToolWrapper(tool_name='analyze').__name__ returns 'analyze'."""
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+
+        wrapper = PythonExecToolWrapper(
+            executor=object(),
+            tool_name="analyze",
+        )
+        assert wrapper.__name__ == "analyze"
+
+    def test_custom_tool_name_in_schema(self):
+        """PythonExecToolWrapper(tool_name='analyze').tool_schema uses 'analyze'."""
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+
+        wrapper = PythonExecToolWrapper(
+            executor=object(),
+            tool_name="analyze",
+        )
+        schema = wrapper.tool_schema
+        assert schema["function"]["name"] == "analyze"
+
+    def test_default_tool_name_is_execute_python(self):
+        """PythonExecToolWrapper().__name__ returns 'execute_python' (default)."""
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+
+        wrapper = PythonExecToolWrapper(executor=object())
+        assert wrapper.__name__ == "execute_python"
+
+    def test_default_tool_name_in_schema(self):
+        """PythonExecToolWrapper().tool_schema uses 'execute_python'."""
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+
+        wrapper = PythonExecToolWrapper(executor=object())
+        schema = wrapper.tool_schema
+        assert schema["function"]["name"] == "execute_python"
+
+    def test_distinct_tool_names_have_distinct_schemas(self):
+        """Two wrappers with different tool_name have distinct schemas."""
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+
+        wrapper_a = PythonExecToolWrapper(executor=object(), tool_name="analyze")
+        wrapper_b = PythonExecToolWrapper(executor=object(), tool_name="execute")
+
+        schema_a = wrapper_a.tool_schema
+        schema_b = wrapper_b.tool_schema
+
+        assert schema_a["function"]["name"] == "analyze"
+        assert schema_b["function"]["name"] == "execute"
+        assert schema_a["function"]["name"] != schema_b["function"]["name"]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Task 4.2: PythonExecNodeModel tool_name field + NodePythonExec threading
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestPythonExecNodeModelToolName:
+    """Tests for PythonExecNodeModel tool_name field."""
+
+    @pytest.mark.asyncio
+    async def test_process_passes_custom_tool_name_to_wrapper(self):
+        """NodePythonExec.process() passes tool_name to PythonExecToolWrapper."""
+        node = NodePythonExec(
+            data=PythonExecNodeModel(tool_name="analyze"),
+            node_id='py-1',
+            debug=False,
+        )
+
+        # Process in tool mode (no code) yields a wrapper around the real executor.
+        from magic_agents.node_system.NodePythonExec import PythonExecToolWrapper
+
+        results = []
+        async for result in node.process(chat_log=None):
+            results.append(result)
+
+        business_events = [
+            result
+            for result in results
+            if result.get("type") == "handle-tool-definition"
+        ]
+        assert len(business_events) == 1
+
+        wrapper = business_events[0]["content"]["content"]
+        assert isinstance(wrapper, PythonExecToolWrapper)
+        assert wrapper.__name__ == "analyze"
+
+
+async def test_tool_mode_handler_calls_use_the_configured_runner_settings():
+    """Regression: handler calls used CodeRunner() defaults, ignoring the node config."""
+    node = NodePythonExec(
+        # subprocess mode so the runaway loop below is really killed at the timeout.
+        data=PythonExecNodeModel(safety_mode='subprocess', timeout=0.5, max_output_chars=5),
+        node_id='py-tool',
+        debug=False,
+    )
+    tool = [event['content']['content'] async for event in node.process(None) if event['type'] == node.OUTPUT_HANDLE][0]
+
+    assert node._code_runner.safety_mode == 'subprocess'
+    truncated = json.loads(await tool(code="def run(handler):\n    return 'x' * 100", handler={}))
+    assert len(truncated['result']) < 100
+    with pytest.raises(RuntimeError, match='timed out'):
+        await tool(code="def run(handler):\n    while True:\n        pass", handler={})

@@ -24,6 +24,9 @@ Run LLM generation in batch or streaming mode, optionally with tools or JSON par
 | `max_input_tokens` | `null` | No-CHAT token budget control. |
 | `truncation_strategy` | `"tail"` | `"tail"` or `"token_budget"`. |
 | `model` | `null` | Usage/logging only. |
+| `reasoning_effort` | `null` | Provider-defined reasoning effort (OpenAI suggests `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`); empty/null inherits provider defaults. |
+| `agent_config` | `null` | Agent-loop budgets: `max_iterations` (150), `wall_clock_timeout`, `per_tool_timeout` (30 s), `max_parallel_tools` (8). |
+| `messaging` | `null` | Coordination participant settings (`enabled`, `role`, `description`, `peers`, `canWakePeers`, `wakeOnMessage`, `tools`); requires a graph-level `coordination` block. |
 
 ## Default inputs
 
@@ -44,6 +47,7 @@ The runtime also supports input handles that can override selected generation se
 - `handle-llm-stream`
 - `handle-llm-iterate`
 - `handle-llm-json_output`
+- `handle-llm-reasoning_effort`
 
 ## Default outputs
 
@@ -61,7 +65,7 @@ The runtime also supports input handles that can override selected generation se
 - supports `json_output` with code-block extraction before JSON parsing
 - supports `iterate: true` so the node re-runs on each loop iteration
 - accepts enabled Skills metadata and registers the model-selected `skills_load` batch loader; see [skills.md](skills.md)
-- collects tools from `fetch`, `python_exec`, `mcp`, task-subagent bundles, and schema-only `node_tool` definitions
+- collects tools from `fetch`, `python_exec`, `inner` in `tool_mode`, `mcp`, task-subagent bundles, and schema-only `node_tool` definitions
 - passes schema-only `node_tool` definitions directly through provider `tools=` and emits client-executable `handle-tool-calls` envelopes
 - rejects mixed callable/server tools plus schema-only `node_tool` inputs on the same LLM node in v1
 - warns for engines known to have weak/no tool support
@@ -70,7 +74,11 @@ The runtime also supports input handles that can override selected generation se
 
 - if debug is enabled, consumers must handle non-content debug events too
 - `handle-tool-calls` is only emitted when tools are present
-- schema-only `node_tool` calls use `{execution: "client", source: "schema_only", tool_calls: [...]}`; clients execute them
+- schema-only `node_tool` calls use `{execution: "client", source: "schema_only", node_id: <llm node id>, tool_calls: [...]}`; clients execute them
+- a Chat input is copied before the node adds its system context and user message, so one Chat node can feed several LLM nodes (or Loop iterations) without their prompts leaking into each other
+- `handle-system-context` is inserted as an additional system message; when the Chat input already has one, the provider receives both (see [../external/magic-llm.md](../external/magic-llm.md), ML-2)
+- a provider reply with `content: null` is treated as empty text
+- with `json_output`, a reply that contains no parseable JSON emits a `JSONExtractionError`/`JSONParseError` diagnostic and **no** `handle_generated_content` output, so an `onFinish` Hook can repair it. Without such a Hook, downstream nodes wait for that input until the graph `timeout` (60 s by default) and then time out
 
 ## Example
 
@@ -102,22 +110,22 @@ NodeLLM is the primary driver of LLM and tool hook events in the hooks system. I
 
 ### Path Distinction
 
-1. **HookRelay path** (callable tools — `tool_functions` present): `NodeLLM` creates a `HookRelay` instance at `NodeLLM.py:292` and passes it as `hooks=` to magic-llm's `run_agent_async()` / `run_agent_stream_async()`. HookRelay bridges magic-llm's sync `AgentHooks` protocol to magic-agents' async `FlowHooks`. All 5 LLM/tool events fire through HookRelay translation. Tool events carry `node_type="TOOL"` via `_build_tool_context()`.
+1. **HookRelay path** (agent loop required: callable tools, registered task subagents, or a coordination participant): `NodeLLM` creates a `HookRelay` with `_create_hook_relay()` and passes it as `hooks=` to magic-llm's `run_agent_async()` / `run_agent_stream_async()`. HookRelay bridges magic-llm's sync `AgentHooks` protocol to magic-agents' async `FlowHooks`. All 5 LLM/tool events fire through HookRelay translation. Tool events carry `node_type="TOOL"` via `_build_tool_context()`.
 
 2. **Direct path** (schema-only tools or no tools): `NodeLLM` calls `self._hooks.invoke()` directly for `on_llm_start`, `on_llm_end`, and `on_llm_loop_end`. Tool events (`on_tool_start`, `on_tool_end`) only fire from the HookRelay path (they require an agent loop). The direct path sets `total_iterations=1` for `on_llm_loop_end` since it's a single-call path (no multi-iteration agent loop).
 
 ### flush_pending_hooks() Behavior
 
 - Called at the **end of every execution** (both streaming and non-streaming)
-- For **streaming paths**: called in a `finally` block (`NodeLLM.py:648`, `NodeLLM.py:683`) — ensures hooks are flushed even on error exit
-- For **non-streaming paths**: called immediately after the agent loop or LLM call completes (`NodeLLM.py:450`, `NodeLLM.py:461`)
+- On both the streaming and non-streaming agent-loop paths it is called in a `finally` block, so hooks are flushed even on error exit or cancellation
 - Drains all pending async futures in `HookRelay._pending_futures` — prevents `Task was destroyed but it is pending!` warnings
 
 ### Sync Fallback Path Limitation
 
 When `run_agent_async()` or `run_agent_stream_async()` are NOT available in the installed magic-llm version (very old versions), `NodeLLM` falls back to synchronous execution via `asyncio.to_thread()`:
 
-- **Hook events are NOT delivered on sync fallback paths.** The `HookRelay` methods called from the thread pool thread cannot use `asyncio.create_task()`, so all hook events are silently dropped.
+- **Non-streaming fallback:** `run_agent()` runs in a worker thread. The `HookRelay` methods called from that thread have no running event loop, so async hook events are dropped.
+- **Streaming fallback:** only the `run_agent_stream()` generator is created in a thread; iterating it runs provider and tool work on the event-loop thread, which blocks the loop for the whole stream. The stream is closed on early exit or cancellation. See [../external/magic-llm.md](../external/magic-llm.md) (ML-5).
 - A `WARNING`-level log message is emitted: *"Hook events will NOT be delivered via this path. Upgrade magic-llm for native async hook support."*
 - **Recommendation**: Upgrade magic-llm to a version that provides `run_agent_async()` / `run_agent_stream_async()` to enable full hook delivery.
 

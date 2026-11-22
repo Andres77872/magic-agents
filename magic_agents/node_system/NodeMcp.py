@@ -17,6 +17,7 @@ from magic_agents.mcp import (
     MCPProtocolError,
     MCPTransportError,
 )
+from magic_agents.mcp.session import display_url
 
 logger = logging.getLogger(__name__)
 
@@ -184,7 +185,7 @@ class NodeMcp(Node):
                 error_type="MCPProtocolError",
                 error_message=str(e),
                 context={
-                    "server": self._session.server_key if self._session else server_config.command or server_config.url,
+                    "server": self._session.server_key if self._session else server_config.command or display_url(server_config.url),
                     "code": e.code,
                     "node_id": self.node_id
                 }
@@ -201,7 +202,7 @@ class NodeMcp(Node):
                 error_type="MCPTransportError",
                 error_message=str(e),
                 context={
-                    "server": self._session.server_key if self._session else server_config.command or server_config.url,
+                    "server": self._session.server_key if self._session else server_config.command or display_url(server_config.url),
                     "transport_type": e.transport_type,
                     "node_id": self.node_id
                 }
@@ -219,7 +220,7 @@ class NodeMcp(Node):
                 error_message=f"MCP node execution failed: {str(e)}",
                 context={
                     "exception_type": type(e).__name__,
-                    "server": server_config.command or server_config.url,
+                    "server": server_config.command or display_url(server_config.url),
                     "node_id": self.node_id
                 }
             )

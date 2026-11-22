@@ -518,6 +518,27 @@ class GraphEventDispatcher:
             "bypassed_targets": list(bypassed_targets)
         }
     
+    async def bypass_outgoing_edges(self, node_id: str) -> None:
+        """Mark every outgoing edge of a node skipped for lack of inputs as bypassed.
+
+        Such a node never emits, so none of its edges can deliver. Targets are
+        left to their own scheduling: each becomes ready once all its inputs are
+        accounted for and then reports (and propagates) its own bypass. Without
+        this, consumers of a skipped node waited until the graph timeout.
+        """
+        for edge in self._outgoing.get(node_id, []):
+            bypassed_hook_id = await self._bypass_edge_hook_trigger(edge.id)
+            if bypassed_hook_id is not None:
+                for hook_edge in self._outgoing.get(bypassed_hook_id, []):
+                    await self._recursive_bypass(hook_edge.target, edge_id=hook_edge.id)
+            if self.get_state(edge.target) in (NodeState.BYPASSED, NodeState.COMPLETED, NodeState.ERROR):
+                continue
+            tracker = self._trackers.get(edge.target)
+            if tracker is None:
+                continue
+            self._clear_bypassed_skills_input(edge.target, edge.id)
+            await tracker.receive_bypass(edge_id=edge.id)
+
     async def handle_bypass_all_signal(self, node_id: str):
         """
         Handle BYPASS_ALL signal from conditional (error case).

@@ -12,6 +12,7 @@ Internal sink node for outputs that should be dropped.
 
 - build injects it automatically with a generated UUID
 - edges using `targetHandle: "handle-void"` are rewritten to target this node
+- an edge with no `targetHandle` (after tool-handle backfilling) defaults to `handle-void`, so it also ends here and delivers nothing
 - users usually do not need to declare it manually, but the runtime accepts the type literal
 
 ## Practical meaning

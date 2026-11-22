@@ -858,7 +858,13 @@ class NodeLLM(Node):
             content = extract_message(raw_content)
 
             if role == 'user':
-                chat_obj.add_user_message(content)
+                if (isinstance(raw_content, list) and raw_content
+                        and all(isinstance(part, dict) and 'type' in part for part in raw_content)):
+                    # Multimodal content parts (text/image_url): keep them, as the
+                    # Chat node does, instead of sending their JSON as text.
+                    chat_obj.messages.append({'role': 'user', 'content': deepcopy(raw_content)})
+                else:
+                    chat_obj.add_user_message(content)
             elif role == 'assistant':
                 tool_calls = msg.get('tool_calls')
                 if isinstance(tool_calls, list) and tool_calls:
@@ -891,10 +897,10 @@ class NodeLLM(Node):
             coordination.validate_client(self, client)
             provider_options["provider_attempt_control"] = coordination.attempt_control(self.node_id)
         if c := params.get(self.INPUT_HANDLER_CHAT):
-            clean_messages = strip_ephemeral_skills_history(c.messages)
-            chat = deepcopy(c) if self._skills_bundle is not None or clean_messages != c.messages else c
-            if chat is not c:
-                chat.messages = clean_messages
+            # The Chat node's ModelChat is shared by every consumer and reused
+            # across loop iterations; prompts added here must stay local.
+            chat = deepcopy(c)
+            chat.messages = strip_ephemeral_skills_history(chat.messages)
             if sys_prompt := self.get_input(self.INPUT_HANDLER_SYSTEM_CONTEXT):
                 chat.set_system(extract_message(sys_prompt))
             if user_prompt := self.get_input(self.INPUT_HANDLER_USER_MESSAGE):
@@ -1120,7 +1126,7 @@ class NodeLLM(Node):
                         await hook_relay.flush_pending_hooks()
                     for event in self._drain_tool_events(tool_functions):
                         yield event
-                self.generated = intention.content
+                self.generated = intention.content or ""
                 # Use REAL collected tool calls, not intention.tool_calls (always empty for callable-tool path)
                 if hook_relay is not None and hook_relay.collected_tool_calls:
                     final_tool_calls = list(hook_relay.collected_tool_calls)
@@ -1230,7 +1236,7 @@ class NodeLLM(Node):
                     _llm_ctx.outputs["total_iterations"] = 1
                     await self._hooks.invoke("on_llm_loop_end", _llm_ctx)
 
-                self.generated = intention.content
+                self.generated = intention.content or ""
                 final_tool_calls = getattr(intention, 'tool_calls', []) or []
                 # Phase 0: emit LLM_GENERATION for execution tree persistence
                 # TODO: verify on_llm_end carries cached/reasoning/audio token fields
@@ -1275,8 +1281,13 @@ class NodeLLM(Node):
 
                     hook_relay = self._create_hook_relay(client=client)
                     last_chunk = None
+                    sync_stream = None
                     try:
-                        for chunk in await asyncio.to_thread(
+                        # Legacy fallback: only the generator is created off the
+                        # loop; iterating it runs provider and tool work on the
+                        # event-loop thread (the relay needs that loop for async
+                        # hooks). Upgrade magic-llm for the native async stream.
+                        sync_stream = await asyncio.to_thread(
                             client.run_agent_stream,
                             user_input=user_msg,
                             system_prompt=sys_msg,
@@ -1285,7 +1296,8 @@ class NodeLLM(Node):
                             hooks=hook_relay,
                             extra_messages=extra_messages or None,
                             **loop_options()
-                        ):
+                        )
+                        for chunk in sync_stream:
                             self.generated += chunk.choices[0].delta.content or ''
                             last_chunk = chunk
                             hook_relay.observe_stream_chunk(chunk)
@@ -1318,6 +1330,10 @@ class NodeLLM(Node):
                             yield event
                         raise
                     finally:
+                        # Close the provider stream on early exit/cancellation.
+                        close_stream = getattr(sync_stream, 'close', None)
+                        if callable(close_stream):
+                            close_stream()
                         await hook_relay.flush_pending_hooks()
                     for event in self._drain_tool_events(tool_functions):
                         yield event

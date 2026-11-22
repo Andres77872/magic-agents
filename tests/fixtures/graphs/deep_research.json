@@ -1,0 +1,150 @@
+{
+  "type": "graph",
+  "debug": true,
+  "debug_config": {
+    "preset": "default",
+    "redact_sensitive": true,
+    "max_payload_length": 1000,
+    "capture_inputs": true,
+    "capture_outputs": true
+  },
+  "content": {
+    "nodes": [
+      {
+        "id": "0",
+        "type": "user_input",
+        "position": {
+          "x": -459.38632435326656,
+          "y": -144.77720978116355
+        },
+        "data": {}
+      },
+      {
+        "id": "1",
+        "type": "end",
+        "position": {
+          "x": 1268.4011892857543,
+          "y": 347.00355241585714
+        },
+        "data": {}
+      },
+      {
+        "id": "bda6f19a-c873-46fe-84ef-ed90c3bb2807",
+        "data": {
+          "text": "You are a deep-research agent with access to web search and scraping tools.\n\n## Your Task\nResearch the user's query thoroughly using the available tools, then produce a comprehensive research dossier.\n\n## Tools Available\n1. **search_web(query)**: Search Google via Serper.dev. Returns URLs, titles, and snippets.\n2. **scrape_url(url)**: Extract full content from a specific URL.\n\n## Research Protocol\n1. **Start with search**: Call `search_web` with the core query and 2-3 variant queries.\n2. **Scrape top results**: Identify the most relevant URLs from search results and call `scrape_url` for each.\n3. **Iterate as needed**: If initial results are insufficient, search again with refined queries.\n4. **Stop when evidence is sufficient**: When you have gathered enough information to answer comprehensively, STOP calling tools.\n\n## Output Requirements\nWhen done researching, produce a **research dossier** with:\n- Key findings organized by topic\n- Supporting evidence with source citations (URLs)\n- Confidence level for each finding\n- Gaps or limitations in the research\n\nDo NOT call tools in your final output. Provide the dossier directly.\n\n## User Query\nYou are a deep-research agent with access to web search and scraping tools.\n\n## Your Task\nResearch the user's query thoroughly using the available tools, then produce a comprehensive research dossier.\n\n## Tools Available\n1. **search_web(query)**: Search Google via Serper.dev. Returns URLs, titles, and snippets.\n2. **scrape_url(url)**: Extract full content from a specific URL.\n\n## Research Protocol\n1. **Start with search**: Call `search_web` with the core query and 2-3 variant queries.\n2. **Scrape top results**: Identify the most relevant URLs from search results and call `scrape_url` for each.\n3. **Iterate as needed**: If initial results are insufficient, search again with refined queries.\n4. **Stop when evidence is sufficient**: When you have gathered enough information to answer comprehensively, STOP calling tools.\n\n## Output Requirements\nWhen done researching, produce a **research dossier** with:\n- Key findings organized by topic\n- Supporting evidence with source citations (URLs)\n- Confidence level for each finding\n- Gaps or limitations in the research\n\nDo NOT call tools in your final output. Provide the dossier directly.\n\n## User Query\n{{ handle_parser_input_0 }}"
+        },
+        "type": "parser",
+        "position": {
+          "x": -64.06865449366089,
+          "y": -405.53816540143663
+        }
+      },
+      {
+        "id": "967a7ad8-cd06-4833-9d1f-e35ef43c18f7",
+        "data": {
+          "top_p": 1,
+          "temperature": 0.7,
+          "max_tokens": 512,
+          "stream": true,
+          "json_output": false,
+          "iterate": false
+        },
+        "type": "llm",
+        "position": {
+          "x": 745.8765983243859,
+          "y": 1.3808734534667764
+        }
+      },
+      {
+        "id": "4e7ebba5-3e9e-4afd-afa0-b9b10e93eca7",
+        "data": {
+          "model": "openai/gpt-5.4",
+          "engine": "openai"
+        },
+        "type": "client",
+        "position": {
+          "x": -429.95254944679704,
+          "y": 196.70676804478381
+        }
+      },
+      {
+        "id": "a113a3f4-7971-4389-86c8-fe2571abf4cb",
+        "data": {
+          "url": "https://google.serper.dev/search",
+          "data": "",
+          "json_data": "{\n  \"q\": \"{{query}}\",\n  \"num\": 10\n}",
+          "method": "POST",
+          "headers": "{\n  \"X-API-KEY\": \"{{env.SERPER_API_KEY}}\",\n  \"Content-Type\": \"application/json\"\n}",
+          "tool_mode": true,
+          "tool_name": "search_web"
+        },
+        "type": "fetch",
+        "position": {
+          "x": -57.97642013041896,
+          "y": 281.4592920475062
+        }
+      },
+      {
+        "id": "b7550f88-edca-4c8b-be28-ff725cd48d21",
+        "data": {
+          "url": "https://scrape.serper.dev",
+          "data": "",
+          "json_data": "{\n  \"url\": \"{{url}}\",\n  \"includeMarkdown\": true\n}",
+          "method": "POST",
+          "headers": "{\n  \"X-API-KEY\": \"{{env.SERPER_API_KEY}}\",\n  \"Content-Type\": \"application/json\"\n}",
+          "tool_mode": true,
+          "tool_name": "scrape_url"
+        },
+        "type": "fetch",
+        "position": {
+          "x": -630.2461611337171,
+          "y": 840.0225194475324
+        }
+      }
+    ],
+    "edges": [
+      {
+        "source": "4e7ebba5-3e9e-4afd-afa0-b9b10e93eca7",
+        "sourceHandle": "handle-client-provider",
+        "target": "967a7ad8-cd06-4833-9d1f-e35ef43c18f7",
+        "targetHandle": "handle-client-provider",
+        "id": "520e509d-f73b-40fa-9cad-9de4b3cf8ef9"
+      },
+      {
+        "source": "967a7ad8-cd06-4833-9d1f-e35ef43c18f7",
+        "sourceHandle": "handle_generated_content",
+        "target": "1",
+        "targetHandle": "handle_flow_input",
+        "id": "ee4e5bab-4693-49e6-ba69-e2f370d53b08"
+      },
+      {
+        "source": "0",
+        "sourceHandle": "handle_user_message",
+        "target": "bda6f19a-c873-46fe-84ef-ed90c3bb2807",
+        "targetHandle": "handle_parser_input_0",
+        "id": "5ddb04de-ea7c-466d-9b53-44168c71e6b3"
+      },
+      {
+        "source": "bda6f19a-c873-46fe-84ef-ed90c3bb2807",
+        "sourceHandle": "handle_parser_output",
+        "target": "967a7ad8-cd06-4833-9d1f-e35ef43c18f7",
+        "targetHandle": "handle_user_message",
+        "id": "242626c8-9cc0-4947-a337-92dc155091f8"
+      },
+      {
+        "source": "a113a3f4-7971-4389-86c8-fe2571abf4cb",
+        "sourceHandle": "handle-tool-definition",
+        "target": "967a7ad8-cd06-4833-9d1f-e35ef43c18f7",
+        "targetHandle": "handle-tool-definition-0",
+        "id": "9c4cb5b7-7102-4afe-8ca3-f5b5f4262613"
+      },
+      {
+        "source": "b7550f88-edca-4c8b-be28-ff725cd48d21",
+        "sourceHandle": "handle-tool-definition",
+        "target": "967a7ad8-cd06-4833-9d1f-e35ef43c18f7",
+        "targetHandle": "handle-tool-definition-1",
+        "id": "ddbbc3fc-545b-4870-9874-cbe8c7b5658b"
+      }
+    ]
+  }
+}

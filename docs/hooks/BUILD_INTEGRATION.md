@@ -6,7 +6,7 @@ Documents how `build()` and JSON agent definitions interact with the hooks syste
 
 ## Graph-Level Dict Hooks Are Stripped
 
-**File**: `magic_agents/agt_flow.py:663-672`
+**File**: `magic_agents/agt_flow.py`
 
 ```python
 if 'hooks' in agt_data and isinstance(agt_data['hooks'], dict):
@@ -33,11 +33,11 @@ When building from JSON:
 {
   "id": "hook-1",
   "type": "hook",
-  "function_template": "def my_hook(ctx, log): emit.user('processed')"
+  "data": {"function_template": "def my_hook(ctx, log): emit.user('processed')"}
 }
 ```
 
-Works in JSON because it's a regular node with a string `function_template` field. No serialization of Python objects needed.
+Works in JSON because it's a regular node with a string `data.function_template` field. Put it under `data`: `validate_graph()` also accepts a top-level `function_template`, but `create_node()` only reads `data`, so a top-level template passes validation and then runs empty. No serialization of Python objects needed.
 
 ### 2. EdgeHookConfig (`edges[].hooks`)
 
@@ -68,6 +68,6 @@ These patterns cannot be expressed in JSON:
 
 ## NodeInner Hook Propagation
 
-**Status**: ✅ Implemented (`NodeInner.py:143-171`).
+**Status**: ✅ Implemented (`NodeInner.py`).
 
 `NodeInner` propagates hooks to child graphs by creating a child `HookRegistry` with identity copied from the parent. When building from JSON, this works automatically if the inner graph's `AgentFlowModel.hooks` is set programmatically.

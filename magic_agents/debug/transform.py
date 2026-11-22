@@ -8,6 +8,7 @@ or otherwise modify debug events before they are emitted.
 from __future__ import annotations
 
 import copy
+import re
 from typing import Any, Dict, List, Optional, Protocol, Set, runtime_checkable
 
 from .events import DebugEvent, DebugEventType, DebugEventSeverity
@@ -193,7 +194,7 @@ class RedactTransformer:
     SENSITIVE_KEYS = {
         "api_key", "apikey", "api-key",
         "private_key", "privatekey", "private-key",
-        "authorization", "auth",
+        "authorization", "auth", "oauth",
         "password", "passwd", "pwd",
         "token", "access_token", "refresh_token",
         "bearer", "secret", "credential", "credentials",
@@ -255,12 +256,29 @@ class RedactTransformer:
                 result.append(item)
         return result
     
+    # Short patterns that only count as a whole word: "author" is not "auth".
+    WHOLE_WORD_KEYS = frozenset({"auth", "pwd"})
+
     def _is_sensitive_key(self, key: Any) -> bool:
-        """Check if a key matches any sensitive pattern."""
+        """Check if a key matches any sensitive pattern.
+
+        Matching is by substring (fail-safe), except that usage counters such as
+        ``prompt_tokens``/``maxTokens`` are not secrets under the bare
+        ``token`` pattern and ``WHOLE_WORD_KEYS`` must be a whole word.
+        """
         if not isinstance(key, str):
             return False
         key_lower = key.lower()
-        return any(sensitive in key_lower for sensitive in self._sensitive_keys)
+        words = re.split(r"[^a-z0-9]+", re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key).lower())
+        for sensitive in self._sensitive_keys:
+            if sensitive not in key_lower:
+                continue
+            if sensitive in self.WHOLE_WORD_KEYS and sensitive not in words:
+                continue
+            if sensitive == "token" and all(word == "tokens" for word in words if "token" in word):
+                continue
+            return True
+        return False
 
 
 class FilterTransformer:
@@ -572,6 +590,7 @@ def create_default_pipeline(
     redact: bool = True,
     min_severity: DebugEventSeverity = DebugEventSeverity.DEBUG,
     max_length: int = 1000,
+    additional_redact_keys: Optional[Set[str]] = None,
 ) -> TransformPipeline:
     """
     Create a pipeline with common defaults.
@@ -580,6 +599,7 @@ def create_default_pipeline(
         redact: Whether to redact sensitive data
         min_severity: Minimum severity to include
         max_length: Maximum string length before truncation
+        additional_redact_keys: Extra key patterns to redact (``DebugConfig``)
         
     Returns:
         Configured TransformPipeline
@@ -587,7 +607,7 @@ def create_default_pipeline(
     pipeline = TransformPipeline()
     
     if redact:
-        pipeline.add(RedactTransformer())
+        pipeline.add(RedactTransformer(additional_keys=additional_redact_keys))
     
     pipeline.add(FilterTransformer(min_severity=min_severity))
     pipeline.add(TruncateTransformer(max_length=max_length))

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`CallbackEmitter` is a small module-level callback registry in `magic_agents/agt_flow.py:93-117`. It lets host applications register synchronous callbacks for selected structured debug events emitted by the reactive executors.
+`CallbackEmitter` is a small module-level callback registry in `magic_agents/agt_flow.py`. It lets host applications register synchronous callbacks for selected structured debug events emitted by the reactive executors.
 
 This is **not** the main hook system. It is a compatibility/debug bridge for external consumers that need coarse execution lifecycle events without implementing `FlowHooks`.
 
@@ -36,8 +36,8 @@ The current source only calls `CallbackEmitter.emit()` from the reactive executo
 
 | Event | Source |
 | --- | --- |
-| `GRAPH_START` | `execute_graph_reactive()` (`reactive_executor.py:417-432`) and `execute_graph_loop_reactive()` (`reactive_executor.py:869-884`) |
-| `GRAPH_END` | `execute_graph_reactive()` completion path (`reactive_executor.py:771-784`) |
+| `GRAPH_START` | `execute_graph_reactive()` (`reactive_executor.py`) and `execute_graph_loop_reactive()` (`reactive_executor.py`) |
+| `GRAPH_END` | `execute_graph_reactive()` completion path (`reactive_executor.py`) |
 
 Other debug events such as `NODE_START`, `NODE_END`, `LLM_GENERATION`, `TOOL_CALL`, `TOOL_RESULT`, `ITERATION_START`, `ITERATION_END`, `SUBGRAPH_START`, and `SUBGRAPH_END` can be yielded by nodes/executors or delivered through the debug observer/callback system, but they are **not currently dispatched through `agt_flow.CallbackEmitter.emit()` unless code explicitly calls it**.
 
@@ -45,7 +45,7 @@ Other debug events such as `NODE_START`, `NODE_END`, `LLM_GENERATION`, `TOOL_CAL
 
 | Concern | `CallbackEmitter` | `GraphPersistenceHook` |
 | --- | --- | --- |
-| File | `magic_agents/agt_flow.py:93-117` | `magic_agents/hooks/persistence.py:76-370` |
+| File | `magic_agents/agt_flow.py` | `magic_agents/hooks/persistence.py` |
 | Protocol | Module-level synchronous callback registry | `FlowHooks` async implementation |
 | Registration | `CallbackEmitter.register(callback)` | `RuntimeConfig.enable_persistence(sink)` / registry auto-wiring |
 | Scope | Coarse debug event envelopes emitted manually by executor code | Graph/node/LLM/tool lifecycle via `HookRegistry` and `HookRelay` |
@@ -56,7 +56,7 @@ Use `GraphPersistenceHook` for durable execution-tree persistence. Use `Callback
 
 ## Relationship to Debug CallbackEmitter
 
-There is also a separate `magic_agents.debug.emitter.CallbackEmitter` class. That one is an instance-based debug emitter for `DebugEvent` objects and supports sync/async callbacks (`debug/emitter.py:405-442`). Do not confuse it with `magic_agents.agt_flow.CallbackEmitter`, which is module-level and receives raw debug-event dictionaries.
+There is also a separate `magic_agents.debug.emitter.CallbackEmitter` class. That one is an instance-based debug emitter for `DebugEvent` objects and supports sync/async callbacks (`debug/emitter.py`). Do not confuse it with `magic_agents.agt_flow.CallbackEmitter`, which is module-level and receives raw debug-event dictionaries.
 
 ## Limitations
 

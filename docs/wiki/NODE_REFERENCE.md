@@ -8,7 +8,7 @@ Current runtime node count: 21.
 
 | Type | Purpose | Detail page |
 | --- | --- | --- |
-| `user_input` | Inject user text/files/images and create chat/thread IDs | [../nodes/user_input.md](../nodes/user_input.md) |
+| `user_input` | Inject user text/files/images/extras; apply a configured `session_id` or reuse caller-supplied chat/thread IDs (it never generates IDs) | [../nodes/user_input.md](../nodes/user_input.md) |
 | `text` | Emit static text | [../nodes/text.md](../nodes/text.md) |
 | `constant` | Emit a typed primitive constant value | [../nodes/constant.md](../nodes/constant.md) |
 | `parser` | Render a Jinja2 template from inputs | [../nodes/parser.md](../nodes/parser.md) |
@@ -23,7 +23,7 @@ Current runtime node count: 21.
 | `inner` | Execute a nested graph | [../nodes/inner.md](../nodes/inner.md) |
 | `end` | Terminal completion node | [../nodes/end.md](../nodes/end.md) |
 | `void` | Internal sink node | [../nodes/void.md](../nodes/void.md) |
-| `python_exec` | Expose a Python execution tool or run `data.code` as a graph node | [../nodes/python_exec.md](../nodes/python_exec.md) |
+| `python_exec` | Run `data.code` as a graph node, or expose a Python tool (model-written code without `code`; fixed `code` with `tool_mode: true`) | [../nodes/python_exec.md](../nodes/python_exec.md) |
 | `mcp` | Discover MCP tools and expose an `MCPToolBundle` | [../nodes/mcp.md](../nodes/mcp.md) |
 | `node_tool` | Provide a raw schema-only OpenAI function tool for client-side execution | [../nodes/tool.md](../nodes/tool.md) |
 | `memory` | Background-extract memories, store embeddings, and inject relevant context via vector similarity | [../nodes/memory.md](../nodes/memory.md) |

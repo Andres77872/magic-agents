@@ -1,3 +1,5 @@
+import sys
+from types import ModuleType
 from typing import List, Dict, Tuple, Optional, Any
 
 import networkx as nx
@@ -101,6 +103,25 @@ class NodeMcpProxy(metaclass=_NodeMcpProxyMeta):
         return get_node_mcp()(*args, **kwargs)
 
 NodeMcp = NodeMcpProxy
+
+
+class _NodeSystemModule(type(sys.modules[__name__])):
+    """Keep ``magic_agents.node_system.NodeMcp`` the class-like proxy.
+
+    Importing the ``NodeMcp`` submodule makes the import system set the package
+    attribute of the same name to the module, so ``from magic_agents.node_system
+    import NodeMcp`` would return a module (and ``isinstance`` checks would
+    raise) once any MCP node had been created. The submodule stays reachable
+    through ``sys.modules`` and ``import magic_agents.node_system.NodeMcp``.
+    """
+
+    def __setattr__(self, name, value):
+        if name == "NodeMcp" and isinstance(value, ModuleType):
+            return
+        super().__setattr__(name, value)
+
+
+sys.modules[__name__].__class__ = _NodeSystemModule
 
 
 def build_graph(edges: List[Dict]) -> nx.DiGraph:
@@ -311,7 +332,11 @@ def arrange_with_sizes(
     
     # Handle disconnected nodes (nodes not in graph edges)
     node_ids_in_graph = set(graph.nodes())
-    disconnected_nodes = all_node_ids - node_ids_in_graph
+    # Authored order, not set order: set iteration over strings depends on the
+    # per-process hash seed, so positions changed between runs.
+    disconnected_nodes = list(dict.fromkeys(
+        n.get('id') for n in nodes if n.get('id') not in node_ids_in_graph
+    ))
     
     # Position disconnected nodes after the main graph
     offset = layer_distance

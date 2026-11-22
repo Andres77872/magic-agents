@@ -28,6 +28,24 @@ Execute a nested graph from inside a parent graph.
 - merges client extras with parent state exposure
 - exposes full parent state as `parent_state` by default, or mapped keys via `parent_state_mapping`
 
+## Tool mode
+
+With `tool_mode: true` the node does not run its sub-flow when the graph
+reaches it. It emits a tool on `handle-tool-definition` (rename with
+`handles.tool`) that an `llm` node can call; each call runs the sub-flow with
+the model's arguments and returns its terminal result.
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `tool_mode` | `false` | Expose the sub-flow as an LLM tool. |
+| `tool_name` | `"run_flow"` | Function name shown to the model. |
+| `tool_description` | `"Run the configured flow with structured arguments and return its terminal result."` | Function description. |
+| `tool_parameters` | `null` | JSON Schema of the arguments. |
+| `tool_timeout` | `30` | Seconds per tool call (finite, > 0). |
+
+The child graph must contain an `end` node (it provides the result), or the
+model is rejected at build.
+
 ## Failures
 
 The sub-flow fails when one of its nodes ends in `ERROR`: it raised, it timed out waiting for inputs, or it emitted `__bypass_all__`. This is decided from child node state (the executor's result sink), not from diagnostic frames: a child that emits a non-fatal diagnostic and still completes, for example a `JSONParseError` that an `onFinish` Hook recovers, leaves the sub-flow successful and its Result is delivered.

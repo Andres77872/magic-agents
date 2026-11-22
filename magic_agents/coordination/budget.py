@@ -16,6 +16,7 @@ from typing import Callable
 from uuid import uuid4
 
 from magic_agents.models.coordination import CoordinationLimits
+from magic_agents.util.aio import wait_for
 
 
 class BudgetError(RuntimeError):
@@ -223,7 +224,7 @@ class WorkgroupBudget:
                     raise BudgetError("operation_exists", "An already admitted physical operation cannot dispatch again")
                 self._check_capacity(estimate, kind)
                 if self._has_slot(kind): break
-                try: await asyncio.wait_for(self.condition.wait(), timeout=max(0, self.deadline - self.clock()))
+                try: await wait_for(self.condition.wait(), timeout=max(0, self.deadline - self.clock()))
                 except TimeoutError: raise BudgetError("deadline_exceeded", "Deadline expired while awaiting compute admission") from None
             self._shared.journal[operation_id] = _Reservation(self, estimate, kind)
             if credit is not None: self._shared.tool_operation_dispatches.add(credit)
@@ -284,7 +285,7 @@ class WorkgroupBudget:
                     for scope in self._path: scope._totals.active_jobs += 1
                     self.condition.notify_all()
                     return
-                try: await asyncio.wait_for(self.condition.wait(), timeout=max(0, self.deadline - self.clock()))
+                try: await wait_for(self.condition.wait(), timeout=max(0, self.deadline - self.clock()))
                 except TimeoutError: continue
 
     def rollback_unaccepted_job_locked(self, operation_id: str):

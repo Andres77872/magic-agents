@@ -103,7 +103,10 @@ def estimate_tokens(
             for part in content:
                 if isinstance(part, dict):
                     if part.get("type") == "text":
-                        total += len(encoding.encode(part.get("content", "")))
+                        # ModelChat / OpenAI text parts carry "text"; "content"
+                        # is accepted for older callers.
+                        text = part.get("text") or part.get("content") or ""
+                        total += len(encoding.encode(text))
                     elif part.get("type") == "image_url":
                         total += _estimate_image_tokens(part)
 

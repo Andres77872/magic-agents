@@ -17,9 +17,19 @@ import time
 import uuid
 from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Tuple, Union
 from datetime import datetime, UTC
+from magic_agents.util.aio import wait_for
 
 # Loop execution constants
 DEFAULT_MAX_ITERATIONS = 100
+
+
+class InputWaitTimeout(asyncio.TimeoutError):
+    """A node's inputs did not arrive within the graph (or coordination) budget.
+
+    Distinct from a ``TimeoutError`` raised by the node's own work (an HTTP or
+    tool timeout), which is an ordinary node failure with its own message,
+    error code and retryability.
+    """
 DEFAULT_ITERATION_TIMEOUT_MS = 30000
 DEFAULT_TOTAL_TIMEOUT_MS = 300000
 
@@ -430,15 +440,6 @@ async def execute_graph_reactive(
         from magic_agents.coordination.invocation import invocation_runtime
         coordination_parent = invocation_runtime(graph)
     require_runtime_coordination(graph, coordination_parent)
-    coordination_scope = None
-    if coordination_parent is not None:
-        from magic_agents.coordination.context import CoordinationRuntime
-        if isinstance(coordination_parent, CoordinationRuntime):
-            coordination_scope = coordination_parent.enter_graph(graph)
-        else:
-            coordination_scope = coordination_parent.runtime.enter_graph(
-                graph, parent=coordination_parent, path=coordination_parent.path)
-
     # Check for validation errors — fail fast on blocking errors before starting execution
     if hasattr(graph, '_validation_errors') and graph._validation_errors:
         # Only block on structural graph errors that make execution impossible.
@@ -463,6 +464,17 @@ async def execute_graph_reactive(
             _fill_result(result, has_errors=True, summary=None)
             return
 
+    # Enter the coordination scope only once the graph can run: a blocking
+    # validation error must not leave an admitted scope open.
+    coordination_scope = None
+    if coordination_parent is not None:
+        from magic_agents.coordination.context import CoordinationRuntime
+        if isinstance(coordination_parent, CoordinationRuntime):
+            coordination_scope = coordination_parent.enter_graph(graph)
+        else:
+            coordination_scope = coordination_parent.runtime.enter_graph(
+                graph, parent=coordination_parent, path=coordination_parent.path)
+
     # Phase 4: Wire persistence and debug hooks into existing HookRegistry.
     # Must happen BEFORE the loop detection (which may early-return to loop executor)
     # so that loop graphs also receive auto-wired hooks on the shared registry.
@@ -484,14 +496,15 @@ async def execute_graph_reactive(
             from magic_agents.coordination.service import CoordinationError
             raise CoordinationError('unsupported_coordination_topology', 'Loop scheduling cannot discard an inherited coordination authority')
         logger.info("Detected loop nodes: %s. Delegating to loop executor.", loop_nodes)
-        async for msg in execute_graph_loop_reactive(
+        async with aclosing(execute_graph_loop_reactive(
             graph, id_chat=id_chat, id_thread=id_thread, id_user=id_user,
             extras=extras, flow_state=flow_state,
             run_id=run_id, parent_run_id=parent_run_id,
             hooks=hooks, debug_callback=debug_callback,
             result=result,
-        ):
-            yield msg
+        )) as _relayed:
+            async for msg in _relayed:
+                yield msg
         return
     
     nodes = graph.nodes
@@ -632,7 +645,10 @@ async def execute_graph_reactive(
         try:
             if coordination_scope is not None and tracker.node_id in coordination_scope.withheld_descendants:
                 remaining = max(0, coordination_scope.budget.deadline - coordination_scope.budget.clock())
-                return await asyncio.wait_for(asyncio.shield(ready_task), timeout=remaining)
+                try:
+                    return await wait_for(asyncio.shield(ready_task), timeout=remaining)
+                except asyncio.TimeoutError as exc:
+                    raise InputWaitTimeout() from exc
             while True:
                 if tracker.is_ready:
                     return tracker.should_execute
@@ -664,7 +680,7 @@ async def execute_graph_reactive(
                             idle_task.cancel()
                         await asyncio.gather(idle_task, return_exceptions=True)
                 elif dispatcher.timeout is not None and elapsed >= dispatcher.timeout:
-                    raise asyncio.TimeoutError
+                    raise InputWaitTimeout()
         finally:
             if not ready_task.done():
                 ready_task.cancel()
@@ -749,6 +765,8 @@ async def execute_graph_reactive(
                 dispatcher.set_state(node_id, NodeState.BYPASSED)
                 node.mark_bypassed()
                 logger.debug("Node %s bypassed", node_id)
+                # It will never emit: release consumers waiting on its edges.
+                await dispatcher.bypass_outgoing_edges(node_id)
                 
                 # Notify observer (executor-owned hook)
                 if observer_registry.is_active:
@@ -897,7 +915,7 @@ async def execute_graph_reactive(
             if coordination_scope is not None and dispatcher.get_state(node_id) == NodeState.COMPLETED:
                 coordination_scope.record_completed(node)
         
-        except asyncio.TimeoutError as e:
+        except InputWaitTimeout as e:
             if coordination_scope is not None:
                 await coordination_scope.terminate(node_id, state="timed_out", reason="input_deadline_exceeded")
             dispatcher.set_state(node_id, NodeState.ERROR)
@@ -1045,7 +1063,7 @@ async def execute_graph_reactive(
     try:
         while True:
             try:
-                item = await asyncio.wait_for(output_queue.get(), timeout=1.0)
+                item = await wait_for(output_queue.get(), timeout=1.0)
                 if item is None:
                     break
                 yield item
@@ -1574,21 +1592,23 @@ async def execute_graph_loop_reactive(
             hook_node._response = None
             hook_node.outputs.clear()
             try:
-                async for hook_output in execute_node_inline(
+                async with aclosing(execute_node_inline(
                     hook_node_id,
                     edges_to_process=[],
-                ):
-                    yield hook_output
+                )) as _relayed:
+                    async for hook_output in _relayed:
+                        yield hook_output
                 # Hook outputs may have their own attached Hooks. Those events
                 # follow the same ordering even though input resolution above
                 # was intentionally skipped for this edge-owned invocation.
-                async for hook_output in execute_traversed_edge_hooks(
+                async with aclosing(execute_traversed_edge_hooks(
                     hook_node_id,
                     hook_node.outputs,
                     all_edges,
                     ignored_edge_ids,
-                ):
-                    yield hook_output
+                )) as _relayed:
+                    async for hook_output in _relayed:
+                        yield hook_output
             finally:
                 running_edge_hooks.remove(hook_node_id)
 
@@ -1696,13 +1716,14 @@ async def execute_graph_loop_reactive(
                     return
                 mark_completed(node_id)
 
-                async for hook_output in execute_traversed_edge_hooks(
+                async with aclosing(execute_traversed_edge_hooks(
                     node_id,
                     node.outputs,
                     edges_for_inputs,
                     ignored_edge_ids,
-                ):
-                    yield hook_output
+                )) as _relayed:
+                    async for hook_output in _relayed:
+                        yield hook_output
 
     # Track bypassed nodes during static phase
     bypassed_nodes: Set[str] = set()
@@ -2032,12 +2053,13 @@ async def execute_graph_loop_reactive(
                 continue
 
         # Execute the node
-        async for out in execute_node_inline(
+        async with aclosing(execute_node_inline(
             node_id,
             static_edges,
             ignored_edge_ids=bypassed_edge_ids,
-        ):
-            yield out
+        )) as _relayed:
+            async for out in _relayed:
+                yield out
 
         if node_id in current_failed_node_ids:
             propagate_failure_bypass(
@@ -2180,7 +2202,7 @@ async def execute_graph_loop_reactive(
         logger.debug("Feedback node: %s", feedback_node_id)
         
         # Get loop configuration (with defaults)
-        max_iterations = getattr(loop_node, 'max_iterations', DEFAULT_MAX_ITERATIONS)
+        max_iterations = getattr(loop_node, 'max_iterations', None) or DEFAULT_MAX_ITERATIONS
         
         loop_agg = []
         start_time = time.time()
@@ -2322,13 +2344,14 @@ async def execute_graph_loop_reactive(
             loop_node.outputs[loop_node.OUTPUT_HANDLE_ITEM] = prepare_item_output(item, idx)
             item_edges_traversed = True
             
-            async for hook_output in execute_traversed_edge_hooks(
+            async with aclosing(execute_traversed_edge_hooks(
                 loop_id,
                 loop_node.outputs,
                 item_edges,
                 iteration_bypassed_edges,
-            ):
-                yield hook_output
+            )) as _relayed:
+                async for hook_output in _relayed:
+                    yield hook_output
 
             # Deliver the original item only after attached Hooks have finished.
             for edge in item_edges:
@@ -2401,12 +2424,13 @@ async def execute_graph_loop_reactive(
                             apply_phase_input(edge, source_node, node)
                 
                 # Execute the node and WAIT for completion
-                async for out in execute_node_inline(
+                async with aclosing(execute_node_inline(
                     node_id,
                     all_edges,
                     ignored_edge_ids=iteration_bypassed_edges,
-                ):
-                    yield out
+                )) as _relayed:
+                    async for out in _relayed:
+                        yield out
 
                 if node_id in current_failed_node_ids:
                     propagate_failure_bypass(
@@ -2549,13 +2573,14 @@ async def execute_graph_loop_reactive(
         if _core_loop is not None:
             await _core_loop.post()
 
-        async for hook_output in execute_traversed_edge_hooks(
+        async with aclosing(execute_traversed_edge_hooks(
             loop_id,
             loop_node.outputs,
             end_edges,
             bypassed_edge_ids,
-        ):
-            yield hook_output
+        )) as _relayed:
+            async for hook_output in _relayed:
+                yield hook_output
         
         # Clear response for end nodes so they execute
         for edge in end_edges:
@@ -2670,11 +2695,12 @@ async def execute_graph_loop_reactive(
         node.outputs.clear()
         
         # Execute the node - execute_node_inline will apply inputs from all_edges
-        async for out in execute_node_inline(
+        async with aclosing(execute_node_inline(
             node_id,
             ignored_edge_ids=bypassed_edge_ids,
-        ):
-            yield out
+        )) as _relayed:
+            async for out in _relayed:
+                yield out
 
         if node_id in current_failed_node_ids:
             propagate_failure_bypass(

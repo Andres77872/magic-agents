@@ -15,7 +15,7 @@ Satisfies the VectorDB Protocol (structural subtyping) with:
 import asyncio
 import logging
 import math
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Awaitable, Callable, Optional
 
 from magic_agents.models.factory.Nodes.MemoryNodeModel import MemoryEntry
@@ -188,7 +188,7 @@ class InMemoryVectorDB:
                     created_at=(
                         datetime.fromisoformat(meta["created_at"])
                         if "created_at" in meta
-                        else datetime.now()
+                        else datetime.now(UTC)
                     ),
                     source_id=meta.get("doc_id"),  # NEW: populate from stored doc_id
                 ))

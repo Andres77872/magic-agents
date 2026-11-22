@@ -19,6 +19,10 @@ Execute a user-defined Python function template at a lifecycle point in graph ex
 | `lifecycle_event` | `string or null` | Optional | `null` | `onStart`, `onDeliver`, `onError`, `onFinish`, or `onCancel`; null retains the connection observer |
 | `target_node_id` | `string or null` | Optional | `null` | Node scope; otherwise use the enabled edge attachment |
 | `failure_policy` | `string` | Optional | `"preserve"` | `preserve` current request/outcome or `fail` when a control fails |
+| `hook_mode` | `string` | Optional | `"python"` | `python` runs `function_template`; `messages` makes the Hook the coordination messaging binding for its targets |
+| `target_node_ids` | `array or null` | Optional | `null` | Several target nodes (alternative to `target_node_id`) |
+| `messaging_engine` | `string` | Optional | `"in_memory"` | `messages` mode: `in_memory` or `db_persistence` (needs an integrated core storage adapter) |
+| `messaging_by_target` | `object or null` | Optional | `null` | `messages` mode: per-target `messaging` config (`enabled`, `role`, `peers`, …) keyed by target node id |
 
 ## Lifecycle controls
 
@@ -32,7 +36,7 @@ Wire `handle-child-call` (alias `handles.child_call`) to the child's data input.
 
 Controls are awaited. For controlled ordinary nodes, processor output is buffered until finish controls complete; nodes without controls keep their existing streaming behavior. Pass preserves unchanged operational values, including client objects and tool definitions. Hook code has a fresh execution namespace per invocation. The existing observer registry remains responsible for run persistence and accounting.
 
-Real integration coverage lives in `test/test_lifecycle_hook_fallback.py` and `test/test_lifecycle_delivery.py`, with `magic-llm/test/test_tool_executor_invocation_controls.py` checking that caching cannot skip per-call controls. These use the actual node classes and tool loop; the HTTP integration test uses a loopback server.
+Real integration coverage lives in `tests/hooks/lifecycle/test_fallback.py` and `tests/hooks/lifecycle/test_delivery.py`, with `magic-llm/test/test_tool_executor_invocation_controls.py` checking that caching cannot skip per-call controls. These use the actual node classes and tool loop; the HTTP integration test uses a loopback server.
 
 ## Existing connection observer
 

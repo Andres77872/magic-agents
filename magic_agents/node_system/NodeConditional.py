@@ -9,6 +9,7 @@ import uuid
 from typing import Any, Dict, AsyncGenerator, Optional, List
 
 import jinja2
+from jinja2.sandbox import SandboxedEnvironment
 from jinja2 import UndefinedError, TemplateSyntaxError, TemplateError
 
 from magic_agents.node_system.Node import Node
@@ -19,6 +20,7 @@ from magic_agents.execution.condition_evaluator_llm import build_judgment_chat, 
 from magic_agents.execution.condition_evaluator_jev import evaluate_jev
 from magic_agents.execution.condition_judgment_contract import validate_judgment_answers
 from magic_agents.util.llm_usage import usage_detail_outputs
+from magic_agents.util.aio import wait_for
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +149,7 @@ class NodeConditional(Node):
         # Pre-compile template for efficiency (only if condition is valid)
         # This is kept for backward compatibility — the evaluator handles actual evaluation.
         if self.condition_template:
-            env = jinja2.Environment()
+            env = SandboxedEnvironment()
             self._template = env.from_string(self.condition_template)
         else:
             self._template = None
@@ -201,7 +203,7 @@ class NodeConditional(Node):
             options['provider_attempt_control'] = scope.attempt_control(self.node_id)
         dispatch = scope.dispatch_session(self.node_id) if scope is not None and client is None else None
         try:
-            response = await asyncio.wait_for(
+            response = await wait_for(
                 client.llm.async_generate(chat, **options) if client is not None else
                     evaluate_jev(render_ctx, self.questions, self.jev, timeout=self.evaluation_timeout,
                                  **({'dispatch_session': dispatch} if dispatch is not None else {})),

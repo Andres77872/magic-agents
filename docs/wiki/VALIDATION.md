@@ -10,6 +10,13 @@ This page documents what the current code validates and what it does not.
 2. duplicate edges by `(source, target, sourceHandle, targetHandle)`
 3. missing source/target nodes
 4. self-loop edges
+5. Fetch request templates (`FetchTemplateValidationError`)
+6. Hook `function_template` code (`HookValidationError`)
+7. edge `hooks.hook_node_id` must reference an existing `hook` node, with at most one enabled edge per Hook
+8. lifecycle Hook bindings (`validate_lifecycle_hooks`)
+
+Before it, `build()` also runs `require_valid_coordination()` (a malformed
+`coordination` block raises) and `validate_skills_topology()`.
 
 Invalid source/target edges and self-loops are also filtered before sorting/build continues.
 
@@ -61,7 +68,7 @@ These results are attached to the built graph and emitted by the executor.
 
 `AgentFlowModel.contract_config` supports:
 
-- `off` — skip contract validation entirely
+- `off` — skip the contract validation chain (`run_all_validations`); the conditional-edge and source-handle checks still run in every mode
 - `shadow` — compute diagnostics and attach the report, but do not surface them
 - `warn` — compute diagnostics and surface them as warnings/log output (default)
 - `strict` — declared on the model surface, but strict enforcement is still partially deferred in follow-up work
@@ -72,7 +79,7 @@ These results are attached to the built graph and emitted by the executor.
 
 The executors emit `_validation_errors` as `debug` events.
 
-Only blocking structural errors with `error_type == "GraphValidationError"` abort execution immediately.
+Only blocking errors abort execution immediately: `error_type` (or `type`) `GraphValidationError`, `HookValidationError` or `FetchTemplateValidationError`. Every other validation error, including `LegacyHandleRejected`, is reported as a `debug` event and the run continues.
 
 Conditional routing validation issues do **not** automatically abort execution. They can still surface as runtime bypass/routing behavior.
 
@@ -96,5 +103,3 @@ That means older claims like "all cycles abort execution" are stale.
 - do not author arbitrary cycles
 - use `loop` for supported iteration semantics
 - treat non-loop cycle handling as a documented limitation, not a supported feature
-
-See [../issues/cycle-behavior-and-doc-drift.md](../issues/cycle-behavior-and-doc-drift.md).

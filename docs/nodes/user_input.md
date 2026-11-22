@@ -23,7 +23,7 @@ Entry node that injects the initial user message and optional files, images, and
 - mirrors configured `session_id` into `chat_log.id_thread` when no thread ID is already present
 - resolves text from `text`, `content`, or `message`
 - normalizes legacy scalar `files` and `images` values to one-item lists
-- passes `extras` through only when present
+- always yields `handle_client_extras`, `{}` when no extras were supplied
 
 ## Common fields
 

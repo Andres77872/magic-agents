@@ -35,7 +35,7 @@ Handle overrides are supported via `handles` dict:
 |-------|------|----------|---------|-------------|
 | `instructions` | `string` | Optional | `null` | LLM extraction prompt template. When `null`, only vector search is performed (no LLM extraction). When set, NodeMemory uses this as the system prompt for the extraction LLM call. |
 | `memory_entries` | `array` | Optional | `[]` | Seed memory entries (array of `MemoryEntry` objects). This is a seed/export snapshot only — the vector DB is the source of truth for runtime search. |
-| `top_k` | `integer` | Optional | `5` | Number of top memory matches to retrieve from vector search. Valid range: 1–50. Configurable per graph in JSON (see [Graph wiring](#graph-wiring)). |
+| `top_k` | `integer` | Optional | `5` | Number of top memory matches to retrieve from vector search. Valid range: 1–50. Configurable per graph in JSON (see [Configuring `top_k`](#configuring-top_k-in-graph-json)). |
 | `context_messages_count` | `integer` | Optional | `5` | Number of previous chat/history messages to include in the extraction prompt. Valid range: 0-100. This affects extraction only, not vector search. |
 
 ### `MemoryEntry` sub-model fields
@@ -65,7 +65,7 @@ NodeMemory currently executes six logical phases with fail-open behavior:
 | **1 - Input** | Get user message from `handle_memory_input` and optional MagicLLM client from `handle-client-provider`. If no message is present, yield an empty passthrough. | N/A |
 | **2 - Background extraction** | If `instructions` and a MagicLLM client are available, start `asyncio.create_task(...)` for extraction. The prompt includes the system instructions, up to `context_messages_count` injected history messages, and the current message. | Log warning in the background task; current invocation continues. |
 | **3 - Background embedding + upsert** | The background task embeds extracted memories with injected `embedding_client.llm.async_embedding(...)` and upserts them into the vector DB with a UUID4 `doc_id` stored in metadata. | Log warning and skip that memory/batch. |
-| **4 - Vector search** | If an injected `embedding_client` is available, embed the current message and call `vector_db.search(..., top_k=top_k, filter_scope={"session_id": str(chat_log.id_chat) or "", "node_id": self.node_id or ""})`. | Log warning and use the original message unchanged. |
+| **4 - Vector search** | If an injected `embedding_client` is available, embed the current message and call `vector_db.search(..., top_k=top_k, filter_scope={"session_id": str(chat_log.id_chat) or "", "node_id": <scope node id>})`. | Log warning and use the original message unchanged. |
 | **5 - Injection** | Sort returned matches by `created_at` ascending, wrap each as `<memory_content>{content}</memory_content>`, and prepend them to the current user message. | Use the original message unchanged. |
 | **6 - Yield** | Emit the final text on `handle_memory_output`. | N/A |
 
@@ -80,9 +80,13 @@ Every `search()` call enforces a compound key filter:
 ```python
 filter_scope = {
     "session_id": chat_log.id_chat,  # From ModelAgentRunLog
-    "node_id": self.node_id,          # From Node base class
+    "node_id": self._scope_node_id,   # the node id; inside nested graphs a JSON-Pointer path
 }
 ```
+
+The scope id is the node id at the top level. Inside an `inner` sub-flow it is
+the node's JSON-Pointer path from the root graph, so two sub-flows that reuse a
+node id do not share memories.
 
 - Two NodeMemory nodes with different `node_id` values produce independent search results within the same chat session.
 - The same NodeMemory node across different chat sessions produces independent search results.
@@ -210,12 +214,7 @@ For development or testing environments where data loss is acceptable, no rebuil
 Add the `top_k` field to the memory node's `data` object to control how many memory entries are retrieved on each invocation:
 
 ```json
-{
-  "nodes": [
-    {"id": "memory-1", "type": "memory", "data": {"top_k": 10, "memory_entries": []}},
-    ...
-  ]
-}
+{"id": "memory-1", "type": "memory", "data": {"top_k": 10, "memory_entries": []}}
 ```
 
 Valid values: `1` through `50`. Default: `5` (when `top_k` is absent from JSON).
@@ -288,8 +287,7 @@ Distinct handles prevent competing-edge race:
 
 ## Testing
 
-- **Unit tests**: `test/test_node_memory_process.py` — covers process paths, fail-open scenarios, scope isolation, background extraction context, `top_k` defaults/boundaries, `source_id` roundtrip, handle overrides, and `_capture_internal_state`.
-- **Integration tests**: `test/test_node_memory_integration.py` (11 tests) — full graph execution with mocked vector DB and LLM client, client provider sharing, graph validation, `run_agent(deps=...)` injection (vector_db + embedding_client).
-- **Vector DB tests**: `test/test_qdrant_vector_db.py` (14 tests) — `QdrantVectorDB` wrapper unit tests using `QdrantClient(location=":memory:")` (skip-guarded if `qdrant-client` is not installed), including `source_id` roundtrip and UUID-formatted ID acceptance.
+- **Tests**: `tests/nodes/memory/` covers the process path with fakes (`test_memory_process.py`), real `build()` + `run_agent()` graphs (`test_memory_integration.py`), the client edge contract and path-scoped deps; node construction is in `tests/graph/test_create_node.py` and coordination/lifecycle-hook cases in `tests/coordination/test_dispatch.py` and `tests/hooks/lifecycle/test_validation.py`.
+- Qdrant: `tests/vector_storage/test_qdrant_vector_db.py` runs when the `qdrant` extra is installed (it skips otherwise); `test_qdrant_optional_dependency.py` always checks the install hint.
 - **Production vector storage**: `magic_agents.vector_storage.InMemoryVectorDB` — production-grade ephemeral storage with `asyncio.Lock` concurrency safety, validated `MemoryEntry` reconstruction, and dimension-mismatch guards. `magic_agents.vector_storage.QdrantVectorDB` — optional Qdrant wrapper (requires the `qdrant` extra).
-- **Fixtures**: `mock_magic_embedding` (deterministic SHA256-based 8-dim unit vector) and `in_memory_vector_db` (fresh `InMemoryVectorDB` from `magic_agents.vector_storage`) in `test/conftest.py`.
+- **Fixtures**: `in_memory_vector_db` (fresh `InMemoryVectorDB`) and `mock_magic_llm` (patches the client node's `MagicLLM` constructor) in `tests/conftest.py`.

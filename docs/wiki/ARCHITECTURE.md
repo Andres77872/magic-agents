@@ -20,17 +20,22 @@ This page documents the current build-side architecture from the codebase.
 ```mermaid
 flowchart TD
   A[raw graph dict] --> B[normalize content wrapper]
-  B --> C[resolve env placeholders]
-  C --> D[validate_graph]
-  D --> E[filter invalid/self-loop edges]
-  E --> F[auto-assign tool handles]
-  F --> G[sort nodes and edges]
-  G --> H[inject internal void node]
-  H --> I[instantiate node classes]
-  I --> J[build inner graphs]
-  J --> K[instantiate AgentFlowModel]
-  K --> L[conditional + contract validation]
-  L --> M[attach validation report]
+  B --> C[require_valid_coordination]
+  C --> D[private deep copy]
+  D --> E[resolve env placeholders in MCP connection fields]
+  E --> F[drop JSON 'hooks' key with a warning]
+  F --> G[validate_skills_topology]
+  G --> H[validate_graph]
+  H --> I[filter invalid/self-loop edges]
+  I --> J[auto-assign tool handles + edge ids]
+  J --> K[sort nodes and edges]
+  K --> L[inject internal void node; missing targetHandle -> handle-void]
+  L --> M[instantiate node classes]
+  M --> N[build inner graphs]
+  N --> O[ConditionalEdgeValidator + validate_edge_handles]
+  O --> P[instantiate AgentFlowModel]
+  P --> Q[contract validation chain unless mode is off]
+  Q --> R[attach validation report]
 ```
 
 ## Build details worth knowing
@@ -60,29 +65,33 @@ Other Jinja-like placeholders such as `{{ handle_user_message }}` are preserved 
 - no duplicate edges with the same `(source, target, sourceHandle, targetHandle)`
 - existing source/target node references
 - self-loop detection
+- Fetch request templates (`FetchTemplateValidationError`)
+- Hook `function_template` code (`HookValidationError`)
+- edge `hooks.hook_node_id` references an existing `hook` node, with at most one enabled edge per Hook
+- lifecycle Hook bindings (`validate_lifecycle_hooks`)
 
 Those are only the first-pass structural checks. After node/edge instantiation, the build path also runs conditional validation plus the broader contract-validation chain documented in [VALIDATION.md](VALIDATION.md).
 
 ### 4. Tool-edge backfilling
 
-Before node creation, `_assign_tool_handles()` inspects edges from tool-capable nodes (`fetch` in `tool_mode`, tool-mode `python_exec`, `mcp`, and `node_tool`) into `llm` nodes.
+Before node creation, `_assign_tool_handles()` inspects edges from tool-capable nodes (`fetch` in `tool_mode`, tool-mode `python_exec`, `inner` in `tool_mode`, `mcp`, and `node_tool`) into `llm` nodes.
 
 It auto-fills:
 
 - `sourceHandle` based on the provider node
 - `targetHandle` as `handle-tool-definition-N` when missing
 
-Exception: `python_exec` has two modes. When its node data includes `code`, it runs as a normal graph node and `_assign_tool_handles()` intentionally skips automatic tool-handle assignment. In that node-mode case, existing handles are preserved so the result can route through graph edges instead of being treated as an LLM tool definition. Omit `data.code` only when you want `python_exec` to behave as a tool provider for an LLM.
+Exception: `python_exec` runs as a normal graph node when `tool_mode` is `false`, or when it has `data.code` and `tool_mode` is not `true`; `_assign_tool_handles()` then skips automatic tool-handle assignment and existing handles are preserved so the result routes through graph edges. Without `code` it is a model-written-code tool; with `code` and `tool_mode: true` it is a fixed tool.
 
 ### 5. Sorting and positioning
 
 `sort_nodes()` uses `perform_topological_sort()` plus automatic positions for nodes with missing or default positions.
 
-Important nuance: `perform_topological_sort()` falls back to graph insertion order when `networkx.topological_sort()` is unfeasible. That is why cycle behavior needs careful documentation; see [VALIDATION.md](VALIDATION.md) and [../issues/cycle-behavior-and-doc-drift.md](../issues/cycle-behavior-and-doc-drift.md).
+Important nuance: `perform_topological_sort()` falls back to graph insertion order when `networkx.topological_sort()` is unfeasible. That is why cycle behavior needs careful documentation; see [VALIDATION.md](VALIDATION.md).
 
 ### 6. Internal `void` sink injection
 
-Build always appends an internal `void` node and rewrites edges targeting `handle-void` to that node.
+Build always appends an internal `void` node and rewrites edges targeting `handle-void` to that node. An edge that still has no `targetHandle` after tool-handle backfilling defaults to `handle-void`, so it is routed to the sink and delivers nothing.
 
 `end` nodes also get an automatic edge to the internal sink.
 
@@ -95,7 +104,7 @@ Build always appends an internal `void` node and rewrites edges targeting `handl
 
 This is also where aliases such as `json_mode -> json_output` or `provider -> engine` get normalized through node models.
 
-The runtime factory currently maps **20** node types, including `codex`, `memory`, and `node_tool`, which were missing from older wiki pages.
+The runtime factory currently maps **21** node types, including `codex`, `memory`, `node_tool` and `skills`.
 
 ### 8. Recursive inner graphs
 

@@ -2,7 +2,7 @@
 
 This is the canonical documentation entry point for the repository.
 
-Use this page as the navigation hub. The wiki explains concepts and execution behavior, `nodes/` and `hooks/` are reference sections, `JSON_CONTRACT.md` documents the serialized graph contract, and `issues/` tracks known limitations or documentation drift.
+Use this page as the navigation hub. The wiki explains concepts and execution behavior, `nodes/` and `hooks/` are reference sections, and `JSON_CONTRACT.md` documents the serialized graph contract.
 
 ## Start here
 
@@ -19,7 +19,9 @@ Use this page as the navigation hub. The wiki explains concepts and execution be
 | Work with lifecycle hooks | [hooks/README.md](hooks/README.md) |
 | Check serialized graph shape | [JSON_CONTRACT.md](JSON_CONTRACT.md) |
 | Understand task subagents | [wiki/TASK_SUBAGENTS.md](wiki/TASK_SUBAGENTS.md) |
-| Review known issues and limitations | [issues/README.md](issues/README.md) |
+| Attach files to chat turns | [chat-file-attachments.md](chat-file-attachments.md) |
+| Check problems that belong to `magic-llm` or other dependencies | [external/README.md](external/README.md) |
+| Contribute, run the tests | [wiki/DEVELOPMENT.md](wiki/DEVELOPMENT.md) |
 
 ## Documentation map
 
@@ -28,7 +30,8 @@ Use this page as the navigation hub. The wiki explains concepts and execution be
 - [wiki/NODE_REFERENCE.md](wiki/NODE_REFERENCE.md) — concise index of all built-in node types
 - [hooks/README.md](hooks/README.md) — flow hook protocol, `hook` nodes, edge hook behavior, and hook lifecycle docs
 - [JSON_CONTRACT.md](JSON_CONTRACT.md) — JSON graph contract, top-level fields, node/edge shape, and compatibility notes
-- [issues/README.md](issues/README.md) — documented repo issues, limitations, and known documentation drift
+- [chat-file-attachments.md](chat-file-attachments.md) — Chat attachment descriptors, PDF parsing, and the optional Redis cache
+- [external/README.md](external/README.md) — issues whose root cause is in another repository (out of scope here)
 
 ## Recommended reading order
 
@@ -39,16 +42,9 @@ Use this page as the navigation hub. The wiki explains concepts and execution be
 5. [nodes/README.md](nodes/README.md) — look up the node types used by a graph.
 6. [wiki/EXECUTION_MODEL.md](wiki/EXECUTION_MODEL.md) — then read how the runtime executes the graph.
 7. [hooks/README.md](hooks/README.md) — read after the execution model if you use lifecycle hooks or `hook` nodes.
-8. [issues/README.md](issues/README.md) — check known limitations before relying on edge cases.
-
-## Example material outside `docs/`
-
-- [examples/json/INDEX.md](../examples/json/INDEX.md) — complete graph specs and their local runner
-- [examples/conditional/INDEX.md](../examples/conditional/INDEX.md) — branching examples
-- [examples/loop/INDEX.md](../examples/loop/INDEX.md) — loop examples
 
 ## Source of truth policy
 
 - Runtime behavior is documented from the current codebase, not from stale prose.
 - If code and docs disagree, update the docs from the current runtime behavior.
-- Unresolved mismatches are tracked under [docs/issues/](issues/README.md).
+- Problems rooted in another repository are recorded under [external/](external/README.md), not fixed here.

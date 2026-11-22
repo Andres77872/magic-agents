@@ -4,7 +4,7 @@
 
 `HookRelay` bridges magic-llm's **sync** `AgentHooks` protocol to magic-agents' **async** `FlowHooks` protocol. This gives graph-level visibility into LLM calls and tool executions inside magic-llm without modifying magic-llm's contract.
 
-**File**: `magic_agents/hooks/hook_relay.py:1-764`
+**File**: `magic_agents/hooks/hook_relay.py`
 
 **Status**: ✅ Implemented.
 
@@ -22,12 +22,12 @@ magic-agents FlowHooks (async)
 
 | magic-llm AgentHooks Method | FlowHooks Target | File:Line |
 |-----------------------------|------------------|-----------|
-| `on_iteration_start` | `on_llm_start(context, llm_config=...)` | `hook_relay.py:262-299` |
-| `on_llm_response` | `on_llm_end(context)` | `hook_relay.py:301-379` |
-| `on_tool_start` | `on_tool_start(context)` | `hook_relay.py:381-425` |
-| `on_tool_complete` | `on_tool_end(context)` | `hook_relay.py:427-478` |
-| `on_loop_complete` | **`on_llm_loop_end(context)`** | `hook_relay.py:480-526` |
-| `on_budget_exceeded` | `on_node_error(context)` | `hook_relay.py:528-544` |
+| `on_iteration_start` | `on_llm_start(context, llm_config=...)` | `hook_relay.py` |
+| `on_llm_response` | `on_llm_end(context)` | `hook_relay.py` |
+| `on_tool_start` | `on_tool_start(context)` | `hook_relay.py` |
+| `on_tool_complete` | `on_tool_end(context)` | `hook_relay.py` |
+| `on_loop_complete` | **`on_llm_loop_end(context)`** | `hook_relay.py` |
+| `on_budget_exceeded` | `on_node_error(context)` | `hook_relay.py` |
 
 **Key change**: `on_loop_complete` now maps to `on_llm_loop_end`, NOT to `on_llm_end`. Loop completion is signaled by a distinct method. There is no `loop_complete=True` discriminator — this was removed in a clean cut with no deprecation window.
 
@@ -68,13 +68,16 @@ For an N-iteration tool loop: `on_llm_end` fires N times, `on_llm_loop_end` fire
 |-------|------|-----------------|--------|
 | `model` | `str` | Yes | `response.model` |
 | `content` | `str` | Yes | `response.content` |
-| `content_preview` | `str` | Yes | First 200 chars of content |
 | `finish_reason` | `Optional[str]` | Yes | `response.finish_reason` |
 | `provider_request_id` | `Optional[str]` | Yes | `response.id` — `None` when absent |
 | `prompt_tokens` | `Optional[int]` | Yes | `response.usage.prompt_tokens` — `None` when absent |
 | `completion_tokens` | `Optional[int]` | Yes | `response.usage.completion_tokens` — `None` when absent |
 | `total_tokens` | `Optional[int]` | Yes | `response.usage.total_tokens` — `None` when absent |
 | `iteration` | `int` | Yes | `state.iteration` — 0-indexed |
+| `usage_reported` | `bool` | Yes | Whether the provider reported usage for this response |
+| detail token fields | `Optional[int]` | Yes | `cached_tokens_read`, `cached_tokens_write`, `reasoning_tokens`, `audio_tokens` when the provider reports them |
+
+`context.inputs.streaming` tells whether the response was streamed (consumers that count non-streamed usage separately key off it).
 
 ### `on_llm_loop_end` (aggregate loop completion)
 
@@ -104,15 +107,15 @@ For an N-iteration tool loop: `on_llm_end` fires N times, `on_llm_loop_end` fire
 | `model` | `Optional[str]` | Yes | Best-effort from `_llm_config` — `None` when unavailable |
 | `provider` | `Optional[str]` | Yes | Best-effort from `_llm_config` — `None` when unavailable |
 | `streaming` | `Optional[bool]` | Yes | Best-effort from `_llm_config` — `None` when unavailable |
-| `tools` | `Optional[list]` | Yes | Best-effort from `_llm_config` — `None` when unavailable |
-| `tool_choice` | `Optional[str \| dict]` | Yes | Best-effort from `_llm_config` — `None` when unavailable |
-| `deduplicate` | `Optional[bool]` | Yes | Best-effort from `_llm_config` — `None` when unavailable |
+| `tools` | `Optional[list]` | Yes | Always `None` today: `NodeLLM` does not put it in `_llm_config` |
+| `tool_choice` | `Optional[str \| dict]` | Yes | Always `None` today |
+| `deduplicate` | `Optional[bool]` | Yes | Always `None` today |
 
-The `llm_config` extra kwarg on `on_llm_start` carries the full dict of available config fields (not just those in `context.inputs`). It is `None` when no config data is accessible at all.
+The `llm_config` extra kwarg on `on_llm_start` carries the dict `NodeLLM` built: `model`, `provider`, `streaming` and `json_output`. It is `None` when no config data is accessible at all.
 
 ## Nested Hook Correlation
 
-When nested LLM nodes execute (via `PARENT_HOOKS` ContextVar in `TaskExecutor._execute_nested_llm_node()`), ALL events carry correlation metadata injected by `HookRelay._build_context()` (`hook_relay.py:176-190`) and `_build_tool_context()` (`hook_relay.py:246-257`):
+When nested LLM nodes execute (via `PARENT_HOOKS` ContextVar in `TaskExecutor._execute_nested_llm_node()`), ALL events carry correlation metadata injected by `HookRelay._build_context()` (`hook_relay.py`) and `_build_tool_context()` (`hook_relay.py`):
 
 | Field | Location | Type | Description |
 |-------|----------|------|-------------|
@@ -124,22 +127,22 @@ This makes ALL events from nested loops distinguishable from parent events witho
 
 ## `llm_config` Configuration
 
-HookRelay accepts an `llm_config` dict at construction time (`hook_relay.py:69, 108`). This config is built by `NodeLLM._create_hook_relay()` from available client and node state, and is delivered to `on_llm_start` via the `llm_config` extra kwarg.
+HookRelay accepts an `llm_config` dict at construction time (`hook_relay.py`). This config is built by `NodeLLM._create_hook_relay()` from available client and node state, and is delivered to `on_llm_start` via the `llm_config` extra kwarg.
 
 The config dict contains best-effort data — all fields are optional and may be `None` when data is unavailable. See [PROTOCOL.md](./PROTOCOL.md#llm_config-parameter) for the full field list.
 
 ## Async Bridge
 
-`HookRelay` methods are **sync** (implements `AgentHooks` protocol), but `FlowHooks` methods are **async**. The bridge at `hook_relay.py:582-716` handles the mismatch:
+`HookRelay` methods are **sync** (implements `AgentHooks` protocol), but `FlowHooks` methods are **async**. The bridge at `hook_relay.py` handles the mismatch:
 
-1. **Via HookRegistry** (preferred): `asyncio.create_task(registry.invoke(...))` schedules the async call in the running event loop (`hook_relay.py:635-676`).
-2. **Via single FlowHooks**: `getattr` + `iscoroutinefunction` check → `create_task` for async, direct call for sync (`hook_relay.py:613-625`, `678-716`).
-3. **No running loop**: Logs warning, hook is skipped (`hook_relay.py:664-676`, `702-716`).
+1. **Via HookRegistry** (preferred): `asyncio.create_task(registry.invoke(...))` schedules the async call in the running event loop (`hook_relay.py`).
+2. **Via single FlowHooks**: `getattr` + `iscoroutinefunction` check → `create_task` for async, direct call for sync (`hook_relay.py`, `678-716`).
+3. **No running loop**: Logs warning, hook is skipped (`hook_relay.py`, `702-716`).
 
 ## Flushing Behavior
 
 ```python
-await hook_relay.flush_pending_hooks()  # hook_relay.py:548-578
+await hook_relay.flush_pending_hooks()
 ```
 
 Call at the end of a NodeLLM iteration to await all pending async tasks. Uses `asyncio.wait()` with configurable timeout (default 5s). Pending tasks beyond timeout are **cancelled** via `task.cancel()` and the `_pending_futures` set is cleared entirely.
@@ -151,7 +154,7 @@ Call at the end of a NodeLLM iteration to await all pending async tasks. Uses `a
 `HookRelay` accumulates tool calls and results during LLM iterations:
 
 ```python
-hook_relay.get_collected_tool_data_for_yield(clear=True)  # hook_relay.py:717-759
+hook_relay.get_collected_tool_data_for_yield(clear=True)
 ```
 
 Returns yieldable events (`tool_call`, `tool_result`). `clear=True` (default) empties internal lists after read to prevent double-accumulation.
@@ -163,6 +166,6 @@ Each collected entry now carries correlation metadata:
 
 ## Risks
 
-1. **Sync-only fallback**: When `asyncio.create_task` cannot be called (no running event loop), hook methods are skipped with a `logger.warning` at `hook_relay.py:664-676`, `702-716`.
+1. **Sync-only fallback**: When `asyncio.create_task` cannot be called (no running event loop), hook methods are skipped with a `logger.warning` at `hook_relay.py`, `702-716`.
 2. **`_current_provider_request_id` stale window**: Between loop boundary (`on_loop_complete` clears it to `None`) and the next `on_llm_response`, tool events have `provider_request_id = None`. This is documented behavior — tool events before the first LLM response are inherently uncorrelated.
 3. **`on_llm_loop_end` not implemented by existing consumers**: All existing `FlowHooks` subclasses continue working since the protocol provides a default no-op. New consumers should implement `on_llm_loop_end` for loop-level observability.

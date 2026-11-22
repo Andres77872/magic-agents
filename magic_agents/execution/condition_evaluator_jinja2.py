@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 import jinja2
+from jinja2.sandbox import SandboxedEnvironment
 
 from magic_agents.execution.condition_evaluator import ConditionEvaluator
 
@@ -36,7 +37,7 @@ class Jinja2Evaluator:
         Returns:
             Rendered template as string
         """
-        env = jinja2.Environment()
+        env = SandboxedEnvironment()
         tpl = env.from_string(template)
         return str(tpl.render(**context)).strip()
     
@@ -72,7 +73,7 @@ class Jinja2StrictEvaluator:
         Raises UndefinedError if any variable in the template is not
         defined in the context.
         """
-        env = jinja2.Environment(undefined=jinja2.StrictUndefined)
+        env = SandboxedEnvironment(undefined=jinja2.StrictUndefined)
         tpl = env.from_string(template)
         return str(tpl.render(**context)).strip()
     

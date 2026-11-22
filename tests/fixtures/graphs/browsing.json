@@ -1,0 +1,540 @@
+{
+  "nodes": [
+    {
+      "id": "user_input",
+      "type": "user_input",
+      "position": {
+        "x": -2185.726078608185,
+        "y": -245.59055646824848
+      }
+    },
+    {
+      "id": "finish",
+      "type": "end",
+      "position": {
+        "x": 4495.351508398015,
+        "y": 1192.571761548932
+      }
+    },
+    {
+      "id": "system-prompt-rewrite",
+      "type": "parser",
+      "data": {
+        "text": "You are a query expansion assistant for a search engine. Your task is to analyze user queries and generate optimized search queries when information retrieval is needed.\n\n<user_query>\n{{ handle_parser_input_0 }}\n</user_query>\n\nAnalyze the query and determine if it requires searching for information. Consider these guidelines:\n\n1. **Requires search**: Questions seeking facts, explanations, current events, how-to information, or any knowledge-based content\n2. **Does NOT require search**: Greetings, farewells, acknowledgments, personal statements, or commands that don't seek information (e.g., \"hi\", \"thanks\", \"goodbye\", \"I'm tired\")\n\nIf the query requires search, generate up to 3 different optimized search queries that:\n- Capture different aspects or interpretations of the user's intent\n- Use relevant keywords and remove unnecessary words\n- Are specific enough to yield accurate results\n- Cover various phrasings that might return complementary results\n\nOutput a JSON object with a list of queries:\n- For information-seeking queries: Include 1-3 optimized search queries\n- For non-information queries: Return an empty list\n\nOutput format:\n```json\n{\n  \"queries\": [\"query1\", \"query2\", \"query3\"]\n}\n```\n\nExamples:\n\nInput: \"What's the weather like in New York?\"\nOutput: {\"queries\": [\"current weather New York\", \"New York weather forecast today\", \"NYC temperature conditions\"]}\n\nInput: \"hi there\"\nOutput: {\"queries\": []}\n\nInput: \"Who won the last World Cup?\"\nOutput: {\"queries\": [\"FIFA World Cup 2022 winner\", \"latest World Cup champion Qatar\", \"Argentina France World Cup final result\"]}\n\nInput: \"How do I make pasta?\"\nOutput: {\"queries\": [\"how to cook pasta step by step\", \"pasta cooking instructions time\", \"homemade pasta recipe guide\"]}\n\nProvide only the JSON object as your response."
+      },
+      "position": {
+        "x": -1462.997640739709,
+        "y": -18.36071431379372
+      }
+    },
+    {
+      "id": "llm-client",
+      "type": "client",
+      "data": {
+        "model": "gpt-4.1-2025-04-14",
+        "engine": "openai"
+      },
+      "position": {
+        "x": -1884.2102661321,
+        "y": 410.27359314623504
+      }
+    },
+    {
+      "id": "conditional-queries-check",
+      "type": "conditional",
+      "data": {
+        "condition": "{{ 'has_queries' if queries is defined and queries is iterable and queries|list|length > 0 else 'no_queries' }}",
+        "merge_strategy": "flat",
+        "output_handles": [
+          "no_queries",
+          "has_queries"
+        ],
+        "default_handle": "no_queries"
+      },
+      "position": {
+        "x": -600,
+        "y": 200
+      }
+    },
+    {
+      "id": "text-no-search-response",
+      "type": "text",
+      "data": {
+        "text": "I understand! How can I help you today?"
+      },
+      "position": {
+        "x": -200,
+        "y": 600
+      }
+    },
+    {
+      "id": "send-message-no-search",
+      "type": "send_message",
+      "data": {
+        "json_extras": ""
+      },
+      "position": {
+        "x": 200,
+        "y": 600
+      }
+    },
+    {
+      "id": "system-prompt",
+      "type": "parser",
+      "data": {
+        "text": "{% if handle_parser_input_0 %}\nYou are tasked with extracting and consolidating ALL information from an XML document through systematic analysis and reasoning. This is an intermediate extraction step - your output will be processed further, so focus on comprehensive data extraction with source tracking and logical organization.\n\nHere is the XML content to process:\n<xml_content>\n{{handle_parser_input_0}}\n</xml_content>\n\n**Step 1: Initial XML Structure Analysis**\n- Map the overall structure and hierarchy of the XML document\n- Identify main sections, subsections, and data categories\n- Note any patterns in element naming or organization\n- Recognize data types (text, numbers, dates, references, etc.)\n\n**Step 2: Systematic Content Extraction**\nExtract ALL information while preserving:\n- Exact text content from every element\n- All attribute values with their contexts\n- Hierarchical relationships and nesting levels\n- Any IDs, references, or linking mechanisms\n\n**Step 3: Reasoning About Relationships**\nAnalyze and document:\n- How different XML elements relate to each other\n- Parent-child dependencies\n- Cross-references between sections\n- Implicit relationships based on structure or naming patterns\n- Data that appears to be connected but in different locations\n\n**Step 4: Identifying Information Patterns**\nReason about:\n- Repeated information and where it appears\n- Variations in how similar data is presented\n- Complementary information that forms complete concepts\n- Hierarchical importance based on XML structure\n- Any apparent categorization or grouping logic\n\n**Step 5: Source Reference Mapping**\nFor each piece of information, establish:\n- Primary source location (exact XPath or element path)\n- Secondary occurrences if information is repeated\n- Structural context (what section/parent element it belongs to)\n- Any associated metadata or attributes\n\n**Step 6: Consolidation with Reasoning**\nOrganize extracted information by:\n- Grouping related data based on XML structure\n- Maintaining chronological or logical order if apparent\n- Preserving all variations and duplicates\n- Creating clear connections between related elements\n\n**Critical Requirements:**\n- Extract EVERYTHING - do not filter based on perceived importance\n- Include reasoning for how information connects\n- Preserve exact wording and values\n- Track ALL source locations for duplicate/related information\n- Note structural relationships that provide context\n- Include metadata and attributes as separate information items\n- Document your reasoning for grouping or organizing data\n- **Include ALL URLs, images, and captions EXACTLY as found in the original**\n\n**Remember:**\n- This is NOT a final response - avoid summarizing\n- Your reasoning should explain connections, not interpret meaning\n- Include duplicate information from all sources\n- Maintain complete source traceability\n- Let the XML structure guide your organization\n- **Preserve ALL references, sources, URLs, images, and captions completely**\n\nProvide your reasoned extraction within <extracted_content> tags.\n{% endif %}"
+      },
+      "position": {
+        "x": 2095.135883062577,
+        "y": -216.7894055549776
+      }
+    },
+    {
+      "id": "llm-rewrite",
+      "type": "llm",
+      "data": {
+        "top_p": 1,
+        "temperature": 1,
+        "max_tokens": 450,
+        "stream": false,
+        "json_output": true
+      },
+      "position": {
+        "x": -867.9849211685348,
+        "y": -87.06185685066481
+      }
+    },
+    {
+      "id": "fetch",
+      "type": "fetch",
+      "data": {
+        "url": "https://s.jina.ai/",
+        "method": "POST",
+        "data": "",
+        "json_data": {
+          "q": "{{ handle_fetch_input  }}"
+        },
+        "headers": {
+          "Accept": "application/json",
+          "X-Engine": "browser",
+          "Content-Type": "application/json",
+          "Authorization": "Bearer {{env.JINA_API_KEY}}",
+          "X-With-Generated-Alt": "true",
+          "X-With-Images-Summary": "true"
+        }
+      },
+      "position": {
+        "x": 104.00649447892192,
+        "y": -81.60426359399878
+      }
+    },
+    {
+      "id": "send-message",
+      "type": "send_message",
+      "data": {
+        "json_extras": ""
+      },
+      "position": {
+        "x": 2391.6421436224196,
+        "y": 1166.5793991605028
+      }
+    },
+    {
+      "id": "parser-browsing-response",
+      "type": "parser",
+      "data": {
+        "text": "{%- set all_items = [] -%}\n{%- set seen_urls = [] -%}\n{%- set max_per_input = 3 -%}\n{%- set max_total = 9 -%}\n\n{%- for input_source in [handle_parser_input_0, handle_parser_input_1, handle_parser_input_2] -%}\n  {%- if input_source.data is defined and input_source.data is not none and input_source.data|length > 0 -%}\n    {%- set added_count = 0 -%}\n    {%- for item in input_source.data -%}\n      {%- if added_count < max_per_input and item.url not in seen_urls and all_items|length < max_total -%}\n        {%- set _ = all_items.append(item) -%}\n        {%- set _ = seen_urls.append(item.url) -%}\n        {%- set added_count = added_count + 1 -%}\n      {%- endif -%}\n    {%- endfor -%}\n  {%- endif -%}\n{%- endfor -%}\n\n{%- if all_items|length > 0 -%}\n<search_results>\n{%- for item in all_items[:max_total] -%}\n<result>\n<title>{{ item.title }}</title>\n<link>{{ item.url }}</link>\n<content>{{ item.content }}</content>\n<images>{{ item.images }}</images>\n{%- if item.date is defined -%}\n<date>{{ item.date }}</date>\n{%- endif -%}\n</result>\n{%- endfor -%}\n</search_results>\n{%- endif -%}"
+      },
+      "position": {
+        "x": 1602.5361281434214,
+        "y": -420.7242468675765
+      }
+    },
+    {
+      "id": "parser-browsing-references",
+      "type": "parser",
+      "data": {
+        "text": "{%- set seen_urls = [] -%}\n{%- set unique_items = [] -%}\n{%- for parser_input in [handle_parser_input_0, handle_parser_input_1, handle_parser_input_2] -%}\n  {%- for x in parser_input.data -%}\n    {%- if x.url not in seen_urls -%}\n      {%- set _ = seen_urls.append(x.url) -%}\n      {%- set _ = unique_items.append(x) -%}\n    {%- endif -%}\n  {%- endfor -%}\n{%- endfor -%}\n{\"results_ref\": [{% for x in unique_items %}{\"title\": {{ x.title | tojson }},\"snippet\": {{ x.description | tojson }},\"link\": \"{{ x.url }}\",\"imageUrl\": \"\",\"position\": {{ loop.index0 }}}{% if not loop.last %},{% endif %}{% endfor %}]}"
+      },
+      "position": {
+        "x": 1647.3302647229934,
+        "y": 1167.8141594868498
+      }
+    },
+    {
+      "id": "parser-browsing-rewrite",
+      "type": "parser",
+      "data": {
+        "text": "{%- if handle_parser_input_0.queries is defined and handle_parser_input_0.queries|length > 0 -%}\n  {{ handle_parser_input_0.queries[0] }}\n{%- endif -%}"
+      },
+      "position": {
+        "x": -338.6116516898883,
+        "y": 651.4197194899632
+      }
+    },
+    {
+      "id": "llm-final",
+      "type": "llm",
+      "data": {
+        "top_p": 0.95,
+        "temperature": 0.65,
+        "max_tokens": 16384,
+        "stream": true
+      },
+      "position": {
+        "x": 2904.377905813049,
+        "y": -216.17277282985756
+      }
+    },
+    {
+      "id": "8867edcd-b3b4-433a-b13e-0cf7b9fd8e24",
+      "type": "llm",
+      "data": {
+        "top_p": 1,
+        "temperature": 0.7,
+        "max_tokens": 16384,
+        "stream": true,
+        "json_output": false
+      },
+      "position": {
+        "x": 4061.8462078131215,
+        "y": -209.99901444305289
+      }
+    },
+    {
+      "id": "0fe88ab6-93fe-44c1-a344-a2e7031152a6",
+      "type": "client",
+      "data": {
+        "model": "gpt-5-chat-latest",
+        "engine": "openai"
+      },
+      "position": {
+        "x": 1656.1021894357357,
+        "y": 339.81846503032097
+      }
+    },
+    {
+      "id": "56dfe539-bb08-493a-9c79-a2bfe1b05af5",
+      "type": "parser",
+      "data": {
+        "text": "You are a content formatter specializing in transforming raw answers into polished, user-friendly responses using Markdown and interactive HTML/CSS/JavaScript components.\n\n## Input\n<answer>\n{{handle_parser_input_0}}\n</answer>\n\n## Formatting Guidelines\n\n### 1. Primary Format: Markdown\nWrite your response directly in Markdown. Use appropriate formatting for clarity:\n- **Headers**: `#` Main topics, `##` Subtopics, `###` Details\n- **Emphasis**: `**bold**` for important terms, `*italic*` for emphasis\n- **Lists**: Bullet points for unordered items, numbers for sequential steps\n- **Code**: `` `inline code` ``, ``` code blocks ``` with language specification\n- **Quotes**: `>` for citations or important callouts\n- **Tables**: When simple enough for Markdown syntax\n\n### 2. Enhanced Presentations: HTML/CSS/JS\nFor complex or interactive content, use this decorator syntax:\n```\n<|start_gen_ui|>\n[HTML content with embedded CSS and JavaScript]\n<|end_gen_ui|>\n```\n\nUse HTML decorators for:\n- Complex tables with styling\n- Interactive demonstrations or calculators\n- Visual diagrams, charts, or timelines\n- Animated explanations\n- Custom-styled content blocks\n- Image galleries with captions\n\n### 3. CSS Namespace Requirements\n**CRITICAL**: Prefix ALL CSS classes with `magit-gen-ui-` to prevent style conflicts.\n\nExamples:\n- ✅ `magit-gen-ui-container`\n- ✅ `magit-gen-ui-button-primary`\n- ✅ `magit-gen-ui-data-table`\n- ❌ `container` \n- ❌ `button`\n- ❌ `table`\n\n### 4. Image Handling\nWhen including images:\n- Generate appropriate image URLs based on context and captions\n- Embed images within `<|start_gen_ui|>` blocks for proper styling\n- Add alt text for accessibility\n- Consider responsive sizing\n\n### 5. Code Presentation\n- Use Markdown code blocks with language hints: ``` ```python ```\n- For interactive code demos, create runnable examples in HTML decorators\n- Include syntax highlighting when using HTML presentation\n\n### 6. Example: Interactive Component\n\n<|start_gen_ui|>\n<div class=\"magit-gen-ui-demo-container\">\n  <h3 class=\"magit-gen-ui-title\">Interactive Color Picker</h3>\n  <button class=\"magit-gen-ui-action-btn\" onclick=\"randomizeColor()\">\n    🎨 Randomize Color\n  </button>\n  <div class=\"magit-gen-ui-color-display\" id=\"colorDisplay\">\n    <p class=\"magit-gen-ui-color-text\">Click to change my color!</p>\n  </div>\n</div>\n\n<style>\n.magit-gen-ui-demo-container {\n  max-width: 400px;\n  margin: 20px auto;\n  padding: 25px;\n  background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);\n  border-radius: 12px;\n  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);\n}\n\n.magit-gen-ui-title {\n  margin: 0 0 20px 0;\n  color: #2c3e50;\n  text-align: center;\n}\n\n.magit-gen-ui-action-btn {\n  width: 100%;\n  padding: 12px 24px;\n  background-color: #4a90e2;\n  color: white;\n  border: none;\n  border-radius: 6px;\n  font-size: 16px;\n  cursor: pointer;\n  transition: all 0.3s ease;\n}\n\n.magit-gen-ui-action-btn:hover {\n  background-color: #357abd;\n  transform: translateY(-2px);\n  box-shadow: 0 4px 12px rgba(74, 144, 226, 0.3);\n}\n\n.magit-gen-ui-color-display {\n  margin-top: 20px;\n  padding: 30px;\n  background-color: white;\n  border-radius: 8px;\n  text-align: center;\n  transition: background-color 0.5s ease;\n}\n\n.magit-gen-ui-color-text {\n  margin: 0;\n  font-size: 20px;\n  font-weight: 600;\n  transition: color 0.5s ease;\n}\n</style>\n\n<script>\nfunction randomizeColor() {\n  const colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FECA57', '#FF9FF3'];\n  const textColors = ['white', 'white', 'white', 'black', 'black', 'black'];\n  const index = Math.floor(Math.random() * colors.length);\n  \n  const display = document.getElementById('colorDisplay');\n  const text = display.querySelector('.magit-gen-ui-color-text');\n  \n  display.style.backgroundColor = colors[index];\n  text.style.color = textColors[index];\n  text.textContent = `Color: ${colors[index]}`;\n}\n</script>\n<|end_gen_ui|>\n\n## Quality Checklist\nBefore finalizing your response, ensure:\n- ✓ Original meaning and accuracy preserved\n- ✓ Information organized logically with clear hierarchy\n- ✓ Complex data presented visually when beneficial\n- ✓ All CSS classes properly namespaced\n- ✓ Interactive elements enhance understanding\n- ✓ Code examples are runnable and well-commented\n- ✓ Images included where they add value\n\nTransform the provided answer into an engaging, professional response that maximizes readability and user comprehension."
+      },
+      "position": {
+        "x": 3426.1473669407983,
+        "y": 891.5423308201489
+      }
+    },
+    {
+      "id": "4d2dbd69-9eca-493e-9787-4daebf927c50",
+      "type": "client",
+      "data": {
+        "model": "gpt-5-chat-latest",
+        "engine": "openai"
+      },
+      "position": {
+        "x": 3372.1243670120843,
+        "y": -55.555933500803945
+      }
+    },
+    {
+      "id": "aba0057a-ab2d-4612-a015-cb28017bbfca",
+      "type": "parser",
+      "data": {
+        "text": "{%- if handle_parser_input_0.queries is defined and handle_parser_input_0.queries|length > 1 -%}\n  {{ handle_parser_input_0.queries[1] }}\n{%- endif -%}"
+      },
+      "position": {
+        "x": -292.1112652366746,
+        "y": 1201.1108359526809
+      }
+    },
+    {
+      "id": "7c7317b8-b01d-4584-9a9e-88e1329e8dfb",
+      "type": "parser",
+      "data": {
+        "text": "{%- if handle_parser_input_0.queries is defined and handle_parser_input_0.queries|length > 2 -%}\n  {{ handle_parser_input_0.queries[2] }}\n{%- endif -%}"
+      },
+      "position": {
+        "x": -266.200551718872,
+        "y": 1789.7237529528884
+      }
+    },
+    {
+      "id": "39431f32-00c4-47a9-b915-b8f6fa907b34",
+      "type": "fetch",
+      "data": {
+        "url": "https://s.jina.ai/",
+        "method": "POST",
+        "data": "",
+        "json_data": {
+          "q": "{{ handle_fetch_input  }}"
+        },
+        "headers": {
+          "Accept": "application/json",
+          "X-Engine": "browser",
+          "Content-Type": "application/json",
+          "Authorization": "Bearer {{env.JINA_API_KEY}}",
+          "X-With-Generated-Alt": "true",
+          "X-With-Images-Summary": "true"
+        }
+      },
+      "position": {
+        "x": 547.6266447305885,
+        "y": 333.17047681792997
+      }
+    },
+    {
+      "id": "5b581c5d-3551-464b-84bf-263fcc699dc9",
+      "type": "fetch",
+      "data": {
+        "url": "https://s.jina.ai/",
+        "method": "POST",
+        "data": "",
+        "json_data": {
+          "q": "{{ handle_fetch_input  }}"
+        },
+        "headers": {
+          "Accept": "application/json",
+          "X-Engine": "browser",
+          "Content-Type": "application/json",
+          "Authorization": "Bearer {{env.JINA_API_KEY}}",
+          "X-With-Generated-Alt": "true",
+          "X-With-Images-Summary": "true"
+        }
+      },
+      "position": {
+        "x": 1014.372755211923,
+        "y": 853.0649515895627
+      }
+    },
+    {
+      "id": "3ff7b71b-f886-4340-bfc2-279eecce8078",
+      "type": "parser",
+      "data": {
+        "text": "{% if handle_parser_input_0 %}\n{{ handle_parser_input_0 }}\nUser query: {{ handle_parser_input_1 }}\n{% endif %}"
+      },
+      "position": {
+        "x": 2220.122845003829,
+        "y": 183.19810648280207
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "llm-client__llm-rewrite",
+      "source": "llm-client",
+      "target": "llm-rewrite",
+      "sourceHandle": "handle-client-provider",
+      "targetHandle": "handle-client-provider"
+    },
+    {
+      "id": "system-prompt-rewrite__llm-rewrite",
+      "source": "system-prompt-rewrite",
+      "target": "llm-rewrite",
+      "sourceHandle": "handle_parser_output",
+      "targetHandle": "handle_user_message"
+    },
+    {
+      "id": "llm-rewrite__conditional-queries-check",
+      "source": "llm-rewrite",
+      "target": "conditional-queries-check",
+      "sourceHandle": "handle_generated_content",
+      "targetHandle": "handle_input"
+    },
+    {
+      "id": "conditional-queries-check__text-no-search-response",
+      "source": "conditional-queries-check",
+      "target": "text-no-search-response",
+      "sourceHandle": "no_queries",
+      "targetHandle": "handle_flow_input"
+    },
+    {
+      "id": "text-no-search-response__send-message-no-search",
+      "source": "text-no-search-response",
+      "target": "send-message-no-search",
+      "sourceHandle": "handle_text_output",
+      "targetHandle": "handle_send_extra"
+    },
+    {
+      "id": "send-message-no-search__finish",
+      "source": "send-message-no-search",
+      "target": "finish",
+      "sourceHandle": "handle_message_output",
+      "targetHandle": "handle_flow_input"
+    },
+    {
+      "id": "parser-browsing-rewrite__fetch",
+      "source": "parser-browsing-rewrite",
+      "target": "fetch",
+      "sourceHandle": "handle_parser_output",
+      "targetHandle": "handle_fetch_input"
+    },
+    {
+      "id": "parser-browsing-references__send-message",
+      "source": "parser-browsing-references",
+      "target": "send-message",
+      "sourceHandle": "handle_parser_output",
+      "targetHandle": "handle_send_extra"
+    },
+    {
+      "id": "send-message__finish",
+      "source": "send-message",
+      "target": "finish",
+      "sourceHandle": "handle_message_output",
+      "targetHandle": "handle_flow_input"
+    },
+    {
+      "id": "xy-edge__56dfe539-bb08-493a-9c79-a2bfe1b05af5handle_parser_output-8867edcd-b3b4-433a-b13e-0cf7b9fd8e24handle-system-context",
+      "source": "56dfe539-bb08-493a-9c79-a2bfe1b05af5",
+      "target": "8867edcd-b3b4-433a-b13e-0cf7b9fd8e24",
+      "sourceHandle": "handle_parser_output",
+      "targetHandle": "handle-system-context"
+    },
+    {
+      "id": "xy-edge__user_inputhandle_user_message-8867edcd-b3b4-433a-b13e-0cf7b9fd8e24handle_user_message",
+      "source": "user_input",
+      "target": "8867edcd-b3b4-433a-b13e-0cf7b9fd8e24",
+      "sourceHandle": "handle_user_message",
+      "targetHandle": "handle_user_message"
+    },
+    {
+      "id": "xy-edge__8867edcd-b3b4-433a-b13e-0cf7b9fd8e24handle_generated_content-finishhandle_flow_input",
+      "source": "8867edcd-b3b4-433a-b13e-0cf7b9fd8e24",
+      "target": "finish",
+      "sourceHandle": "handle_generated_content",
+      "targetHandle": "handle_flow_input"
+    },
+    {
+      "id": "xy-edge__0fe88ab6-93fe-44c1-a344-a2e7031152a6handle-client-provider-llm-finalhandle-client-provider",
+      "source": "0fe88ab6-93fe-44c1-a344-a2e7031152a6",
+      "target": "llm-final",
+      "sourceHandle": "handle-client-provider",
+      "targetHandle": "handle-client-provider"
+    },
+    {
+      "id": "xy-edge__4d2dbd69-9eca-493e-9787-4daebf927c50handle-client-provider-8867edcd-b3b4-433a-b13e-0cf7b9fd8e24handle-client-provider",
+      "source": "4d2dbd69-9eca-493e-9787-4daebf927c50",
+      "target": "8867edcd-b3b4-433a-b13e-0cf7b9fd8e24",
+      "sourceHandle": "handle-client-provider",
+      "targetHandle": "handle-client-provider"
+    },
+    {
+      "id": "conditional-queries-check__parser-browsing-rewrite",
+      "source": "conditional-queries-check",
+      "target": "parser-browsing-rewrite",
+      "sourceHandle": "has_queries",
+      "targetHandle": "handle_parser_input_0"
+    },
+    {
+      "id": "xy-edge__fetchhandle_fetch_output-parser-browsing-responsehandle_parser_input_0",
+      "source": "fetch",
+      "target": "parser-browsing-response",
+      "sourceHandle": "handle_fetch_output",
+      "targetHandle": "handle_parser_input_0"
+    },
+    {
+      "id": "xy-edge__conditional-queries-check__aba0057a-ab2d-4612-a015-cb28017bbfca",
+      "source": "conditional-queries-check",
+      "target": "aba0057a-ab2d-4612-a015-cb28017bbfca",
+      "sourceHandle": "has_queries",
+      "targetHandle": "handle_parser_input_0"
+    },
+    {
+      "id": "xy-edge__conditional-queries-check__7c7317b8-b01d-4584-9a9e-88e1329e8dfb",
+      "source": "conditional-queries-check",
+      "target": "7c7317b8-b01d-4584-9a9e-88e1329e8dfb",
+      "sourceHandle": "has_queries",
+      "targetHandle": "handle_parser_input_0"
+    },
+    {
+      "id": "xy-edge__aba0057a-ab2d-4612-a015-cb28017bbfcahandle_parser_output-39431f32-00c4-47a9-b915-b8f6fa907b34handle_fetch_input",
+      "source": "aba0057a-ab2d-4612-a015-cb28017bbfca",
+      "target": "39431f32-00c4-47a9-b915-b8f6fa907b34",
+      "sourceHandle": "handle_parser_output",
+      "targetHandle": "handle_fetch_input"
+    },
+    {
+      "id": "xy-edge__7c7317b8-b01d-4584-9a9e-88e1329e8dfbhandle_parser_output-5b581c5d-3551-464b-84bf-263fcc699dc9handle_fetch_input",
+      "source": "7c7317b8-b01d-4584-9a9e-88e1329e8dfb",
+      "target": "5b581c5d-3551-464b-84bf-263fcc699dc9",
+      "sourceHandle": "handle_parser_output",
+      "targetHandle": "handle_fetch_input"
+    },
+    {
+      "id": "xy-edge__user_inputhandle_user_message-system-prompt-rewritehandle_parser_input_0",
+      "source": "user_input",
+      "target": "system-prompt-rewrite",
+      "sourceHandle": "handle_user_message",
+      "targetHandle": "handle_parser_input_0"
+    },
+    {
+      "id": "xy-edge__39431f32-00c4-47a9-b915-b8f6fa907b34handle_fetch_output-parser-browsing-responsehandle_parser_input_1",
+      "source": "39431f32-00c4-47a9-b915-b8f6fa907b34",
+      "target": "parser-browsing-response",
+      "sourceHandle": "handle_fetch_output",
+      "targetHandle": "handle_parser_input_1"
+    },
+    {
+      "id": "xy-edge__5b581c5d-3551-464b-84bf-263fcc699dc9handle_fetch_output-parser-browsing-responsehandle_parser_input_2",
+      "source": "5b581c5d-3551-464b-84bf-263fcc699dc9",
+      "target": "parser-browsing-response",
+      "sourceHandle": "handle_fetch_output",
+      "targetHandle": "handle_parser_input_2"
+    },
+    {
+      "id": "xy-edge__fetchhandle_fetch_output-parser-browsing-referenceshandle_parser_input_0",
+      "source": "fetch",
+      "target": "parser-browsing-references",
+      "sourceHandle": "handle_fetch_output",
+      "targetHandle": "handle_parser_input_0"
+    },
+    {
+      "id": "xy-edge__parser-browsing-responsehandle_parser_output-system-prompthandle_parser_input_0",
+      "source": "parser-browsing-response",
+      "target": "system-prompt",
+      "sourceHandle": "handle_parser_output",
+      "targetHandle": "handle_parser_input_0"
+    },
+    {
+      "id": "xy-edge__llm-finalhandle_generated_content-56dfe539-bb08-493a-9c79-a2bfe1b05af5handle_parser_input_0",
+      "source": "llm-final",
+      "target": "56dfe539-bb08-493a-9c79-a2bfe1b05af5",
+      "sourceHandle": "handle_generated_content",
+      "targetHandle": "handle_parser_input_0"
+    },
+    {
+      "id": "xy-edge__39431f32-00c4-47a9-b915-b8f6fa907b34handle_fetch_output-parser-browsing-referenceshandle_parser_input_1",
+      "source": "39431f32-00c4-47a9-b915-b8f6fa907b34",
+      "target": "parser-browsing-references",
+      "sourceHandle": "handle_fetch_output",
+      "targetHandle": "handle_parser_input_1"
+    },
+    {
+      "id": "xy-edge__5b581c5d-3551-464b-84bf-263fcc699dc9handle_fetch_output-parser-browsing-referenceshandle_parser_input_2",
+      "source": "5b581c5d-3551-464b-84bf-263fcc699dc9",
+      "target": "parser-browsing-references",
+      "sourceHandle": "handle_fetch_output",
+      "targetHandle": "handle_parser_input_2"
+    },
+    {
+      "id": "xy-edge__system-prompthandle_parser_output-3ff7b71b-f886-4340-bfc2-279eecce8078handle_parser_input_0",
+      "source": "system-prompt",
+      "target": "3ff7b71b-f886-4340-bfc2-279eecce8078",
+      "sourceHandle": "handle_parser_output",
+      "targetHandle": "handle_parser_input_0"
+    },
+    {
+      "id": "xy-edge__user_inputhandle_user_message-3ff7b71b-f886-4340-bfc2-279eecce8078handle_parser_input_1",
+      "source": "user_input",
+      "target": "3ff7b71b-f886-4340-bfc2-279eecce8078",
+      "sourceHandle": "handle_user_message",
+      "targetHandle": "handle_parser_input_1"
+    },
+    {
+      "id": "xy-edge__3ff7b71b-f886-4340-bfc2-279eecce8078handle_parser_output-llm-finalhandle_user_message",
+      "source": "3ff7b71b-f886-4340-bfc2-279eecce8078",
+      "target": "llm-final",
+      "sourceHandle": "handle_parser_output",
+      "targetHandle": "handle_user_message"
+    }
+  ]
+}

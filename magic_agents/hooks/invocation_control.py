@@ -7,6 +7,7 @@ it does not build or schedule a second graph runtime.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import copy
 import json
 import math
@@ -16,6 +17,7 @@ from datetime import datetime, UTC
 from types import MappingProxyType
 
 from magic_agents.hooks.context_factory import HookContextFactory
+from magic_agents.util.aio import wait_for
 
 
 def snapshot(value):
@@ -402,7 +404,7 @@ class InvocationControl:
         if tool is not None:
             if not isinstance(content, dict):
                 raise OperationFailure("INVALID_INPUT", "Tool arguments must be an object")
-            if asyncio.iscoroutinefunction(tool) or asyncio.iscoroutinefunction(getattr(tool, "__call__", None)):
+            if inspect.iscoroutinefunction(tool) or inspect.iscoroutinefunction(getattr(tool, "__call__", None)):
                 return await tool(**content)
             _reject_sync_tool(chat_log)
             return await asyncio.to_thread(tool, **content)
@@ -447,7 +449,7 @@ class InvocationControl:
             if len(functions) != 1 or not isinstance(content, dict):
                 raise OperationFailure("INVALID_INPUT", "Child tool operation needs one callable and object arguments")
             function = functions[0]
-            if asyncio.iscoroutinefunction(function) or asyncio.iscoroutinefunction(getattr(function, "__call__", None)):
+            if inspect.iscoroutinefunction(function) or inspect.iscoroutinefunction(getattr(function, "__call__", None)):
                 return await function(**content)
             _reject_sync_tool(chat_log)
             return await asyncio.to_thread(function, **content)
@@ -581,7 +583,7 @@ class InvocationControl:
                                 frame["request"]["content"], operation)
                                 if child_operation and authority is not None else operation())
                             dispatch_task = asyncio.ensure_future(dispatch)
-                            result = await asyncio.wait_for(dispatch_task,
+                            result = await wait_for(dispatch_task,
                                 timeout=max(0, state["deadline"] - time.monotonic()))
                         if time.monotonic() >= state["deadline"]:
                             raise asyncio.TimeoutError()
@@ -747,7 +749,7 @@ class InvocationControl:
                 raise asyncio.TimeoutError()
             frame["executed"] = True
             hook_task = asyncio.ensure_future(hook.invoke_control(context, _copy_run_log(chat_log)))
-            reply = await asyncio.wait_for(hook_task, timeout=budget)
+            reply = await wait_for(hook_task, timeout=budget)
             if authority is not None and not cancelling:
                 authority.check(subject["node_id"])
             if time.monotonic() >= hook_deadline:

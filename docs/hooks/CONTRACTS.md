@@ -6,7 +6,7 @@ Defines the data contracts for hook invocations: `HookContext` dataclass, `HookC
 
 ## HookContext Dataclass
 
-**File**: `magic_agents/hooks/flow_hooks.py:157-218`
+**File**: `magic_agents/hooks/flow_hooks.py`
 
 **Status**: ✅ Implemented. Direct construction deprecated in favor of `HookContextFactory`.
 
@@ -33,18 +33,18 @@ class HookContext:
     emit: Optional[Any] = None     # EmitInterface (injected at runtime)
 ```
 
-`to_dict()` at `flow_hooks.py:220-247` serializes to a JSON-safe dict. Error objects are excluded; only `error_type`/`error_message` are serialized.
+`to_dict()` at `flow_hooks.py` serializes to a JSON-safe dict. Error objects are excluded; only `error_type`/`error_message` are serialized.
 
 ## HookContextFactory
 
-**File**: `magic_agents/hooks/context_factory.py:52-419`
+**File**: `magic_agents/hooks/context_factory.py`
 
 **Status**: ✅ Implemented (6 builder methods).
 
 All factory methods:
 - Accept `**extra` — unknown kwargs absorbed into `inputs` (forward compatibility).
 - Accept `warn_on_missing: bool = False` — logs warnings for missing required fields without blocking.
-- Suppress the `DeprecationWarning` from direct `HookContext()` construction (`context_factory.py:39-47`).
+- Suppress the `DeprecationWarning` from direct `HookContext()` construction (`context_factory.py`).
 
 | Method | For | Key Parameters |
 |--------|-----|----------------|
@@ -57,7 +57,7 @@ All factory methods:
 
 ## TypedDict Schemas
 
-**File**: `magic_agents/hooks/contracts.py:1-202`
+**File**: `magic_agents/hooks/contracts.py`
 
 **Status**: ✅ Implemented as `total=False` TypedDicts. NOT enforced at the Protocol level — serve as documentation and optional factory validation.
 
@@ -78,7 +78,7 @@ All factory methods:
 
 ## Canonical Bypass Reasons
 
-**File**: `magic_agents/hooks/contracts.py:32-38`
+**File**: `magic_agents/hooks/contracts.py`
 
 ```python
 BypassReason = Literal["upstream_error", "condition", "not_ready"]
@@ -92,7 +92,7 @@ BypassReason = Literal["upstream_error", "condition", "not_ready"]
 
 ## Deprecated Context Subclasses
 
-**File**: `magic_agents/hooks/flow_hooks.py:253-292`
+**File**: `magic_agents/hooks/flow_hooks.py`
 
 **Status**: ⚠️ Deprecated. Use `HookContext` with `metadata` fields instead.
 

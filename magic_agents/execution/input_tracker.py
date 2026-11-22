@@ -18,6 +18,7 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Set, Optional
 from dataclasses import dataclass, field
+from magic_agents.util.aio import wait_for
 
 logger = logging.getLogger(__name__)
 
@@ -298,7 +299,7 @@ class NodeInputTracker:
             asyncio.TimeoutError if timeout reached
         """
         try:
-            await asyncio.wait_for(self._ready_event.wait(), timeout=timeout)
+            await wait_for(self._ready_event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             logger.error(
                 "Node %s timed out waiting for inputs. "

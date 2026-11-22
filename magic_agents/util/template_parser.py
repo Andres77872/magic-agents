@@ -1,8 +1,11 @@
-from jinja2 import Environment
 import json
 import re
 
-env = Environment()
+from jinja2.sandbox import SandboxedEnvironment
+
+# Templates are authored graph data. The sandbox blocks attribute escapes such
+# as ``lipsum.__globals__.os.environ`` that would expose server secrets.
+env = SandboxedEnvironment()
 
 def regex_replace(s, pattern, repl, ignorecase=False, dotall=False):
     flags = 0
@@ -32,10 +35,10 @@ def fromjson(s):
     which is essential for parser-to-parser JSON handoff patterns
     (e.g. dynamic flow routing, state management across nodes).
     """
-    if isinstance(s, (dict, list)):
+    # Already-decoded values (dict, list, numbers, booleans, None) pass through,
+    # e.g. a parser input "42" that safe_json_parse turned into 42.
+    if not isinstance(s, (str, bytes, bytearray)):
         return s
-    if s is None:
-        return None
     return json.loads(s)
 
 def tojson(value, indent=None):

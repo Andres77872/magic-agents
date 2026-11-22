@@ -131,8 +131,8 @@ Construct a fresh graph for each request, or use the existing invocation factory
 
 ## Verification and TBD
 
-`test/test_embedded_skills.py` verifies 72 offline cases: strict validation and immutable props, exact batches/errors/bounds, factory/aliases/fanout/readiness, metadata-first buffered/streamed requests, repeat loads/invocations, stale native history, terminal context overflow and actual provider callback/log privacy.
+`tests/nodes/skills/test_embedded_skills.py` verifies 72 offline cases: strict validation and immutable props, exact batches/errors/bounds, factory/aliases/fanout/readiness, metadata-first buffered/streamed requests, repeat loads/invocations, stale native history, terminal context overflow and actual provider callback/log privacy.
 
-`test/test_multisource_skills.py` adds 22 offline cases for the real shared-client X → A/B, Y → B graph and final OpenAI transport payloads, concurrent consumers and reused call IDs, private A-only loading and atomic guessed-Y rejection, ordered B batches with ownership, every-source readiness, reverse delivery order, fresh invocations and source failure, duplicate source/ID rejection, aggregate limits, disabled/disconnected IDs, native stale-history cleanup and idempotent observer privacy. Together these suites pass 94 cases.
+`tests/nodes/skills/test_multisource_skills.py` adds 22 offline cases for the real shared-client X → A/B, Y → B graph and final OpenAI transport payloads, concurrent consumers and reused call IDs, private A-only loading and atomic guessed-Y rejection, ordered B batches with ownership, every-source readiness, reverse delivery order, fresh invocations and source failure, duplicate source/ID rejection, aggregate limits, disabled/disconnected IDs, native stale-history cleanup and idempotent observer privacy. Together these suites pass 94 cases.
 
 All other Skills capabilities remain TBD: file/reference paging, scripts/assets, YAML/SKILL.md import, external catalog/version/ACL infrastructure, automatic host selection, slash arguments, model overrides, native hosted Skills and skill-specific hooks/subagents.

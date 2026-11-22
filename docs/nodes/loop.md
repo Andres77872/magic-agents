@@ -7,7 +7,7 @@ Iterate over a list and aggregate per-iteration feedback.
 ## Runtime class
 
 - `NodeLoop`
-- model: `LoopNodeModel` (currently just a stub)
+- model: `LoopNodeModel` is declared but not applied: `create_node()` passes the raw `data` (including `handles`) to `NodeLoop`
 
 ## Default inputs
 
@@ -25,6 +25,7 @@ Iterate over a list and aggregate per-iteration feedback.
 - emits each item during iteration
 - aggregates values fed back into `handle_loop`
 - triggers the specialized loop executor for the entire graph
+- `data.max_iterations` (positive integer, default 100) caps the processed items; the rest are dropped with a `MaxIterationsExceeded` debug event. Unknown `data` fields are rejected at build, as for every other node
 
 ## Critical runtime nuance
 
@@ -55,4 +56,24 @@ Each iteration starts clean. Inputs that iteration nodes receive from the loop i
 
 ## Example
 
-See [../../examples/loop/loop_with_llm_processing.json](../../examples/loop/loop_with_llm_processing.json).
+Each item of the input list is rendered by a parser and fed back; `handle_end`
+receives the aggregated results:
+
+```json
+{
+  "nodes": [
+    {"id": "input", "type": "user_input"},
+    {"id": "loop", "type": "loop"},
+    {"id": "target", "type": "parser", "data": {"text": "{{ handle_parser_input }}"}},
+    {"id": "end", "type": "end"}
+  ],
+  "edges": [
+    {"source": "input", "target": "loop", "sourceHandle": "handle_user_message", "targetHandle": "handle_list"},
+    {"source": "loop", "target": "target", "sourceHandle": "handle_item", "targetHandle": "handle_parser_input"},
+    {"source": "target", "target": "loop", "sourceHandle": "handle_parser_output", "targetHandle": "handle_loop"},
+    {"source": "loop", "target": "end", "sourceHandle": "handle_end", "targetHandle": "handle_flow_input"}
+  ]
+}
+```
+
+Run it with `build(spec, message='["alpha", "beta"]')`.

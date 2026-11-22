@@ -23,6 +23,7 @@ from magic_agents.coordination.budget import BudgetError, UsageBound, WorkgroupB
 from magic_agents.coordination.control import ActorLoopControl, BudgetAttemptControl
 from magic_agents.coordination.service import CoordinationError, CoordinationService, _json, LIFECYCLE_CHECKPOINT_KEY
 from magic_agents.models.coordination import CoordinationLimits
+from magic_agents.util.aio import wait_for
 
 
 @dataclass(frozen=True)
@@ -165,8 +166,10 @@ class CoordinationScope:
         if self.service is not None:
             limits = self.service.limits
             # Retain final activation/state, request, job and epoch dispositions.
+            # Invocation mode admits an unset (unbounded) tool-call limit; no
+            # finite reservation covers it, so those records are best-effort.
             slots = (3 * (len(self.roles) + limits.max_wakeups_per_workgroup)
-                     + limits.max_accepted_messages + 2 * limits.max_tool_calls + 2)
+                     + limits.max_accepted_messages + 2 * (limits.max_tool_calls or 0) + 2)
         self.runtime.events.bind_scope(root_run_id=root_id, run_id=actual,
             workgroup_id=self.runtime.workgroup_id, epoch_id=self.runtime.epoch_id,
             scope_id=self.scope_id, terminal_slots=slots)
@@ -557,7 +560,7 @@ class CoordinationScope:
                     if self.service._state not in ('open', 'sealed'):
                         raise CoordinationError(self.service._state, 'Coordination group reached a terminal failure')
                 try:
-                    await asyncio.wait_for(self.budget.condition.wait(),
+                    await wait_for(self.budget.condition.wait(),
                         timeout=max(0, self.budget.deadline - self.budget.clock()))
                 except TimeoutError:
                     continue

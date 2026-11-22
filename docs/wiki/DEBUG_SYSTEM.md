@@ -59,7 +59,7 @@ Current preset names:
 | Event type | Shape |
 | --- | --- |
 | `debug` | per-error or per-node structured payload |
-| `debug_summary` | final `GraphDebugFeedback` payload |
+| `debug_summary` | forwarded only when a node emits one; the end-of-run `GraphDebugFeedback` goes to `debug_callback` as a `GRAPH_END` `DebugEvent` (rendered as `debug_summary` by the `DebugSSEHook` sink), not to the `run_agent()` stream |
 | `loop_progress` | loop progress event |
 
 ## Observer architecture
@@ -94,11 +94,11 @@ Nodes usually emit debug events instead of throwing hard exceptions into the cal
 - JSON parsing failures
 - MCP transport/protocol failures
 
-Validation diagnostics can also be surfaced as debug payloads, but only blocking `GraphValidationError` entries abort execution immediately.
+Validation diagnostics can also be surfaced as debug payloads, but only blocking entries (`GraphValidationError`, `HookValidationError`, `FetchTemplateValidationError`) abort execution immediately.
 
 ## Important nuance
 
-`run_agent()` output is not guaranteed to be only `ChatCompletionModel` objects when debug is enabled. Debug events are plain dict events.
+`run_agent()` always yields dict events, debug on or off. Streaming chunks are `ChatCompletionModel` objects nested at `event["content"]` of `type: "content"` events; validation errors, `GRAPH_START` and node error/timeout frames are `type: "debug"` events even when `graph.debug` is false.
 
 That is why consumers and tests must branch on the event `type` instead of blindly assuming every item has `.choices`.
 

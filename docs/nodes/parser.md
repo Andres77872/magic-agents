@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Render a Jinja2 template against the node inputs.
+Render a Jinja2 template against the node inputs. Templates render in a Jinja2 `SandboxedEnvironment`: attribute escapes such as `lipsum.__globals__` raise `SecurityError`, so a template cannot read the server environment.
 
 ## Runtime class
 

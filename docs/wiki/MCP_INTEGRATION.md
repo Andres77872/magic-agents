@@ -18,7 +18,7 @@ flowchart LR
 
 - one server per `mcp` node at runtime
 - supported transports: `stdio`, `http`
-- tool names can be prefixed to avoid collisions
+- tool names are always exposed as `{prefix}_{tool}`; the prefix defaults to the node id and is normalized to lowercase letters, digits and underscores (falling back to `mcp`)
 - allowlist and denylist can filter discovered tools
 - cleanup runs in `finally`
 

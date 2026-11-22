@@ -43,16 +43,17 @@ Validation is strict at model/graph build time:
 
 Connect `node_tool.handle-tool-definition` to an `llm` tool input such as `handle-tool-definition-0`. NodeLLM passes the raw schema through provider `tools=` using the direct `magic-llm` generation path.
 
-Schema-only NodeTool must not be mixed with callable server tools (`fetch` tool mode, `python_exec`, `mcp`, task subagents) on the same LLM node in v1. Split the graph into separate LLM nodes if you need both.
+Schema-only NodeTool must not be mixed with callable server tools (`fetch` tool mode, `python_exec`, `inner` tool mode, `mcp`, task subagents) on the same LLM node in v1. Split the graph into separate LLM nodes if you need both.
 
 ## Tool-call envelope
 
-When a schema-only tool call is returned, `handle-tool-calls` emits:
+When a schema-only tool call is returned, `handle-tool-calls` emits (`node_id` is the emitting LLM node):
 
 ```json
 {
   "execution": "client",
   "source": "schema_only",
+  "node_id": "answer",
   "tool_calls": [
     {"id": "call_123", "type": "function", "function": {"name": "client_lookup_order", "arguments": "{}"}}
   ]

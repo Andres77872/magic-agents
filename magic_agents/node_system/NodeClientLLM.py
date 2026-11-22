@@ -10,6 +10,18 @@ from magic_llm import MagicLLM
 
 logger = logging.getLogger(__name__)
 
+PROVIDER_INIT_ERROR = "Provider client initialization failed."
+
+
+class ClientConfigurationError(ValueError):
+    """An authored client setting is invalid.
+
+    Messages are constant text written in this module and never include resolved
+    configuration values, so they are safe to show. Provider constructor errors
+    are still replaced by ``PROVIDER_INIT_ERROR`` because they may echo
+    credentials.
+    """
+
 
 class NodeClientLLM(Node):
     """
@@ -83,7 +95,7 @@ class NodeClientLLM(Node):
         if args.get('engine') != 'openai':
             endpoint = args.pop('endpoint', None)
             if endpoint == 'responses':
-                raise ValueError("Responses requires engine='openai'")
+                raise ClientConfigurationError("Responses requires engine='openai'")
 
         return args
 
@@ -110,8 +122,12 @@ class NodeClientLLM(Node):
             self._current_engine = engine
             self._current_model = model
             logger.info("NodeClientLLM:%s client initialized", self.node_id)
+        except ClientConfigurationError as e:
+            self.init_error = str(e)
+            self.init_error_type = type(e).__name__
+            logger.error("NodeClientLLM:%s invalid client configuration: %s", self.node_id, self.init_error)
         except Exception as e:
-            self.init_error = "Provider client initialization failed."
+            self.init_error = PROVIDER_INIT_ERROR
             self.init_error_type = type(e).__name__
             logger.error("NodeClientLLM:%s failed to initialize client: %s", self.node_id, self.init_error)
 

@@ -110,7 +110,10 @@ class DebugConfig:
         """
         if not data:
             return cls()
-        
+        # Never mutate the caller's mapping (graph definitions are reused).
+        if isinstance(data, dict):
+            data = dict(data)
+
         # Check for preset first
         preset_name = data.pop("preset", None) if isinstance(data, dict) else None
         

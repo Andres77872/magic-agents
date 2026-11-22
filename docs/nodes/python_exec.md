@@ -13,8 +13,11 @@ Expose a Python execution tool to an `llm` node, or execute configured Python co
 
 | Mode | Trigger | Output |
 |------|---------|--------|
-| Tool mode | `data.code` is absent or empty | `handle-tool-definition` |
-| Node mode | `data.code` is a non-empty string | `handle-python_exec-result` |
+| Tool mode (model-written code) | `data.code` is absent or empty, `tool_mode` not `false` | `handle-tool-definition` |
+| Fixed tool | `data.code` is a non-empty string and `tool_mode: true` | `handle-tool-definition` (a `FixedPythonTool` whose arguments match `tool_parameters`) |
+| Node mode | `data.code` is a non-empty string and `tool_mode` is not `true` | `handle-python_exec-result` |
+
+`tool_mode: false` without `code` is rejected at build ("Python node mode requires code defining run(handler)").
 
 ## Config fields
 
@@ -23,6 +26,9 @@ Expose a Python execution tool to an `llm` node, or execute configured Python co
 - `max_output_chars`
 - `code` — optional Python source for direct node-mode execution via the `run(handler)` contract
 - `tool_name` — optional tool-mode name; defaults to `execute_python`
+- `tool_mode` — `null` (default) infers the mode from `code`; `true` with `code` makes a fixed tool; `false` forces node mode
+- `tool_description` — fixed-tool description (default "Run the configured Python function with structured arguments.")
+- `tool_parameters` — fixed-tool JSON Schema of the arguments
 - `handles` — supports `safety_mode`, `timeout`, `max_output_chars`, and `output`
 
 ## Important behavior

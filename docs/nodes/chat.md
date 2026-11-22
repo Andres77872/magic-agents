@@ -67,6 +67,8 @@ Example override:
 | `max_input_tokens` | `int` or `null` | No | `null` | `>= 1` | Maximum estimated tokens for the assembled chat. Applied AFTER `max_messages`. When `null` and legacy `memory.max_input_tokens` is set, falls back to the legacy value with a deprecation warning. |
 | `truncation_strategy` | `string` | No | `"tail"` | `"tail"` or `"token_budget"` | Windowing strategy. `"tail"` = keep the newest N non-system messages. `"token_budget"` = defer to token budget (skip the message-count step and go directly to token-level enforcement). |
 | `model` | `string` or `null` | No | `null` | — | Usage/logging only. Does **not** affect STM windowing token estimation, which uses a hardcoded tokenizer. Optional — purely informational. |
+| `file_cache_redis` | `object` or `null` | No | `null` | — | Redis connection for caching parsed PDF attachments (`url_env`, `url`, or `host`/`port`/`db`); see [../chat-file-attachments.md](../chat-file-attachments.md). Requires the `redis` extra. |
+| `file_cache_ttl_seconds` | `int` | No | `86400` | `>= 1` | TTL of cached parsed PDFs. |
 
 ### Backward compatibility
 
@@ -108,15 +110,19 @@ yield self.yield_static(self.chat, ...)        ← windowed output
 JSON-encoded list. All image references are attached to the current-turn user
 message.
 
-`handle_user_files` accepts provider-neutral descriptors because `ModelChat`
-does not expose a raw-file primitive. Each descriptor is either a
-`[text, image]` pair or a mapping with `text`/`content` and an optional
-`image`/`url`/`image_url`. Extracted file messages are inserted immediately
-before the current-turn user message. For backward compatibility, legacy
-`[text, image]` descriptors routed through `handle_user_images` remain valid.
+`handle_user_files` accepts raw file descriptors (`name`, `mime_type`,
+`data` as a data URL), which are decoded and parsed by the attachment
+processor (UTF-8 `.md`/`.txt` and `.pdf`, at most 4 per turn; see
+[../chat-file-attachments.md](../chat-file-attachments.md)), and
+provider-neutral extracted descriptors: a `[text, image]` pair or a mapping
+with `text`/`content` and an optional `image`/`url`/`image_url`. Extracted file
+messages are inserted immediately before the current-turn user message. For
+backward compatibility, legacy `[text, image]` descriptors routed through
+`handle_user_images` remain valid.
 
-The image and file handles are mutually exclusive for a single Chat node
-execution. Invalid or mixed attachment shapes produce a `ValidationError`
+Images and files can be combined in one turn; both attach to the current user
+message. Within `handle_user_images`, mixing image references with legacy file
+descriptors is rejected. Invalid attachment shapes produce a `ValidationError`
 debug event and no chat output.
 
 ## STM Windowing
@@ -133,7 +139,7 @@ Windowing is **skipped entirely** when both `max_messages` and `max_input_tokens
 
 | Field | Effect |
 |-------|--------|
-| `max_messages` | Message-count limit. Keeps the newest N non-system messages (excluding system messages and the last user message). Older messages are dropped. |
+| `max_messages` | Message-count limit. Keeps the newest N non-system messages; the last user message is always kept and counts toward N. Older messages are dropped. |
 | `max_input_tokens` | Token budget limit. Estimated tokens via `tiktoken`; oldest messages dropped until within budget. Applied after `max_messages`. |
 | `truncation_strategy` | `"tail"` = apply message-count then token-budget. `"token_budget"` = skip message-count, go directly to token enforcement. |
 
@@ -253,7 +259,7 @@ The following fields are exposed via `NodeChat._capture_internal_state()`:
 | `messages_before_windowing` | `int` | Message count before `apply_windowing()` was called this turn. |
 | `messages_after_windowing` | `int` | Message count after windowing. |
 | `messages_discarded` | `int` | `messages_before_windowing − messages_after_windowing`. |
-| `total_tokens_estimated` | `int` or `null` | Estimated token count after windowing (or `null` if not estimated). |
+| `total_tokens_estimated` | `int` or `null` | Reserved: currently always `null` (not yet populated). |
 | `windowing_applied` | `bool` | `true` when any STM limit was active this turn. |
 
 ## Graph Wiring Examples

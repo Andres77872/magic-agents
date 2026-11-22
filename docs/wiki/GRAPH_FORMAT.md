@@ -34,6 +34,8 @@ This guide documents the JSON structure the current code actually consumes.
 | `contract_config` | no | Validation behavior. Supports `mode: off|shadow|warn|strict` plus `strict_runtime` (currently deferred). Defaults to `warn`. |
 | `nodes` | yes | Node definitions. |
 | `edges` | yes | Edge definitions. |
+| `coordination` | no | Optional coordination policy (`CoordinationPolicy`). Validated at build by `require_valid_coordination()`; see [../nodes/llm.md](../nodes/llm.md) (`messaging`). |
+| `persistence_enabled` | no | `true`/`false` overrides `RuntimeConfig.persistence_enabled` for this graph; `null` (default) defers to the runtime config. |
 | `master` | no | Legacy field. Present in older examples, but not read by the current runtime. |
 
 ## Programmatic-only graph fields
@@ -79,7 +81,6 @@ That field is meaningful when building graphs from Python objects, not as normal
   "targetHandle": "handle_user_message",
   "hooks": {
     "hook_node_id": "edge-hook-1",
-    "hook_type": "on_edge_traversed",
     "timeout_override": 5,
     "enabled": true
   }
@@ -92,8 +93,9 @@ That field is meaningful when building graphs from Python objects, not as normal
 | `source` | yes | Source node ID. |
 | `target` | yes | Target node ID. |
 | `sourceHandle` | no | Output handle from the source node. |
-| `targetHandle` | no | Input handle on the target node. Missing values can be auto-filled in some cases. |
-| `hooks` | no | Optional edge-level hook config. If enabled and `hook_node_id` resolves to a `hook` node, the dispatcher invokes it when the edge is traversed. |
+| `targetHandle` | no | Input handle on the target node. Tool edges into an `llm` are auto-filled with `handle-tool-definition-N`; any other missing value defaults to `handle-void`, which routes the edge to the internal sink so it delivers nothing. |
+| `hooks` | no | Optional edge-level hook config. If enabled and `hook_node_id` resolves to a `hook` node, the dispatcher invokes it when the edge is traversed. `hooks.hook_type` is deprecated and ignored. |
+| `sourcePort` / `targetPort` | no | Optional port identity alongside the handle names (`EdgeNodeModel`). |
 
 ## Node type literals
 
@@ -111,7 +113,7 @@ That is **21** implemented node types.
 
 ## Concrete examples
 
-### 1. Conditional branch from `examples/json/browsing.json`
+### 1. Conditional branch from a browsing graph
 
 ```json
 {
@@ -126,7 +128,7 @@ That is **21** implemented node types.
 }
 ```
 
-### 2. Loop + iterate example from `examples/loop/loop_with_llm_processing.json`
+### 2. Loop + iterate example
 
 ```json
 {
@@ -193,7 +195,8 @@ Many examples use `handle_parser_input_0`, `handle_parser_input_1`, and so on. T
 
 ## Example flow shapes worth reading
 
-- [../../examples/json/browsing.json](../../examples/json/browsing.json)
-- [../../examples/loop/loop_with_llm_processing.json](../../examples/loop/loop_with_llm_processing.json)
-- [../../examples/conditional/conditional_simple_if_else.json](../../examples/conditional/conditional_simple_if_else.json)
-- [../../examples/json/browsing_loop_v2.json](../../examples/json/browsing_loop_v2.json)
+Complete graphs used by the test suite (they build against the current code):
+
+- [../../tests/fixtures/graphs/browsing.json](../../tests/fixtures/graphs/browsing.json): conditional routing and parallel fetches
+- [../../tests/fixtures/graphs/deep_research.json](../../tests/fixtures/graphs/deep_research.json): fetch tools in an agent loop
+- [../../tests/fixtures/graphs/image.json](../../tests/fixtures/graphs/image.json): Text → Chat system context

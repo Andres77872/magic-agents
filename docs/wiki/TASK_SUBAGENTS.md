@@ -27,15 +27,23 @@ Applications can provide their own `subagents/` directory with manifests and cal
 
 ## Registration model
 
-1. YAML manifest defines identity and schema
+1. A `*.agent.yaml` manifest defines identity and schema
 2. Python callable is decorated with MagicLLM's `@subagent(..., registry=...)`
-3. `NodeLLM` loads manifests from the application's `subagents/` directory, relative to the process working directory, when the feature is enabled
+3. `NodeLLM` loads manifests from `./subagents/` (relative to the process working directory) when the feature is enabled
 
 ## Current feature toggle API
 
+Two flags must both be on; each defaults to off:
+
 ```python
 from magic_agents.agt_flow import enable_task_subagents, disable_task_subagents
+from magic_llm.agent.config import enable_subagents
+
+enable_task_subagents()  # magic-agents: NodeLLM asks MagicLLM to load ./subagents/
+enable_subagents()       # magic-llm: otherwise load_subagents() returns an empty bundle
 ```
+
+Enabling only the first loads nothing and gives no warning; see [../external/magic-llm.md](../external/magic-llm.md) (ML-6).
 
 ## Known caveats
 

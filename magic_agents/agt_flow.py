@@ -338,8 +338,10 @@ def create_node(node: dict, load_chat: Callable, debug: bool = False, deps: Opti
         # Pass validated data to constructor
         return constructor(**extra, **validated.model_dump(exclude_none=True))
     elif node_type == ModelAgentFlowTypesModel.LOOP:
-        # Loop node uses handles for routing configuration
-        return constructor(**extra, **node_data)
+        # Validate like every other node (unknown fields fail); handles were
+        # already moved to ``extra``.
+        validated = LoopNodeModel(**node_data)
+        return constructor(**extra, max_iterations=validated.max_iterations)
     elif node_type == ModelAgentFlowTypesModel.INNER:
         # Validate inner config using Pydantic model
         validated = InnerNodeModel(**node_data)
@@ -470,7 +472,7 @@ async def execute_graph_loop(
         _registry = HookRegistry()
         _registry.register_graph(graph.hooks)
 
-    async for result in execute_graph_loop_reactive(
+    async with aclosing(execute_graph_loop_reactive(
         graph=graph,
         id_chat=id_chat,
         id_thread=id_thread,
@@ -482,8 +484,9 @@ async def execute_graph_loop(
         hooks=_registry,
         runtime_config=hooks,
         debug_callback=debug_callback,
-    ):
-        yield result
+    )) as _relayed:
+        async for result in _relayed:
+            yield result
 
 
 def validate_graph(nodes: list[dict], edges: list[dict]) -> dict:

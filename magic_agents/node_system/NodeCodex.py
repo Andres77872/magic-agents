@@ -58,9 +58,14 @@ class NodeCodex(Node):
 
     @staticmethod
     def _word_boundary_match(trigger: str, text_folded: str) -> bool:
-        """Case-insensitive word-boundary match using \\b anchors."""
+        """Case-insensitive whole-token match.
+
+        The trigger may not be preceded or followed by a word character. Unlike
+        ``\\b`` anchors this also works for triggers that start or end with a
+        non-word character, such as ``c++`` or ``.net``.
+        """
         return bool(re.search(
-            rf'\b{re.escape(trigger.casefold())}\b',
+            rf'(?<!\w){re.escape(trigger.casefold())}(?!\w)',
             text_folded
         ))
 

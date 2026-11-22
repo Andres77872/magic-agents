@@ -17,13 +17,17 @@ A valid graph JSON contains:
 | `nodes` | `array[NodeJSON]` | **Required** | Array of node definitions |
 | `edges` | `array[EdgeJSON]` | **Required** | Array of edge definitions |
 
+The graph may also be wrapped as `{"content": {"nodes": [...], "edges": [...]}}`; `build()` unwraps it.
+
 Optional fields:
-- `type`: `"graph"` (optional metadata)
+- `type`: `string` (optional label, default `"chat"`)
 - `debug`: `boolean` (optional, runtime debug mode)
 - `debug_config`: `object` (optional, debug configuration)
 - `timeout`: `number` (optional, graph-level timeout in seconds, default `60.0`)
 - `contract_config`: `object` (optional, validation mode: `"off"`, `"shadow"`, `"warn"`, `"strict"`; default `"warn"`)
-- `hooks`: `FlowHooks` (optional, programmatic graph-level hook protocol — not serializable via JSON; injected at build time; see [hooks/README.md](hooks/README.md))
+- `coordination`: `object` (optional `CoordinationPolicy`; validated at build by `require_valid_coordination()`)
+- `persistence_enabled`: `boolean | null` (optional; overrides `RuntimeConfig.persistence_enabled` for this graph, `null` defers)
+- `hooks`: not settable from JSON. `build()` logs a warning and removes a `hooks` key; pass `FlowHooks` through `run_agent(..., hooks=RuntimeConfig(...))` or use `hook` nodes (see [hooks/README.md](hooks/README.md))
 
 ### Example
 
@@ -54,9 +58,9 @@ Each node in `nodes` array must contain an `id` and `type`; `data` and `position
 
 ### Validation Rules
 
-1. **`id` must be unique** — duplicate IDs rejected with error
-2. **`id` must be non-empty string** — empty IDs rejected
-3. **`type` must be canonical** — unknown types rejected with available types list
+1. **`id` should be unique** — duplicates are rejected only when `coordination` is enabled; otherwise the later node silently replaces the earlier one
+2. **`id` should be a non-empty string** — empty IDs are not rejected today
+3. **`type` must be canonical** — unknown types raise `ValueError("Unsupported node type: ... Available types: [...]")`
 4. **`data` fields must match node model** — unknown fields rejected (see `extra='forbid'`)
 5. **UI-only fields are rejected** — `measured`, `inputs`, `selected`, `dragging` are not permitted
 
@@ -136,6 +140,8 @@ arrays.
 | `engine` | `string` | Optional | `null` | `provider` |
 | `api_info` | `object|string` | Optional | `null` | `config`, `credentials` |
 | `model` | `string` | Optional | `null` | `model_name` |
+| `endpoint` | `string` | Optional | `null` | - (`"chat_completions"` or `"responses"`; `responses` requires `engine: "openai"`) |
+| `extra_data` | `object` | Optional | `{}` | - (extra client options; `{{env.*}}` resolved) |
 
 ### llm Fields
 
@@ -152,6 +158,9 @@ arrays.
 | `max_input_tokens` | `integer` | Optional | `null` | - |
 | `truncation_strategy` | `string` | Optional | `"tail"` | - |
 | `model` | `string` | Optional | `null` | - |
+| `reasoning_effort` | `string` | Optional | `null` | - |
+| `agent_config` | `object` | Optional | `null` | - (`max_iterations`, `wall_clock_timeout`, `per_tool_timeout`, `max_parallel_tools`) |
+| `messaging` | `object` | Optional | `null` | - (coordination participant config) |
 
 `history_messages` is backend-injected for no-CHAT graph paths. `max_messages`, `max_input_tokens`, `truncation_strategy`, and `model` mirror the no-CHAT STM fallback controls documented on the `llm` node page and `LlmNodeModel`.
 
@@ -163,10 +172,11 @@ arrays.
 | `method` | `string` | Optional | `"GET"` | - |
 | `headers` | `object|string` | Optional | `null` | - |
 | `params` | `object|string` | Optional | `null` | `query` |
-| `body` | `object|string` | Optional | `null` | `data` |
+| `data` | `object|string` | Optional | `null` | `body` |
 | `json_data` | `object|string` | Optional | `null` | `json_body` |
 | `tool_mode` | `boolean` | Optional | `false` | - |
 | `tool_name` | `string` | Optional | `null` | - |
+| `tool_description` | `string` | Optional | `null` | - |
 | `tool_parameters` | `object` | Optional | `null` | - |
 
 ### skills Fields
@@ -216,7 +226,9 @@ Do not mix `node_tool` schemas with callable server tools on the same LLM node i
 
 ### loop Fields
 
-No additional fields beyond base.
+| Field | Type | Required | Default | Aliases |
+|-------|------|----------|---------|---------|
+| `max_iterations` | `integer` (>= 1) | Optional | `null` (executor default 100) | - |
 
 ### inner Fields
 
@@ -224,6 +236,11 @@ No additional fields beyond base.
 |-------|------|----------|---------|---------|
 | `magic_flow` | `object` | Optional | `null` | `flow`, `graph`, `subgraph` |
 | `parent_state_mapping` | `object` | Optional | `null` | - |
+| `tool_mode` | `boolean` | Optional | `false` | - |
+| `tool_name` | `string` | Optional | `"run_flow"` | - |
+| `tool_description` | `string` | Optional | (default text) | - |
+| `tool_parameters` | `object` | Optional | `null` | - |
+| `tool_timeout` | `number` | Optional | `30.0` | - |
 
 ### conditional Fields
 
@@ -234,6 +251,11 @@ No additional fields beyond base.
 | `handles` | `object` | Optional | `null` | Custom handle mappings |
 | `output_handles` | `array` | Optional | `null` | Declared output handles |
 | `default_handle` | `string` | Optional | `null` | Fallback handle |
+| `evaluation_mode` | `string` | Optional | `"jinja"` | `"jinja"`, `"llm"` or `"jev"` |
+| `questions` | `object` | Optional | `null` | Typed questions; required in `llm`/`jev` mode |
+| `evaluation_timeout` | `number` | Optional | `30.0` | Judgment timeout in seconds |
+| `evaluation_error_policy` | `string` | Optional | `"fail"` | `"fail"` or `"default"` |
+| `jev` | `object` | Optional | `null` | `{base_url, api_key}` for `jev` mode |
 
 **Note**: `condition` must be valid Jinja2 syntax.
 
@@ -247,6 +269,9 @@ No additional fields beyond base.
 | `code` | `string` or `null` | Optional | `null` | When set, runs as a graph node via `run(handler)` and emits `handle-python_exec-result` |
 | `tool_name` | `string` or `null` | Optional | `null` | Tool-mode name; defaults to `execute_python` when omitted |
 | `handles` | `object` or `null` | Optional | `null` | Handle overrides for config inputs and output |
+| `tool_mode` | `boolean` or `null` | Optional | `null` | `null` infers from `code`; `true` with `code` is a fixed tool; `false` forces node mode |
+| `tool_description` | `string` | Optional | (default text) | Fixed-tool description |
+| `tool_parameters` | `object` or `null` | Optional | `null` | Fixed-tool JSON Schema |
 
 ### mcp Fields
 
@@ -420,7 +445,13 @@ See [nodes/hook.md](nodes/hook.md) and [hooks/README.md](hooks/README.md) for ru
 |-------|------|----------|---------|-------------|
 | `function_template` | `string` | Optional | `""` | Python function template (def or async def) for hook execution |
 | `timeout_override` | `integer` | Optional | `null` | Per-hook timeout in seconds (global default 30s) |
-| `hook_type` | `string` | Optional | `"custom"` | Lifecycle marker: `"pre"`, `"post"`, `"error"`, `"custom"` |
+| `hook_type` | `string` | Optional | `"custom"` | Legacy label; does not select a lifecycle event |
+| `hook_mode` | `string` | Optional | `"python"` | `"python"` or `"messages"` |
+| `lifecycle_event` | `string` | Optional | `null` | `onStart`, `onDeliver`, `onError`, `onFinish`, `onCancel` |
+| `target_node_id` / `target_node_ids` | `string` / `array` | Optional | `null` | Lifecycle Hook targets |
+| `failure_policy` | `string` | Optional | `"preserve"` | `"preserve"` or `"fail"` |
+| `messaging_engine` | `string` | Optional | `"in_memory"` | `messages` mode storage |
+| `messaging_by_target` | `object` | Optional | `null` | `messages` mode per-target config |
 
 ### codex Fields
 
@@ -507,6 +538,8 @@ Uses `ChatNodeModel` for chat configuration, including session management, messa
 | `max_input_tokens` | `int` or `null` | No | `null` | `>= 1` | Maximum estimated tokens for the assembled chat context. Applied AFTER `max_messages` truncation when `truncation_strategy='tail'`, or independently when `truncation_strategy='token_budget'`. Falls back to legacy `memory.max_input_tokens` if that dict key is present (with deprecation warning). Token estimation uses a hardcoded GPT-5 tokenizer (not configurable via `model`). When `null`, no token-budget limit is enforced. |
 | `truncation_strategy` | `string` | No | `"tail"` | `"tail"` or `"token_budget"` | Windowing algorithm. `"tail"` = keep the newest N non-system messages (oldest dropped first). `"token_budget"` = skip message-count truncation entirely and rely solely on token-budget enforcement via `max_input_tokens`. Any other string value is rejected by Pydantic validation (`Literal['tail', 'token_budget']`). |
 | `model` | `string` or `null` | No | `null` | — | Model name for usage/logging tracking only. Does **NOT** affect STM windowing token estimation, which uses a hardcoded GPT-5 tokenizer. Optional — purely informational. |
+| `file_cache_redis` | `object` or `null` | No | `null` | — | Redis connection for caching parsed PDF attachments (needs the `redis` extra). |
+| `file_cache_ttl_seconds` | `integer` | No | `86400` | `>= 1` | TTL of cached parsed PDFs. |
 
 #### Windowing Semantics (STM)
 
@@ -583,8 +616,10 @@ Each edge in `edges` array must contain:
 | `target` | `string` | **Required** | Target node `id` |
 | `sourceHandle` | `string` | Optional | Output handle on source node |
 | `targetHandle` | `string` | Optional | Input handle on target node |
-| `type` | `string` | Optional | Edge visual type (default `"default"`) |
-| `hooks` | `object` | Optional | Edge-level hook config: `{hook_node_id, hook_type, timeout_override, enabled}`; see [hooks/README.md](hooks/README.md) |
+| `sourcePort` / `targetPort` | `string` | Optional | Port identity alongside the handle names |
+| `hooks` | `object` | Optional | Edge-level hook config: `{hook_node_id, timeout_override, enabled}` (`hook_type` is deprecated and ignored); see [hooks/README.md](hooks/README.md) |
+
+Other edge keys, such as a UI `type`, are ignored.
 
 ### Validation Rules
 
@@ -633,11 +668,11 @@ Each edge in `edges` array must contain:
 | `parser` | Arbitrary template variables; `handle_parser_input_*` is the common dynamic pattern |
 | `fetch` | `handle-url`, `handle-fetch-method`, `handle-fetch-data`, `handle-fetch-json_data`, `handle-fetch-headers`, `handle_fetch_input` |
 | `client` | Runtime overrides: `handle-client-engine`, `handle-client-model` |
-| `llm` | `handle-client-provider`, `handle-chat`, `handle-skills`, `handle-system-context`, `handle_user_message`, tool handles; runtime-overridable generation handles: `handle-llm-temperature`, `handle-llm-top_p`, `handle-llm-max_tokens`, `handle-llm-stream`, `handle-llm-iterate`, `handle-llm-json_output` |
+| `llm` | `handle-client-provider`, `handle-chat`, `handle-skills`, `handle-system-context`, `handle_user_message`, tool handles; runtime-overridable generation handles: `handle-llm-temperature`, `handle-llm-top_p`, `handle-llm-max_tokens`, `handle-llm-stream`, `handle-llm-iterate`, `handle-llm-json_output`, `handle-llm-reasoning_effort` |
 | `chat` | `handle-system-context`, `handle_user_message`, `handle_messages`, `handle_user_files`, `handle_user_images` |
 | `send_message` | `handle_send_extra` |
 | `loop` | `handle_list`, `handle_loop` |
-| `conditional` | `handle_input` plus custom merge input handles |
+| `conditional` | `handle_input` plus custom merge input handles; `handle-client-provider` in `llm` mode |
 | `inner` | `handle_user_message`, `handle_client_extras` |
 | `end` | `handle_flow_input` |
 | `void` | Internal sink; accepts rewritten `handle-void` targets |
@@ -653,23 +688,31 @@ Some runtime-consumed input handles are accepted through warn-mode opaque-handle
 
 ### Port Cardinality
 
+Generated from `magic_agents.util.handle_registry.PORT_CARDINALITY`:
+
 | Node Type | Handle | Cardinality | Exclusive |
 |-----------|--------|-------------|-----------|
 | `llm` | `handle_user_message` | `one` | `True` |
 | `llm` | `handle-client-provider` | `one` | `True` |
 | `llm` | `handle-tool-definition` / `handle-tool-definition-*` | `many` | `False` |
+| `llm` | `handle-skills` | `many` | `False` |
 | `llm` | `handle-chat` | `one` | `True` |
 | `llm` | `handle-system-context` | `one` | `True` |
+| `llm` | `handle-llm-reasoning_effort` | `one` | `True` |
 | `text` | `handle_flow_input` | `one` | `True` |
 | `parser` | `handle_parser_input` / `handle_parser_input_*` | `many` | `False` |
 | `end` | `handle_flow_input` | `many` | `False` |
 | `conditional` | `handle_input` | `many` | `False` |
+| `conditional` | `handle-client-provider` | `one` | `True` |
 | `loop` | `handle_list` | `one` | `True` |
 | `loop` | `handle_loop` | `many` | `False` |
 | `inner` | `handle_user_message` | `one` | `True` |
 | `inner` | `handle_client_extras` | `one` | `True` |
 | `send_message` | `handle_send_extra` | `one` | `True` |
-| `fetch` | request component handles | `one` | `True` |
+| `fetch` | `handle-url`, `handle-fetch-method`, `handle-fetch-data`, `handle-fetch-json_data`, `handle-fetch-headers`, `handle_fetch_input` | `one` | `True` |
+| `client` | `handle-client-model`, `handle-client-engine` | `one` | `True` |
+| `python_exec` | `handle-python_exec-safety_mode`, `handle-python_exec-timeout`, `handle-python_exec-max_output_chars` | `one` | `True` |
+| `void` | `handle-void` | `many` | `False` |
 | `hook` | `handle-hook-context` | `one` | `True` |
 | `codex` | `handle_codex_input` | `one` | `True` |
 | `memory` | `handle_memory_input` | `one` | `True` |
@@ -700,14 +743,17 @@ Users must reconnect edges manually. No automatic migration.
 
 ### Backend Validation (`extra='forbid'`)
 
-All Pydantic node models reject unknown fields. When validation fails:
+All Pydantic node models reject unknown fields. Failures surface as:
 
-| Error Type | Trigger | Message Format |
-|------------|---------|----------------|
-| `ExtraInputsNotPermitted` | Unknown field in `data` | `"Extra inputs are not permitted [field_name]"` |
-| `UnsupportedNodeType` | Unknown `type` key | `"Unsupported node type: {type}. Available types: [...]"` |
-| `MissingRequired` | Missing required field | `"Field required [field_name]"` |
-| `InvalidHandle` | Unknown handle | `"Invalid handle: '{handle}' is not valid for {node_type}"` |
+| Failure | Raised / reported as | Blocks the run? |
+|---------|----------------------|-----------------|
+| Unknown or missing `data` field | `pydantic.ValidationError` from the node model (`extra_forbidden`, `missing`) raised by `build()` | Yes (build raises) |
+| Unknown node `type` | `ValueError("Unsupported node type: {type}. Available types: [...]")` raised by `build()` | Yes (build raises) |
+| Structural graph problem (user_input count, duplicate edge) | `GraphValidationError` in `graph._validation_errors` | Yes |
+| Invalid Hook template / Fetch template | `HookValidationError` / `FetchTemplateValidationError` | Yes |
+| Edge to/from a missing node, self-loop | `InvalidEdgeSource` / `InvalidEdgeTarget` / `SelfLoopEdge` (edge is dropped) | No |
+| Unknown or legacy source handle | `InvalidSourceHandle` / `LegacyHandleRejected` | No (the edge never delivers) |
+| Unknown target handle, fan-in conflicts | contract diagnostics (`PORT_TARGET_HANDLE_UNKNOWN`, …) in `graph.contract_report` | No |
 
 ### Contract Validation (`contract_config`)
 
@@ -770,7 +816,6 @@ Frontend TypeScript interfaces in `magic-ui/src/App/Flow/Types/nodeModels.ts` mi
 
 - [HANDLES_AND_ROUTING.md](wiki/HANDLES_AND_ROUTING.md) — Handle routing protocol
 - [VALIDATION.md](wiki/VALIDATION.md) — Build-time validation details
-- `spec.md` in `.dev/sdd/changes/node-json-canvas-refactor/` — Full specification
 
 ---
 

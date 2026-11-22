@@ -46,12 +46,18 @@ Connect to an MCP server, discover tools, and expose them to downstream `llm` no
 
 ## Failure model
 
-Emits debug errors for:
+Emits a debug error and then re-raises for:
 
 - configuration errors
 - protocol errors
 - transport errors
 - unexpected runtime failures
+
+Because the error is re-raised, the node fails: its downstream edges are
+bypassed and `on_node_error` fires. Server identifiers in these errors and in
+debug state are shown as `stdio:<command>` or `http:<scheme://host[:port]/path>`;
+URL user info, query and fragment (where `{{env.*}}` tokens usually live) are
+dropped.
 
 ## Example
 

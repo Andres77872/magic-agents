@@ -6,7 +6,9 @@ Choose one output handle using application-owned Jinja2 routing. Exact rules
 use `evaluation_mode: "jinja"` (the default for existing graphs). Semantic
 decisions use `evaluation_mode: "llm"`: a connected MagicLLM client first answers
 independent typed questions about state, then the expression routes those answers.
-No Jev service or Jev credentials are used.
+`evaluation_mode: "jev"` asks the same typed questions of a Jev service
+instead (`jev.base_url`, default `https://api.typesafe.ai/v1`, and an optional
+`jev.api_key`); `llm` mode uses no Jev service or credentials.
 
 ## Runtime class
 
@@ -30,6 +32,7 @@ No Jev service or Jev credentials are used.
 - supports `merge_strategy: flat | namespaced`
 - exposes convenience alias `value` for the primary input
 - stores `selected_handle` for executor bypass propagation
+- the selected handle carries the merged input context (a dict of the non-client inputs, plus `value` for the primary input), not the bare input value
 - uses `default_handle` only when the rendered result is empty
 - `__bypass_all__` is emitted on configuration/template errors, causing executor to skip all downstream branches
 - a rendered handle with no matching outgoing edge is a `GraphRoutingError`: the node counts as failed (graph error; a sub-flow fails its Inner Flow node) and all downstream branches are skipped
@@ -41,9 +44,12 @@ No Jev service or Jev credentials are used.
 - `handles` — custom input handle name mappings (e.g., `{'input': 'my_input'}`)
 - `output_handles`
 - `default_handle`
-- `evaluation_mode` — `jinja` or `llm`; question definitions can remain saved while switching modes
-- `questions` — required and nonempty in LLM mode
+- `evaluation_mode` — `jinja` (default), `llm` or `jev`; question definitions can remain saved while switching modes
+- `questions` — required and nonempty in `llm` and `jev` modes
+- `output_handles` — also required in `llm` and `jev` modes
 - `evaluation_timeout` — finite positive provider timeout in seconds, default 30
+- `evaluation_error_policy` — `fail` (default) or `default`; `default` routes the original state to `default_handle` when a judgment fails, and requires `default_handle` to be listed in `output_handles`
+- `jev` — Jev connection settings for `jev` mode (`base_url`, `api_key`)
 
 ## Typed LLM questions
 
@@ -74,7 +80,7 @@ Connect a `client` output to `handle-client-provider` and state to `handle_input
 Custom handles use `handles.client_provider` (or `handles.client`) and
 `handles.input`/`handles.context`. When both client aliases are provided,
 `client_provider` takes precedence.
-Choice questions have 2–255 named criteria; score questions have 2–10 ordered
+Choice questions have 1–255 named criteria; score questions have 2–10 ordered
 descriptions. Instructions and descriptions can be strings, JSON objects, or
 arrays. Choice descriptions may be null. Noul optionally accepts a `criteria`
 object with `true` and/or `false` descriptions. Question IDs may contain punctuation;
@@ -92,9 +98,10 @@ Values must be finite numbers in [0,1]. Labels and IDs must exactly match the
 configuration. Positive distribution sums are normalized; original estimates
 and their sums are retained in `judgment_diagnostics.normalized_distributions`
 when the discrepancy exceeds 1e-6. Missing/extra labels, zero mass, invalid JSON,
-provider errors, and timeouts fail closed, bypassing every business branch.
-Only an empty routing result uses `default_handle`; malformed judgments and
-undeclared nonempty routes do not.
+provider errors, and timeouts fail closed, bypassing every business branch,
+unless `evaluation_error_policy` is `default`, which routes them to
+`default_handle`. Otherwise only an empty routing result uses
+`default_handle`; undeclared nonempty routes never do.
 
 Routing can read `answers` and `state` plus existing merged input variables.
 Selected branch payloads remain the original merged state. Generated answers
@@ -109,4 +116,4 @@ questions for interpretation of text and other semantic judgments.
 
 ## Example
 
-See [../../examples/conditional/conditional_simple_if_else.json](../../examples/conditional/conditional_simple_if_else.json).
+See the `conditional` node in [../../tests/fixtures/graphs/browsing.json](../../tests/fixtures/graphs/browsing.json).

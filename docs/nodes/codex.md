@@ -41,7 +41,7 @@ Unknown fields are rejected.
 
 - matching is case-insensitive
 - each entry prepends at most once per invocation
-- trigger matching uses Python regex word boundaries (`\b`)
+- a trigger matches as a whole token: it may not be preceded or followed by a letter, digit or underscore
 - an empty or missing input yields an empty passthrough
 - if no entries match, the original message is emitted unchanged
 - `<codex_content>` is prompt annotation text, not parsed or escaped XML
@@ -57,10 +57,8 @@ Do not keep a direct `user_input.handle_user_message -> chat.handle_user_message
 ]
 ```
 
-Triggers containing non-word characters, such as `c++` or `node.js`, can behave unexpectedly because matching uses `\b` word-boundary semantics.
+Triggers that start or end with a non-word character, such as `c++`, `.net` or `node.js`, match too: `c++` matches `use c++ now` but not `c++x`.
 
 ## Example
 
-See `examples/codex/codex_basic.json` for the focused build-clean example.
-
-Default smoke validation builds this example without provider credentials. Live/provider credentials are not required for the focused codex example.
+See the Memory + Codex graph in [memory.md](memory.md#memory--codex-coexistence); it builds without provider credentials.

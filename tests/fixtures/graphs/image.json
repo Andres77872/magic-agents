@@ -1,0 +1,119 @@
+{
+  "type": "graph",
+  "content": {
+    "nodes": [
+      {
+        "id": "0",
+        "type": "user_input",
+        "position": {
+          "x": -1192.9210735518543,
+          "y": 328.5453448679
+        },
+        "data": {}
+      },
+      {
+        "id": "5",
+        "type": "end",
+        "position": {
+          "x": 753.7623616307903,
+          "y": 1089.713648975795
+        },
+        "data": {}
+      },
+      {
+        "id": "66dd831a-530d-4cd1-acc7-c6eba1db6dc4",
+        "type": "client",
+        "data": {
+          "model": "gpt-4.1-2025-04-14",
+          "engine": "openai"
+        },
+        "position": {
+          "x": -973.860086105106,
+          "y": 643.627867249335
+        }
+      },
+      {
+        "id": "31889173-9c33-4c0f-90ea-9be8953d29e6",
+        "type": "llm",
+        "data": {
+          "model": "",
+          "top_p": 1,
+          "temperature": 0.7,
+          "max_tokens": 512,
+          "stream": true,
+          "json_output": false
+        },
+        "position": {
+          "x": 194.08446812200685,
+          "y": 102.54292930905945
+        }
+      },
+      {
+        "id": "5d00aefc-852e-4fa8-8d31-8ae27db3ca65",
+        "type": "chat",
+        "data": {
+          "memory": {}
+        },
+        "position": {
+          "x": -441.50540541395065,
+          "y": 359.76103989540456
+        }
+      },
+      {
+        "id": "10703021-baf6-4176-9e42-531f9dd02d55",
+        "data": {
+          "text": "Write always on French"
+        },
+        "type": "text",
+        "position": {
+          "x": -1055.1863799361515,
+          "y": -85.33904361214539
+        }
+      }
+    ],
+    "edges": [
+      {
+        "id": "xy-edge__66dd831a-530d-4cd1-acc7-c6eba1db6dc4handle-client-provider-31889173-9c33-4c0f-90ea-9be8953d29e6handle-client-provider",
+        "source": "66dd831a-530d-4cd1-acc7-c6eba1db6dc4",
+        "target": "31889173-9c33-4c0f-90ea-9be8953d29e6",
+        "sourceHandle": "handle-client-provider",
+        "targetHandle": "handle-client-provider"
+      },
+      {
+        "id": "xy-edge__31889173-9c33-4c0f-90ea-9be8953d29e6handle_generated_content-5handle_flow_input",
+        "source": "31889173-9c33-4c0f-90ea-9be8953d29e6",
+        "target": "5",
+        "sourceHandle": "handle_generated_content",
+        "targetHandle": "handle_flow_input"
+      },
+      {
+        "id": "xy-edge__0handle_user_message-5d00aefc-852e-4fa8-8d31-8ae27db3ca65handle_user_message",
+        "source": "0",
+        "target": "5d00aefc-852e-4fa8-8d31-8ae27db3ca65",
+        "sourceHandle": "handle_user_message",
+        "targetHandle": "handle_user_message"
+      },
+      {
+        "id": "xy-edge__0handle_user_images-5d00aefc-852e-4fa8-8d31-8ae27db3ca65handle_user_images",
+        "source": "0",
+        "target": "5d00aefc-852e-4fa8-8d31-8ae27db3ca65",
+        "sourceHandle": "handle_user_images",
+        "targetHandle": "handle_user_images"
+      },
+      {
+        "id": "xy-edge__5d00aefc-852e-4fa8-8d31-8ae27db3ca65handle_chat_output-31889173-9c33-4c0f-90ea-9be8953d29e6handle-chat",
+        "source": "5d00aefc-852e-4fa8-8d31-8ae27db3ca65",
+        "target": "31889173-9c33-4c0f-90ea-9be8953d29e6",
+        "sourceHandle": "handle_chat_output",
+        "targetHandle": "handle-chat"
+      },
+      {
+        "source": "10703021-baf6-4176-9e42-531f9dd02d55",
+        "sourceHandle": "handle_text_output",
+        "target": "5d00aefc-852e-4fa8-8d31-8ae27db3ca65",
+        "targetHandle": "handle-system-context",
+        "id": "xy-edge__10703021-baf6-4176-9e42-531f9dd02d55handle_text_output-5d00aefc-852e-4fa8-8d31-8ae27db3ca65handle-system-context"
+      }
+    ]
+  }
+}

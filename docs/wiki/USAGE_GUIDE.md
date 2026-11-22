@@ -34,7 +34,8 @@ This guide is about authoring graphs that match the current runtime.
 You can feed an `llm` with tools from:
 
 - `fetch` with `tool_mode: true`
-- `python_exec`
+- `python_exec` in tool mode
+- `inner` with `tool_mode: true` (runs its sub-flow as a tool)
 - `mcp`
 - schema-only `node_tool`
 - task subagents loaded through MagicLLM when enabled
@@ -48,9 +49,9 @@ Graph JSON is a set of `nodes` plus `edges`. Each edge says: take `sourceHandle`
 Practical rules:
 
 - Use node docs as the source of truth for valid handles. A wrong handle is not a cosmetic issue — it changes whether data arrives.
-- Normal nodes (`parser`, `llm`, `fetch` outside `tool_mode`, `python_exec` with `data.code`, etc.) pass values to downstream graph nodes through ordinary handles.
+- Normal nodes (`parser`, `llm`, `fetch` outside `tool_mode`, node-mode `python_exec`, etc.) pass values to downstream graph nodes through ordinary handles.
 - Tool-provider nodes connected to an `llm` use `handle-tool-definition-N` target handles so `NodeLLM` can collect tool schemas/functions before calling magic-llm.
-- `python_exec` with `data.code` is node-mode, not tool-provider mode. In that mode the build step preserves graph-routing handles and does not auto-assign LLM tool handles.
+- `python_exec` with `data.code` is node-mode unless `tool_mode: true` (which makes it a fixed tool). In node mode the build step preserves graph-routing handles and does not auto-assign LLM tool handles.
 - `node_tool` is schema-only. The backend passes the tool schema to the provider and emits returned tool calls for client-side execution; it does not execute those tools server-side.
 - Runtime-overridable LLM settings can be fed through dedicated input handles such as `handle-llm-temperature`, `handle-llm-max_tokens`, and `handle-llm-json_output`.
 

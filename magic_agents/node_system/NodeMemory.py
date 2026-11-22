@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import logging
+from datetime import UTC
 import uuid
 from typing import Any, Optional, AsyncGenerator
 
@@ -16,6 +17,17 @@ from magic_agents.models.factory.Nodes.MemoryNodeModel import (
 from magic_agents.node_system.Node import Node
 
 logger = logging.getLogger(__name__)
+
+# The event loop keeps only weak references to tasks; without a strong one a
+# fire-and-forget extraction can be garbage-collected before it finishes.
+_BACKGROUND_TASKS: set = set()
+
+
+def _spawn_background(coro, *, name: str) -> asyncio.Task:
+    task = asyncio.create_task(coro, name=name)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
 
 
 class NodeMemory(Node):
@@ -89,6 +101,9 @@ class NodeMemory(Node):
         self.INPUT_HANDLE = handles.get('input', self.DEFAULT_INPUT_HANDLE)
         self.OUTPUT_HANDLE = handles.get('output', self.DEFAULT_OUTPUT_HANDLE)
         self.CLIENT_HANDLE = handles.get('client', self.DEFAULT_CLIENT_HANDLE)
+        # Edge validation discovers instance inputs from INPUT_* attributes;
+        # without this alias a valid client edge is reported as unknown.
+        self.INPUT_HANDLE_CLIENT = self.CLIENT_HANDLE
 
         # Per-process counters for _capture_internal_state
         self._extracted_count: int = 0
@@ -148,9 +163,9 @@ class NodeMemory(Node):
                         self.node_id,
                         exc,
                     )
-                    asyncio.create_task(background_coro, name=f"mem-extract-{self.node_id}")
+                    _spawn_background(background_coro, name=f"mem-extract-{self.node_id}")
             else:
-                asyncio.create_task(background_coro, name=f"mem-extract-{self.node_id}")
+                _spawn_background(background_coro, name=f"mem-extract-{self.node_id}")
 
         # =====================================================================
         # SEQUENTIAL: Vector search + injection (Phases 4-6)
@@ -199,8 +214,11 @@ class NodeMemory(Node):
         # PHASE 5: Injection
         # =====================================================================
         if matches:
+            # Stores may return naive timestamps (e.g. legacy entries); treat
+            # them as UTC so they still order against aware ones.
             sorted_matches = sorted(
-                matches, key=lambda m: m.created_at,
+                matches,
+                key=lambda m: m.created_at if m.created_at.tzinfo else m.created_at.replace(tzinfo=UTC),
             )
             memory_blocks = "\n".join(
                 f"<memory_content>{m.content}</memory_content>"

@@ -27,17 +27,20 @@ Instead:
 - multiple independent branches can execute concurrently
 - output routing is handle-based, not node-type-based
 
-That is why the legacy `master` field is currently ignored by the runtime. See [../issues/master-field-is-ignored.md](../issues/master-field-is-ignored.md).
+That is why the legacy `master` field is ignored by the runtime: nothing reads it, and a graph's entry points are simply the nodes with no incoming edges.
 
 ## Event types you will see
 
-| Event type | Meaning |
+`run_agent()` always yields dicts with a `type` key:
+
+| Event type | Shape and meaning |
 | --- | --- |
-| `content` | user-facing streaming chunk or streaming-like content |
-| `debug` | structured debug/error payload |
-| `debug_summary` | final graph debug summary |
+| `content` | `{"type": "content", "content": <ChatCompletionModel chunk>, "source_node": id, "source_node_path": [...]}`: user-facing streaming chunk |
+| `debug` | `{"type": "debug", "content": {...}}`: structured debug/error payload |
 | `loop_progress` | per-iteration loop progress event |
-| handle name such as `handle_generated_content` | internal routed node output |
+| `debug_summary` | only forwarded when a node emits one; the executor does not produce a final summary |
+
+Handle-named outputs such as `handle_generated_content` are internal: they are stored in `node.outputs` and routed along edges, never yielded to the caller.
 
 ## Handle-driven routing
 
@@ -147,11 +150,9 @@ If a node waits longer than that for required inputs, the executor emits a debug
 
 ## Debug behavior
 
-When `graph.debug` is enabled:
+Whatever `graph.debug` is set to, validation issues, the `GRAPH_START` frame and node error/timeout frames are yielded as `debug` events.
 
-- validation issues are emitted as `debug`
-- node-level debug info can be emitted after execution
-- a final `debug_summary` is emitted after the graph finishes
+When `graph.debug` is enabled, node-level debug info is also emitted after execution. The end-of-run summary is not a yielded event: `DefaultObserver` sends a `GRAPH_END` `DebugEvent` carrying it to `debug_callback`, and the `DebugSSEHook` sink renders it as `debug_summary`.
 
 The actual observer chain is more nuanced than "debug on/off":
 
