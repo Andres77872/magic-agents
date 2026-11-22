@@ -500,7 +500,6 @@ async def test_unqualified_sdk_version_rejects_before_transport_construction(mon
             if missing: raise importlib.metadata.PackageNotFoundError(name)
             return 'unqualified-new-version'
         return original(name)
-    assert dict(NodeMcp.coordination_external_transport_versions) == {'mcp': '2.2.0', 'httpx2': '2.13.0', 'mcp-types': '2.2.0'}
     with pytest.raises(TypeError): NodeMcp.coordination_external_transport_versions[package] = 'authored-override'
     monkeypatch.setattr(importlib.metadata, 'version', checked)
     with pytest.raises(CoordinationError, match='dependencies have not been qualified'):

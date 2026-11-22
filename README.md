@@ -18,11 +18,32 @@ Start with:
 
 ## Installation
 
+Requires Python 3.11 or newer. For a checkout of this repo:
+
 ```bash
 git clone https://github.com/Andres77872/magic-agents.git
 cd magic-agents
-pip install -e .
+python -m pip install -e .
 ```
+
+This is enough for applications that only use the JSON graph API. `magic-agents` installs the official `magic-llm` from GitHub as a dependency; application code doesn't need to import it. Standalone LLM applications can install [magic-llm](https://github.com/Andres77872/magic-llm) without `magic-agents`.
+
+If an application declares both packages from Git, use these exact references so pip resolves a single copy of `magic-llm`:
+
+```text
+magic_agents @ git+https://github.com/Andres77872/magic-agents.git@master
+magic_llm @ git+https://github.com/Andres77872/magic-llm.git@master
+```
+
+To work on **both local checkouts**, put `magic-llm` beside this repo, activate one virtualenv, and install from the `magic-agents` root:
+
+```sh
+printf '%s\n' '-e ../magic-llm[test]' | uv pip install --overrides - -r requirements.txt
+```
+
+`uv` resolves all dependencies while keeping both checkouts editable. Don't install either package by its bare name from public PyPI; those names belong to unrelated projects.
+
+Optional extras: `pdf` for PDF attachments, `redis` for their Redis cache, and `qdrant` for persistent memory. For example, `python -m pip install -e ".[pdf,redis]"` adds PDF parsing and Redis caching to an Agents checkout. Text and Markdown attachments work without them.
 
 ## Quickstart
 
@@ -84,16 +105,13 @@ Use the docs for current per-node behavior and routing details: [docs/nodes/READ
 
 ## Testing
 
-Install the test tools and run the deterministic node/integration suite without
-provider credentials:
+Install the test tools with `python -m pip install -r requirements.txt`. If working on both repos, use the local override above instead. For a focused installation check without provider calls:
 
-```bash
-pip install -e ".[test]"
-make test-credential-free
-make coverage-credential-free
+```sh
+env MAGIC_AGENTS_API_KEY_FILE= OPENAI_API_KEY= OPENROUTER_API_KEY= SERPER_API_KEY= JINA_API_KEY= \
+  python -m pytest --strict-config --strict-markers --timeout=30 \
+    test/test_package_dependencies.py test/test_coordination_mcp_http.py test/test_coordination_mcp_discovery.py \
+    test/test_chat_file_attachments.py
 ```
 
-The coverage target exercises both complete test suites with branch coverage,
-a 70% aggregate gate, and a 60% minimum for every `Node*.py` module.
-Live-provider tests are marked `needs_api`/`credential_gated` and excluded from
-this target.
+Install the `pdf` extra to include the real PDF parser case. When running the broader `test/` suite, exclude live tests with `-m 'not needs_api and not credential_gated'`.

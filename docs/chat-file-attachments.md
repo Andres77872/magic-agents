@@ -16,7 +16,9 @@ NodeChat decodes the attachments and injects their contents into user messages i
 
 ## PDF extraction and Redis
 
-The Magic package installs `pdf-inspector>=1.25.2` and `redis>=5.0`. PDFs are parsed on the Chat node using `pdf_inspector.process_pdf(path)`. Only when `result.markdown is None` does the node call `pdf_inspector.process_pdf_with_ocr(path)`. Native extraction runs in a worker thread and its secure temporary file is deleted after processing.
+From a `magic-agents` checkout, install PDF support with `python -m pip install -e '.[pdf]'`. Use `'.[pdf,redis]'` if the Chat node will cache PDFs in Redis. Text and Markdown attachments don't require either extra.
+
+PDFs are parsed on the Chat node using `pdf_inspector.process_pdf(path)`. Only when `result.markdown is None` does the node call `pdf_inspector.process_pdf_with_ocr(path)`. Native extraction runs in a worker thread and its secure temporary file is deleted after processing.
 
 Configure the Chat node with a server environment variable reference:
 

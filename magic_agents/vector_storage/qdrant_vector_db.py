@@ -66,7 +66,7 @@ class QdrantVectorDB:
         if not _QDRANT_AVAILABLE:
             raise ImportError(
                 "qdrant-client is required to use QdrantVectorDB. "
-                "Install: pip install magic-agents[qdrant]"
+                "From the magic-agents checkout, install with: pip install -e '.[qdrant]'"
             )
         self._client: AsyncQdrantClient = client
         self._collection_name: str = collection_name

@@ -184,7 +184,7 @@ Key characteristics of `QdrantVectorDB`:
 - **Payload filtering**: Supports filtering on `node_id`, `session_id`, `tags`, `content`, and `creation_date` via Qdrant's `FieldCondition` mechanism. The `filter_scope` dict provided by NodeMemory is automatically translated to Qdrant filter conditions.
 - **No Qdrant coupling in NodeMemory**: NodeMemory does NOT import, know about, or depend on Qdrant. The `QdrantVectorDB` wrapper implements the `VectorDB` Protocol; NodeMemory interacts with it purely through `upsert()` and `search()`. Collection lifecycle, payload schema, and Qdrant-specific logic are entirely encapsulated in the wrapper.
 
-Requires `pip install magic-agents[qdrant]` (optional extra).
+Requires the optional `qdrant` extra: `python -m pip install -e '.[qdrant]'` from the `magic-agents` checkout.
 
 The MagicLLM client is NOT passed via `deps` — it arrives via the existing `handle-client-provider` edge mechanism, following the proven NodeLLM pattern.
 
@@ -283,7 +283,7 @@ Distinct handles prevent competing-edge race:
 2. **No Codex trigger integration**: No automatic mechanism to convert Codex triggers into memory tags. Manual trigger duplication required.
 3. **No memory eviction/limit**: Vector DB accumulates indefinitely. No count limit, LRU eviction, or expiration.
 4. **No memory deletion/forgetting**: NodeMemory only creates memories. No delete/forget UX or API.
-5. **Ephemeral fallback is NOT persistent**: When no `vector_db` is provided via `deps`, NodeMemory auto-creates an `InMemoryVectorDB` that lives entirely in memory. All memories are lost on process restart. For persistent storage, install `pip install magic-agents[qdrant]` and inject a `QdrantVectorDB` wrapper via `deps` (see [Persistent storage via Qdrant](#persistent-storage-via-qdrant-recommended-for-production)). Use `vector_db_backend` in `_capture_internal_state()` to check which backend is active at runtime.
+5. **Ephemeral fallback is NOT persistent**: When no `vector_db` is provided via `deps`, NodeMemory auto-creates an `InMemoryVectorDB` that lives entirely in memory. All memories are lost on process restart. For persistent storage, install the `qdrant` extra and inject a `QdrantVectorDB` wrapper via `deps` (see [Persistent storage via Qdrant](#persistent-storage-via-qdrant-recommended-for-production)). Use `vector_db_backend` in `_capture_internal_state()` to check which backend is active at runtime.
 6. **Single embedding client**: No multi-engine embedding abstraction. Embedding model behavior is determined by the injected `embedding_client`.
 
 ## Testing
@@ -291,5 +291,5 @@ Distinct handles prevent competing-edge race:
 - **Unit tests**: `test/test_node_memory_process.py` — covers process paths, fail-open scenarios, scope isolation, background extraction context, `top_k` defaults/boundaries, `source_id` roundtrip, handle overrides, and `_capture_internal_state`.
 - **Integration tests**: `test/test_node_memory_integration.py` (11 tests) — full graph execution with mocked vector DB and LLM client, client provider sharing, graph validation, `run_agent(deps=...)` injection (vector_db + embedding_client).
 - **Vector DB tests**: `test/test_qdrant_vector_db.py` (14 tests) — `QdrantVectorDB` wrapper unit tests using `QdrantClient(location=":memory:")` (skip-guarded if `qdrant-client` is not installed), including `source_id` roundtrip and UUID-formatted ID acceptance.
-- **Production vector storage**: `magic_agents.vector_storage.InMemoryVectorDB` — production-grade ephemeral storage with `asyncio.Lock` concurrency safety, validated `MemoryEntry` reconstruction, and dimension-mismatch guards. `magic_agents.vector_storage.QdrantVectorDB` — optional Qdrant wrapper (requires `pip install magic-agents[qdrant]`).
+- **Production vector storage**: `magic_agents.vector_storage.InMemoryVectorDB` — production-grade ephemeral storage with `asyncio.Lock` concurrency safety, validated `MemoryEntry` reconstruction, and dimension-mismatch guards. `magic_agents.vector_storage.QdrantVectorDB` — optional Qdrant wrapper (requires the `qdrant` extra).
 - **Fixtures**: `mock_magic_embedding` (deterministic SHA256-based 8-dim unit vector) and `in_memory_vector_db` (fresh `InMemoryVectorDB` from `magic_agents.vector_storage`) in `test/conftest.py`.

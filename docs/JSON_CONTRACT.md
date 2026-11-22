@@ -804,7 +804,7 @@ This matches the `<codex_content>` policy exactly — see the [codex Fields](#co
 
 NodeMemory does not enforce hard validation in `validate_graph()` for missing vector DB, MagicLLM client, or embedding client.
 
-- **No vector DB**: An ephemeral `InMemoryVectorDB` is auto-created at construction time. With an injected embedding client, upsert and search can still run, but all data is lost on process restart. Use `pip install magic-agents[qdrant]` and inject a `QdrantVectorDB` via `deps` for persistent storage. The `vector_db_backend` debug field signals `"ephemeral"` vs `"qdrant"` vs `"external"`.
+- **No vector DB**: An ephemeral `InMemoryVectorDB` is auto-created at construction time. With an injected embedding client, upsert and search can still run, but all data is lost on process restart. Install the `qdrant` extra from the `magic-agents` checkout (`python -m pip install -e '.[qdrant]'`) and inject a `QdrantVectorDB` via `deps` for persistent storage. The `vector_db_backend` debug field signals `"ephemeral"` vs `"qdrant"` vs `"external"`.
 - **No MagicLLM client**: Extraction is skipped.
 - **No embedding client**: Vector search/upsert is skipped. The message passes through unchanged.
 

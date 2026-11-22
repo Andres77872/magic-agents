@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 class NodeMcp(Node):
     coordination_external_dispatch_version = 1
     coordination_external_transport_profiles = frozenset({'http-stateless-bounded-v1'})
-    coordination_external_transport_versions = MappingProxyType({'mcp': '2.2.0', 'httpx2': '2.13.0', 'mcp-types': '2.2.0'})
+    coordination_external_transport_versions = MappingProxyType({'mcp': '2.3.0', 'httpx2': '2.16.2', 'mcp-types': '2.3.0'})
 
     """MCP tool-provider node.
     

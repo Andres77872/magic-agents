@@ -7,7 +7,7 @@ Provides production-grade vector database implementations:
   All data is lost on process restart.
 
 - QdrantVectorDB (optional) — Qdrant-backed persistent vector store.
-  Requires qdrant-client >= 1.10.0 (pip install magic-agents[qdrant]).
+  Requires the qdrant extra (pip install -e '.[qdrant]' from this checkout).
   Single project-wide collection 'magic_llm_memory' with payload-based
   node/session isolation.
 """

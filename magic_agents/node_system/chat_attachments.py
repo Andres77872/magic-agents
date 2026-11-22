@@ -133,7 +133,7 @@ class ChatAttachmentProcessor:
         try:
             pdf_inspector = importlib.import_module('pdf_inspector')
         except ImportError as exc:
-            raise ChatFileError('PDF processing requires the pdf-inspector package in the Magic runtime.') from exc
+            raise ChatFileError("PDF processing requires the magic-agents 'pdf' extra.") from exc
         # Public native/OCR path APIs match pdf-inspector's documented contract.
         # The secure temporary directory is removed even when the parser fails.
         try:
