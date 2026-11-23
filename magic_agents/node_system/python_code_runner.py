@@ -25,6 +25,10 @@ from magic_agents.util.aio import wait_for
 
 logger = logging.getLogger(__name__)
 
+# Upper bound for a spawned worker to boot and acknowledge ownership of its
+# process group. Kept separate from the configured execution timeout.
+_WORKER_START_TIMEOUT = 30.0
+
 # Restricted builtins for Phase 1: safe subset excluding dangerous functions.
 # This follows the same pattern as NodeHook._compile_hook_function().
 # Blocked: open, exec, eval, compile, __import__, input, breakpoint
@@ -157,7 +161,9 @@ class CodeRunner:
 
         Args:
             safety_mode: Execution mode ('subprocess', 'in_process', or 'restricted_builtins').
-            timeout: Maximum execution time in seconds.
+            timeout: Maximum execution time in seconds. In subprocess mode it
+                starts once the spawned worker is ready to run user code;
+                worker start-up is bounded separately.
             max_output_chars: Maximum output length before truncation.
 
         Warning:
@@ -235,6 +241,24 @@ class CodeRunner:
         try:
             process.start()
             child_connection.close()
+
+            # Spawning a fresh interpreter and importing this module is not
+            # user execution time: on a loaded host it alone can exceed a
+            # short configured timeout. Bound it separately, and start the
+            # execution deadline only once user code is allowed to run.
+            start_deadline = time.monotonic() + _WORKER_START_TIMEOUT
+            while not ready.is_set():
+                if cancelled is not None and cancelled.is_set():
+                    return {"error": "execution cancelled"}
+                if not process.is_alive():
+                    process.join(timeout=0.1)
+                    return {"error": "Python worker exited without a result"}
+                remaining = start_deadline - time.monotonic()
+                if remaining <= 0:
+                    return {"error": f"Python worker did not start within {_WORKER_START_TIMEOUT} seconds"}
+                ready.wait(min(remaining, 0.05))
+
+            proceed.set()
             deadline = time.monotonic() + self._timeout
 
             while True:
@@ -244,10 +268,10 @@ class CodeRunner:
                 if remaining <= 0:
                     return {"error": f"execution timed out after {self._timeout} seconds"}
 
-                if ready.is_set():
-                    proceed.set()
-
-                if parent_connection.poll(min(remaining, 0.05)):
+                # Sample liveness before polling: a worker that already exited
+                # wrote its payload first, so a final non-blocking poll sees it.
+                alive = process.is_alive()
+                if parent_connection.poll(min(remaining, 0.05) if alive else 0):
                     try:
                         kind, payload = parent_connection.recv()
                     except EOFError:
@@ -257,7 +281,7 @@ class CodeRunner:
                         return {"result": self._truncate_result(payload)}
                     return {"error": str(payload)}
 
-                if not process.is_alive():
+                if not alive:
                     process.join(timeout=0.1)
                     return {"error": "Python worker exited without a result"}
         except Exception as exc:

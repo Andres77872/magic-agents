@@ -170,6 +170,19 @@ class TestCodeRunnerExecute:
         )
 
     @pytest.mark.asyncio
+    async def test_execute_timeout_excludes_worker_start_up(self):
+        """Regression: spawn + import time was charged to the execution timeout.
+
+        The timeout is shorter than booting a spawned interpreter and importing
+        ``magic_agents``, so trivial code only succeeds if start-up is excluded.
+        """
+        runner = CodeRunner(timeout=0.2)
+
+        result = await runner.execute("def run(handler):\n    return 'ok'", {})
+
+        assert result == {"result": "ok"}
+
+    @pytest.mark.asyncio
     async def test_execute_does_not_block_event_loop(self):
         """A blocked run(handler) worker does not block another coroutine."""
         runner = CodeRunner(timeout=2.0)
